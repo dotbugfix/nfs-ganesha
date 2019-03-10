@@ -40,11 +40,44 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 #include "server_stats.h"
 #include "client_mgr.h"
+
+struct _9p_write_data {
+	struct gsh_client *client;	/**< Client for stats */
+	fsal_status_t ret;		/**< Return from write */
+};
+
+/**
+ * @brief Callback for NFS3 write done
+ *
+ * @param[in] obj		Object being acted on
+ * @param[in] ret		Return status of call
+ * @param[in] write_data	Data for write call
+ * @param[in] caller_data	Data for caller
+ */
+static void _9p_write_cb(struct fsal_obj_handle *obj, fsal_status_t ret,
+			  void *write_data, void *caller_data)
+{
+	struct _9p_write_data *data = caller_data;
+	struct fsal_io_arg *write_arg = write_data;
+
+	/* Fixup ERR_FSAL_SHARE_DENIED status */
+	if (ret.major == ERR_FSAL_SHARE_DENIED)
+		ret = fsalstat(ERR_FSAL_LOCKED, 0);
+
+	data->ret = ret;
+
+	if (data->client) {
+		op_ctx->client = data->client;
+
+		server_stats_io_done(write_arg->iov[0].iov_len,
+				     write_arg->io_amount, FSAL_IS_ERROR(ret),
+				     false);
+	}
+}
 
 int _9p_write(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
@@ -60,14 +93,8 @@ int _9p_write(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 
 	size_t size;
 	size_t written_size = 0;
-	bool eof_met;
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
-	/* bool sync = true; */
-	bool sync = false;
 
 	char *databuffer = NULL;
-
-	/* fsal_status_t fsal_status; */
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -104,58 +131,65 @@ int _9p_write(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	/* Do the job */
 	size = *count;
 
-	if (pfid->specdata.xattr.xattr_content != NULL) {
-		memcpy(pfid->specdata.xattr.xattr_content + (*offset),
-		       databuffer, size);
-		pfid->specdata.xattr.xattr_offset += size;
-		pfid->specdata.xattr.xattr_write = true;
+	if (pfid->xattr != NULL) {
+		if (*offset > pfid->xattr->xattr_size)
+			return _9p_rerror(req9p, msgtag, EINVAL, plenout,
+					  preply);
+		if (pfid->xattr->xattr_write != _9P_XATTR_CAN_WRITE &&
+		    pfid->xattr->xattr_write != _9P_XATTR_DID_WRITE)
+			return _9p_rerror(req9p, msgtag, EINVAL, plenout,
+					  preply);
+
+		written_size = MIN(*count,
+				   pfid->xattr->xattr_size - *offset);
+
+		memcpy(pfid->xattr->xattr_content + *offset,
+		       databuffer, written_size);
+		pfid->xattr->xattr_offset += size;
+		pfid->xattr->xattr_write = _9P_XATTR_DID_WRITE;
 
 		/* ADD CODE TO DETECT GAP */
 #if 0
 		fsal_status =
-		    pfid->pentry->obj_handle->ops->setextattr_value_by_id(
-			pfid->pentry->obj_handle,
+		    pfid->pentry->ops->setextattr_value_by_id(
+			pfid->pentry,
 			&pfid->op_context,
-			pfid->specdata.xattr.xattr_id,
+			pfid->xattr->xattr_id,
 			xattrval, size + 1);
 
 		if (FSAL_IS_ERROR(fsal_status))
 			return _9p_rerror(req9p, msgtag,
-					  _9p_tools_errno
-					  (cache_inode_error_convert
-					   (fsal_status)), plenout, preply);
+					  _9p_tools_errno(fsal_status), plenout,
+					  preply);
 #endif
 
-		outcount = *count;
+		outcount = written_size;
 	} else {
-		cache_status = cache_inode_rdwr(pfid->pentry, CACHE_INODE_WRITE,
-						*offset, size, &written_size,
-						databuffer, &eof_met, &sync,
-						NULL);
+		struct _9p_write_data write_data;
+		struct fsal_io_arg *write_arg = alloca(sizeof(*write_arg) +
+						      sizeof(struct iovec));
 
-		/* Get the handle, for stats */
-		struct gsh_client *client = req9p->pconn->client;
+		write_arg->info = NULL;
+		write_arg->state = pfid->state;
+		write_arg->offset = *offset;
+		write_arg->iov_count = 1;
+		write_arg->iov[0].iov_len = size;
+		write_arg->iov[0].iov_base = databuffer;
+		write_arg->io_amount = 0;
+		write_arg->fsal_stable = false;
 
-		if (client == NULL) {
-			LogDebug(COMPONENT_9P,
-				 "Cannot get client block for 9P request");
-		} else {
-			op_ctx->client = client;
+		write_data.client = req9p->pconn->client;
 
-			server_stats_io_done(size,
-					     written_size,
-					     (cache_status ==
-					      CACHE_INODE_SUCCESS) ?
-					      true : false,
-					     true);
-		}
+		/* Do the actual write */
+		pfid->pentry->obj_ops->write2(pfid->pentry, true, _9p_write_cb,
+					    write_arg, &write_data);
 
-		if (cache_status != CACHE_INODE_SUCCESS)
+		if (FSAL_IS_ERROR(write_data.ret))
 			return _9p_rerror(req9p, msgtag,
-					  _9p_tools_errno(cache_status),
+					  _9p_tools_errno(write_data.ret),
 					  plenout, preply);
 
-		outcount = (u32) written_size;
+		outcount = (u32) write_arg->io_amount;
 
 	}
 

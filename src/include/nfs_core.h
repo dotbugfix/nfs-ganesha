@@ -40,6 +40,7 @@
 
 #include "sal_data.h"
 #include "gsh_config.h"
+#include "gsh_wait_queue.h"
 
 #ifdef _USE_9P
 #include "9p.h"
@@ -54,7 +55,7 @@
 
 #define XATTR_BUFFERSIZE 4096
 
-char *host_name;
+extern char *nfs_host_name;
 
 /*
  * Bind protocol family, pending a richer interface model.
@@ -71,29 +72,23 @@ typedef struct __nfs4_compound {
 	} v_u;
 } nfs4_compound_t;
 
-/* RPC callback processing */
-typedef enum rpc_call_hook {
-	RPC_CALL_COMPLETE,
-	RPC_CALL_ABORT,
-} rpc_call_hook;
-
 typedef struct _rpc_call rpc_call_t;
 
-typedef int32_t(*rpc_call_func) (rpc_call_t *call, rpc_call_hook hook,
-				 void *arg, uint32_t flags);
+typedef void (*rpc_call_func) (rpc_call_t *call);
 
+#ifdef _HAVE_GSSAPI
 extern gss_OID_desc krb5oid;
+#endif /* _HAVE_GSSAPI */
 
 struct _rpc_call {
+	struct clnt_req call_req;
 	rpc_call_channel_t *chan;
 	rpc_call_func call_hook;
+	void *call_arg;
+	void *call_user_data[2];
 	nfs4_compound_t cbt;
-	struct wait_entry we;
-	enum clnt_stat stat;
 	uint32_t states;
 	uint32_t flags;
-	void *u_data[2];
-	void *completion_arg;
 };
 
 typedef enum request_type {
@@ -106,12 +101,6 @@ typedef enum request_type {
 } request_type_t;
 
 typedef struct request_data {
-	struct glist_head req_q;	/* chaining of pending requests */
-	struct timespec time_queued;	/*< The time at which a request was
-					 *  added to the worker thread queue.
-					 */
-	request_type_t rtype;
-
 	union request_content {
 		rpc_call_t call;
 		nfs_request_t req;
@@ -119,19 +108,35 @@ typedef struct request_data {
 		struct _9p_request_data _9p;
 #endif
 	} r_u;
+
+	struct glist_head req_q;	/* chaining of pending requests */
+	struct timespec time_queued;	/*< The time at which a request was
+					 *  added to the worker thread queue.
+					 */
+	request_type_t rtype;
 } request_data_t;
 
-extern pool_t *request_pool;
+/* in nfs_init.c */
+
+extern pool_t *nfs_request_pool;
+
+struct _nfs_health {
+	uint64_t enqueued_reqs;
+	uint64_t dequeued_reqs;
+};
+
+extern struct _nfs_health nfs_health_;
+bool nfs_health(void);
 
 /* ServerEpoch is ServerBootTime unless overriden by -E command line option */
-extern struct timespec ServerBootTime;
-extern time_t ServerEpoch;
+extern struct timespec nfs_ServerBootTime;
+extern time_t nfs_ServerEpoch;
 
 extern verifier4 NFS4_write_verifier;	/*< NFS V4 write verifier */
 extern writeverf3 NFS3_write_verifier;	/*< NFS V3 write verifier */
 
-extern char *config_path;
-extern char *pidfile_path;
+extern char *nfs_config_path;
+extern char *nfs_pidfile_path;
 
 /*
  * Thread entry functions
@@ -143,6 +148,8 @@ void _9p_tcp_process_request(struct _9p_request_data *req9p);
 int _9p_process_buffer(struct _9p_request_data *req9p, char *replydata,
 		       u32 *poutlen);
 
+int _9p_worker_init(void);
+int _9p_worker_shutdown(void);
 void DispatchWork9P(request_data_t *req);
 #endif
 
@@ -156,24 +163,10 @@ void _9p_rdma_cleanup_conn(msk_trans_t *trans);
 
 void Clean_RPC(void);
 void nfs_Init_svc(void);
-void nfs_rpc_dispatch_threads(pthread_attr_t *attr_thr);
 void nfs_rpc_dispatch_stop(void);
 
-request_data_t *nfs_rpc_dequeue_req(nfs_worker_data_t *worker);
-void nfs_rpc_enqueue_req(request_data_t *req);
-uint32_t get_dequeue_count(void);
-uint32_t get_enqueue_count(void);
-
-/* in nfs_worker_thread.c */
-
-void nfs_rpc_execute(request_data_t *req);
-const nfs_function_desc_t *nfs_rpc_get_funcdesc(nfs_request_t *);
-
-int worker_init(void);
-int worker_shutdown(void);
-
 /* Config parsing routines */
-extern config_file_t config_struct;
+extern config_file_t nfs_config_struct;
 extern struct config_block nfs_core;
 extern struct config_block nfs_ip_name;
 #ifdef _HAVE_GSSAPI
@@ -183,9 +176,9 @@ extern struct config_block version4_param;
 
 /* in nfs_admin_thread.c */
 
+extern bool admin_shutdown;
 void nfs_Init_admin_thread(void);
 void *admin_thread(void *UnusedArg);
-void admin_replace_exports(void);
 void admin_halt(void);
 
 /* Tools */
@@ -202,9 +195,9 @@ unsigned int nfs_core_select_worker_queue(unsigned int avoid_index);
 int nfs_Init_ip_name(void);
 
 void nfs_rpc_destroy_chan(rpc_call_channel_t *chan);
-int32_t nfs_rpc_dispatch_call(rpc_call_t *call, uint32_t flags);
 
 int reaper_init(void);
+void reaper_wake(void);
 int reaper_shutdown(void);
 
 #endif				/* !NFS_CORE_H */

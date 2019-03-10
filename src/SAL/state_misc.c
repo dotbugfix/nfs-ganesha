@@ -50,6 +50,10 @@
 #include "nfs_core.h"
 #include "sal_functions.h"
 
+struct glist_head cached_open_owners = GLIST_HEAD_INIT(cached_open_owners);
+
+pthread_mutex_t cached_open_owners_lock = PTHREAD_MUTEX_INITIALIZER;
+
 pool_t *state_owner_pool;	/*< Pool for NFSv4 files's open owner */
 
 #ifdef DEBUG_SAL
@@ -171,110 +175,6 @@ const char *state_err_str(state_status_t err)
 }
 
 /**
- * @brief Convert Cache inode error to SAL error
- *
- * @param[in] status Cache inode error
- *
- * @return SAL error.
- */
-state_status_t cache_inode_status_to_state_status(cache_inode_status_t status)
-{
-	switch (status) {
-	case CACHE_INODE_SUCCESS:
-		return STATE_SUCCESS;
-	case CACHE_INODE_MALLOC_ERROR:
-		return STATE_MALLOC_ERROR;
-	case CACHE_INODE_POOL_MUTEX_INIT_ERROR:
-		return STATE_POOL_MUTEX_INIT_ERROR;
-	case CACHE_INODE_GET_NEW_LRU_ENTRY:
-		return STATE_GET_NEW_LRU_ENTRY;
-	case CACHE_INODE_INIT_ENTRY_FAILED:
-		return STATE_INIT_ENTRY_FAILED;
-	case CACHE_INODE_FSAL_ERROR:
-		return STATE_FSAL_ERROR;
-	case CACHE_INODE_LRU_ERROR:
-		return STATE_LRU_ERROR;
-	case CACHE_INODE_HASH_SET_ERROR:
-		return STATE_HASH_SET_ERROR;
-	case CACHE_INODE_NOT_A_DIRECTORY:
-		return STATE_NOT_A_DIRECTORY;
-	case CACHE_INODE_INCONSISTENT_ENTRY:
-		return STATE_INCONSISTENT_ENTRY;
-	case CACHE_INODE_BAD_TYPE:
-		return STATE_BAD_TYPE;
-	case CACHE_INODE_ENTRY_EXISTS:
-		return STATE_ENTRY_EXISTS;
-	case CACHE_INODE_DIR_NOT_EMPTY:
-		return STATE_DIR_NOT_EMPTY;
-	case CACHE_INODE_NOT_FOUND:
-		return STATE_NOT_FOUND;
-	case CACHE_INODE_BADNAME:
-	case CACHE_INODE_INVALID_ARGUMENT:
-	case CACHE_INODE_CROSS_JUNCTION:
-		return STATE_INVALID_ARGUMENT;
-	case CACHE_INODE_INSERT_ERROR:
-		return STATE_INSERT_ERROR;
-	case CACHE_INODE_HASH_TABLE_ERROR:
-		return STATE_HASH_TABLE_ERROR;
-	case CACHE_INODE_FSAL_EACCESS:
-		return STATE_FSAL_EACCESS;
-	case CACHE_INODE_IS_A_DIRECTORY:
-		return STATE_IS_A_DIRECTORY;
-	case CACHE_INODE_FSAL_EPERM:
-		return STATE_FSAL_EPERM;
-	case CACHE_INODE_NO_SPACE_LEFT:
-		return STATE_NO_SPACE_LEFT;
-	case CACHE_INODE_READ_ONLY_FS:
-		return STATE_READ_ONLY_FS;
-	case CACHE_INODE_IO_ERROR:
-		return STATE_IO_ERROR;
-	case CACHE_INODE_ESTALE:
-		return STATE_ESTALE;
-	case CACHE_INODE_FSAL_ERR_SEC:
-		return STATE_FSAL_ERR_SEC;
-	case CACHE_INODE_QUOTA_EXCEEDED:
-		return STATE_QUOTA_EXCEEDED;
-	case CACHE_INODE_ASYNC_POST_ERROR:
-		return STATE_ASYNC_POST_ERROR;
-	case CACHE_INODE_NOT_SUPPORTED:
-	case CACHE_INODE_UNION_NOTSUPP:
-		return STATE_NOT_SUPPORTED;
-	case CACHE_INODE_STATE_ERROR:
-		return STATE_STATE_ERROR;
-	case CACHE_INODE_DELAY:
-		return STATE_FSAL_DELAY;
-	case CACHE_INODE_NAME_TOO_LONG:
-		return STATE_NAME_TOO_LONG;
-	case CACHE_INODE_BAD_COOKIE:
-		return STATE_BAD_COOKIE;
-	case CACHE_INODE_FILE_BIG:
-		return STATE_FILE_BIG;
-	case CACHE_INODE_FILE_OPEN:
-		return STATE_FILE_OPEN;
-	case CACHE_INODE_SHARE_DENIED:
-		return STATE_SHARE_DENIED;
-	case CACHE_INODE_FSAL_MLINK:
-		return STATE_MLINK;
-	case CACHE_INODE_NO_DATA:
-	case CACHE_INODE_SERVERFAULT:
-		return STATE_SERVERFAULT;
-	case CACHE_INODE_TOOSMALL:
-		return STATE_TOOSMALL;
-	case CACHE_INODE_FSAL_XDEV:
-		return STATE_XDEV;
-	case CACHE_INODE_IN_GRACE:
-		return STATE_IN_GRACE;
-	case CACHE_INODE_BADHANDLE:
-		return STATE_BADHANDLE;
-	case CACHE_INODE_BAD_RANGE:
-		return STATE_BAD_RANGE;
-	case CACHE_INODE_LOCKED:
-		return STATE_LOCKED;
-	}
-	return STATE_CACHE_INODE_ERR;
-}
-
-/**
  * @brief converts an FSAL error to the corresponding state error.
  *
  * @param[in] fsal_status Fsal error to be converted
@@ -371,6 +271,9 @@ state_status_t state_error_convert(fsal_status_t fsal_status)
 	case ERR_FSAL_LOCKED:
 		return STATE_LOCKED;
 
+	case ERR_FSAL_TOOSMALL:
+		return STATE_TOOSMALL;
+
 	case ERR_FSAL_DQUOT:
 	case ERR_FSAL_NAMETOOLONG:
 	case ERR_FSAL_EXIST:
@@ -384,11 +287,12 @@ state_status_t state_error_convert(fsal_status_t fsal_status)
 	case ERR_FSAL_NO_QUOTA:
 	case ERR_FSAL_XDEV:
 	case ERR_FSAL_MLINK:
-	case ERR_FSAL_TOOSMALL:
 	case ERR_FSAL_TIMEOUT:
 	case ERR_FSAL_SERVERFAULT:
 	case ERR_FSAL_NO_DATA:
 	case ERR_FSAL_NO_ACE:
+	case ERR_FSAL_CROSS_JUNCTION:
+	case ERR_FSAL_BADNAME:
 		/* These errors should be handled inside state
 		 * (or should never be seen by state)
 		 */
@@ -770,8 +674,10 @@ const char *state_owner_type_to_str(state_owner_type_t type)
 	switch (type) {
 	case STATE_LOCK_OWNER_UNKNOWN:
 		return "STATE_LOCK_OWNER_UNKNOWN";
+#ifdef _USE_NLM
 	case STATE_LOCK_OWNER_NLM:
 		return "STATE_LOCK_OWNER_NLM";
+#endif /* _USE_NLM */
 #ifdef _USE_9P
 	case STATE_LOCK_OWNER_9P:
 		return "STALE_LOCK_OWNER_9P";
@@ -808,8 +714,10 @@ bool different_owners(state_owner_t *owner1, state_owner_t *owner2)
 		return true;
 
 	switch (owner1->so_type) {
+#ifdef _USE_NLM
 	case STATE_LOCK_OWNER_NLM:
 		return compare_nlm_owner(owner1, owner2);
+#endif /* _USE_NLM */
 #ifdef _USE_9P
 	case STATE_LOCK_OWNER_9P:
 		return compare_9p_owner(owner1, owner2);
@@ -840,8 +748,10 @@ int display_owner(struct display_buffer *dspbuf, state_owner_t *owner)
 		return display_printf(dspbuf, "<NULL>");
 
 	switch (owner->so_type) {
+#ifdef _USE_NLM
 	case STATE_LOCK_OWNER_NLM:
 		return display_nlm_owner(dspbuf, owner);
+#endif /* _USE_NLM */
 
 #ifdef _USE_9P
 	case STATE_LOCK_OWNER_9P:
@@ -874,7 +784,7 @@ int display_owner(struct display_buffer *dspbuf, state_owner_t *owner)
  */
 void inc_state_owner_ref(state_owner_t *owner)
 {
-	char str[LOG_BUFF_LEN];
+	char str[LOG_BUFF_LEN] = "\0";
 	struct display_buffer dspbuf = {sizeof(str), str, str};
 	bool str_valid = false;
 	int32_t refcount;
@@ -899,13 +809,15 @@ void inc_state_owner_ref(state_owner_t *owner)
  */
 void free_state_owner(state_owner_t *owner)
 {
-	char str[LOG_BUFF_LEN];
+	char str[LOG_BUFF_LEN] = "\0";
 	struct display_buffer dspbuf = {sizeof(str), str, str};
 
 	switch (owner->so_type) {
+#ifdef _USE_NLM
 	case STATE_LOCK_OWNER_NLM:
 		free_nlm_owner(owner);
 		break;
+#endif /* _USE_NLM */
 
 #ifdef _USE_9P
 	case STATE_LOCK_OWNER_9P:
@@ -925,8 +837,7 @@ void free_state_owner(state_owner_t *owner)
 		return;
 	}
 
-	if (owner->so_owner_val != NULL)
-		gsh_free(owner->so_owner_val);
+	gsh_free(owner->so_owner_val);
 
 	PTHREAD_MUTEX_destroy(&owner->so_mutex);
 
@@ -949,8 +860,10 @@ void free_state_owner(state_owner_t *owner)
 hash_table_t *get_state_owner_hash_table(state_owner_t *owner)
 {
 	switch (owner->so_type) {
+#ifdef _USE_NLM
 	case STATE_LOCK_OWNER_NLM:
 		return ht_nlm_owner;
+#endif /* _USE_NLM */
 
 #ifdef _USE_9P
 	case STATE_LOCK_OWNER_9P:
@@ -976,14 +889,13 @@ hash_table_t *get_state_owner_hash_table(state_owner_t *owner)
  */
 void dec_state_owner_ref(state_owner_t *owner)
 {
-	char str[LOG_BUFF_LEN];
+	char str[LOG_BUFF_LEN] = "\0";
 	struct display_buffer dspbuf = {sizeof(str), str, str};
 	bool str_valid = false;
 	struct hash_latch latch;
 	hash_error_t rc;
 	struct gsh_buffdesc buffkey;
 	struct gsh_buffdesc old_value;
-	struct gsh_buffdesc old_key;
 	int32_t refcount;
 	hash_table_t *ht_owner;
 
@@ -1005,32 +917,14 @@ void dec_state_owner_ref(state_owner_t *owner)
 		return;
 	}
 
-	/*
-	 * NFSv4 Open Owner is cached beyond CLOSE op for lease period
-	 * so that it can be used if the client re-opens the file thus
-	 * avoiding the need to confirm the OPEN. If not re-used, these
-	 * objects will later be cleaned up by the reaper thread.
-	 */
-	if ((owner->so_type == STATE_OPEN_OWNER_NFSV4) &&
-	    (atomic_fetch_time_t(&owner->so_owner.so_nfs4_owner.
-				 last_close_time) == 0)) {
-		atomic_store_time_t(&owner->so_owner.so_nfs4_owner.
-				    last_close_time, time(NULL));
-		LogFullDebug(COMPONENT_STATE,
-			     "Cached open owner {%s}",
-			     str);
-		return;
-	}
-
 	ht_owner = get_state_owner_hash_table(owner);
 
 	if (ht_owner == NULL) {
 		if (!str_valid)
-			display_owner(&dspbuf, owner);
+			display_printf(&dspbuf, "Invalid owner %p", owner);
 
-		LogCrit(COMPONENT_STATE, "Unexpected owner {%s}", str);
-
-		assert(ht_owner);
+		LogCrit(COMPONENT_STATE, "Unexpected owner {%s}, type {%d}",
+			str, owner->so_type);
 
 		return;
 	}
@@ -1038,38 +932,32 @@ void dec_state_owner_ref(state_owner_t *owner)
 	buffkey.addr = owner;
 	buffkey.len = sizeof(*owner);
 
-	/* Get the hash table entry and hold latch */
+	/* Since the refcount is zero, another thread that needs this
+	 * owner might have deleted ours, so expect not to find one or
+	 * find someone else's owner!
+	 */
 	rc = hashtable_getlatch(ht_owner, &buffkey, &old_value, true, &latch);
+	switch (rc) {
+	case HASHTABLE_SUCCESS:
+		/* If ours, delete from hash table */
+		if (old_value.addr == owner) {
+			hashtable_deletelatched(ht_owner, &buffkey, &latch,
+						NULL, NULL);
+		}
+		break;
 
-	if (rc != HASHTABLE_SUCCESS) {
-		if (rc == HASHTABLE_ERROR_NO_SUCH_KEY)
-			hashtable_releaselatched(ht_owner, &latch);
+	case HASHTABLE_ERROR_NO_SUCH_KEY:
+		break;
 
+	default:
 		if (!str_valid)
-			display_owner(&dspbuf, owner);
+			display_printf(&dspbuf, "Invalid owner %p", owner);
 
 		LogCrit(COMPONENT_STATE, "Error %s, could not find {%s}",
 			hash_table_err_to_str(rc), str);
 
 		return;
 	}
-
-	refcount = atomic_fetch_int32_t(&owner->so_refcount);
-
-	if (refcount > 0) {
-		if (str_valid)
-			LogDebug(COMPONENT_STATE,
-				 "Did not release {%s} refcount now=%" PRId32,
-				 str, refcount);
-
-		hashtable_releaselatched(ht_owner, &latch);
-
-		return;
-	}
-
-	/* use the key to delete the entry */
-	hashtable_deletelatched(ht_owner, &buffkey, &latch, &old_key,
-				&old_value);
 
 	/* Release the latch */
 	hashtable_releaselatched(ht_owner, &latch);
@@ -1078,6 +966,69 @@ void dec_state_owner_ref(state_owner_t *owner)
 		LogFullDebug(COMPONENT_STATE, "Free {%s}", str);
 
 	free_state_owner(owner);
+}
+
+/** @brief Remove an NFS 4 open owner from the cached owners list.
+ *
+ * The caller MUST hold the cached_open_owners_lock, also must NOT hold
+ * so_mutex as the so_mutex may get destroyed after this call.
+ *
+ * If this owner is being revived, the refcount should have already been
+ * incremented for the new primary reference. This function will release the
+ * refcount that held it in the cache.
+ *
+ * @param[in] nfs4_owner The owner to release.
+ *
+ */
+void uncache_nfs4_owner(struct state_nfs4_owner_t *nfs4_owner)
+{
+	state_owner_t *owner = container_of(nfs4_owner,
+					    state_owner_t,
+					    so_owner.so_nfs4_owner);
+
+	/* This owner is to be removed from the open owner cache:
+	 * 1. Remove it from the list.
+	 * 2. Make sure this is now a proper list head again.
+	 * 3. Indicate it is no longer cached.
+	 * 4. Release the reference held on behalf of the cache.
+	 */
+	if (isFullDebug(COMPONENT_STATE)) {
+		char str[LOG_BUFF_LEN] = "\0";
+		struct display_buffer dspbuf = {sizeof(str), str, str};
+
+		display_owner(&dspbuf, owner);
+
+		LogFullDebug(COMPONENT_STATE, "Uncache {%s}", str);
+	}
+
+	/* Remove owner from cached_open_owners */
+	glist_del(&nfs4_owner->so_cache_entry);
+
+	atomic_store_time_t(&nfs4_owner->so_cache_expire, 0);
+
+	dec_state_owner_ref(owner);
+}
+
+static inline
+void refresh_nfs4_open_owner(struct state_nfs4_owner_t *nfs4_owner)
+{
+	time_t cache_expire;
+
+	/* Since this owner is active, reset cache_expire. */
+	cache_expire = atomic_fetch_time_t(&nfs4_owner->so_cache_expire);
+
+	if (cache_expire != 0) {
+		PTHREAD_MUTEX_lock(&cached_open_owners_lock);
+
+		/* Check again while holding the mutex. */
+
+		if (atomic_fetch_time_t(&nfs4_owner->so_cache_expire) != 0) {
+			/* This is a cached open owner, uncache it for use. */
+			uncache_nfs4_owner(nfs4_owner);
+		}
+
+		PTHREAD_MUTEX_unlock(&cached_open_owners_lock);
+	}
 }
 
 /**
@@ -1094,7 +1045,7 @@ state_owner_t *get_state_owner(care_t care, state_owner_t *key,
 			       state_owner_init_t init_owner, bool_t *isnew)
 {
 	state_owner_t *owner;
-	char str[LOG_BUFF_LEN];
+	char str[LOG_BUFF_LEN] = "\0";
 	struct display_buffer dspbuf = {sizeof(str), str, str};
 	bool str_valid = false;
 	struct hash_latch latch;
@@ -1102,6 +1053,7 @@ state_owner_t *get_state_owner(care_t care, state_owner_t *key,
 	struct gsh_buffdesc buffkey;
 	struct gsh_buffdesc buffval;
 	hash_table_t *ht_owner;
+	int32_t refcount;
 
 	if (isnew != NULL)
 		*isnew = false;
@@ -1127,33 +1079,50 @@ state_owner_t *get_state_owner(care_t care, state_owner_t *key,
 
 	buffkey.addr = key;
 	buffkey.len = sizeof(*key);
-
 	rc = hashtable_getlatch(ht_owner, &buffkey, &buffval, true, &latch);
 
-	/* If we found it, return it */
-	if (rc == HASHTABLE_SUCCESS) {
+	switch (rc) {
+	case HASHTABLE_SUCCESS:
 		owner = buffval.addr;
+		refcount = atomic_inc_int32_t(&owner->so_refcount);
+		if (refcount == 1) {
+			/* This owner is in the process of getting freed.
+			 * Delete from the hash table and pretend as
+			 * though we didn't find it!
+			 */
+			(void)atomic_dec_int32_t(&owner->so_refcount);
+			hashtable_deletelatched(ht_owner, &buffkey, &latch,
+						NULL, NULL);
+			goto not_found;
+		}
 
 		/* Return the found NSM Client */
 		if (isFullDebug(COMPONENT_STATE)) {
 			display_owner(&dspbuf, owner);
-			LogFullDebug(COMPONENT_STATE, "Found {%s}", str);
+			str_valid = true;
 		}
-
-		/* Increment refcount under hash latch.
-		 * This prevents dec ref from removing this entry from hash if
-		 * a race occurs.
-		 */
-		inc_state_owner_ref(owner);
-		atomic_store_time_t(&owner->so_owner.so_nfs4_owner.
-				    last_close_time, 0);
 
 		hashtable_releaselatched(ht_owner, &latch);
 
+		/* Refresh an nfs4 open owner if needed. */
+		if (owner->so_type == STATE_OPEN_OWNER_NFSV4) {
+			refresh_nfs4_open_owner(&owner->so_owner.so_nfs4_owner);
+		}
+
+		if (isFullDebug(COMPONENT_STATE)) {
+			if (!str_valid)
+				display_owner(&dspbuf, owner);
+
+			LogFullDebug(COMPONENT_STATE,
+				     "Found {%s} refcount now=%" PRId32,
+				     str, refcount);
+		}
 		return owner;
-	}
-	/* An error occurred, return NULL */
-	if (rc != HASHTABLE_ERROR_NO_SUCH_KEY) {
+
+	case HASHTABLE_ERROR_NO_SUCH_KEY:
+		goto not_found;
+
+	default:
 		if (!str_valid)
 			display_owner(&dspbuf, key);
 
@@ -1163,9 +1132,9 @@ state_owner_t *get_state_owner(care_t care, state_owner_t *key,
 		return NULL;
 	}
 
+not_found:
 	/* Not found, but we don't care, return NULL */
 	if (care == CARE_NOT) {
-		/* Return the found NSM Client */
 		if (str_valid)
 			LogFullDebug(COMPONENT_STATE, "Ignoring {%s}", str);
 
@@ -1174,15 +1143,7 @@ state_owner_t *get_state_owner(care_t care, state_owner_t *key,
 		return NULL;
 	}
 
-	owner = pool_alloc(state_owner_pool, NULL);
-
-	if (owner == NULL) {
-		if (!str_valid)
-			display_owner(&dspbuf, key);
-		LogCrit(COMPONENT_STATE, "No memory for {%s}", str);
-
-		return NULL;
-	}
+	owner = pool_alloc(state_owner_pool);
 
 	/* Copy everything over */
 	memcpy(owner, key, sizeof(*key));
@@ -1201,19 +1162,14 @@ state_owner_t *get_state_owner(care_t care, state_owner_t *key,
 	if (init_owner != NULL)
 		init_owner(owner);
 
-	owner->so_owner_val = gsh_malloc(key->so_owner_len);
 
-	if (owner->so_owner_val == NULL) {
-		/* Discard the created owner */
-		if (!str_valid)
-			display_owner(&dspbuf, key);
-		LogCrit(COMPONENT_STATE, "No memory for {%s}", str);
+	if (key->so_owner_len != 0) {
+		owner->so_owner_val = gsh_malloc(key->so_owner_len);
 
-		free_state_owner(owner);
-		return NULL;
+		memcpy(owner->so_owner_val,
+		       key->so_owner_val,
+		       key->so_owner_len);
 	}
-
-	memcpy(owner->so_owner_val, key->so_owner_val, key->so_owner_len);
 
 	glist_init(&owner->so_lock_list);
 
@@ -1257,36 +1213,111 @@ state_owner_t *get_state_owner(care_t care, state_owner_t *key,
 }
 
 /**
+ * @brief Acquire a reference on a state owner that might be getting freed.
+ *
+ * @param[in] owner Owner to acquire
+ *
+ * inc_state_owner_ref() can be called to hold a reference provided
+ * someone already has a valid refcount. In other words, one can't call
+ * inc_state_owner_ref on a owner whose refcount has possibly gone to
+ * zero.
+ *
+ * If we don't know for sure if the owner refcount is positive, this
+ * function must be called to hold a reference.  This function places a
+ * reference if the owner has a positive refcount already.
+ *
+ * @return True if we are able to hold a reference, False otherwise.
+ */
+bool hold_state_owner(state_owner_t *owner)
+{
+	char str[LOG_BUFF_LEN] = "\0";
+	struct display_buffer dspbuf = {sizeof(str), str, str};
+	bool str_valid = false;
+	hash_table_t *ht_owner;
+	struct gsh_buffdesc buffkey;
+	struct hash_latch latch;
+	hash_error_t rc;
+	int32_t refcount;
+
+	/* We need to increment and possibly decrement the refcount
+	 * atomically. This "increment" to check for the owner refcount
+	 * condition is also done in get_state_owner. Those are done
+	 * under the hash lock, so we do the same here.
+	 */
+	ht_owner = get_state_owner_hash_table(owner);
+	if (ht_owner == NULL) {
+		if (!str_valid)
+			display_owner(&dspbuf, owner);
+		LogCrit(COMPONENT_STATE,
+			"ht=%p Unexpected key {%s}", ht_owner, str);
+		return false;
+	}
+
+	buffkey.addr = owner;
+	buffkey.len = sizeof(*owner);
+
+	/* We don't care if this owner is in the hashtable or not. We
+	 * just need the partition lock in exclusive mode!
+	 */
+	rc = hashtable_acquire_latch(ht_owner, &buffkey, &latch);
+	switch (rc) {
+	case HASHTABLE_SUCCESS:
+		refcount = atomic_inc_int32_t(&owner->so_refcount);
+		if (refcount == 1) {
+			/* This owner is in the process of getting freed */
+			(void)atomic_dec_int32_t(&owner->so_refcount);
+			hashtable_releaselatched(ht_owner, &latch);
+			return false;
+		}
+
+		hashtable_releaselatched(ht_owner, &latch);
+		return true;
+
+	default:
+		assert(0);
+		return false;
+	}
+}
+
+/**
  * @brief Release all state on a file
  *
  * This function may not be called in any context which could hold
  * entry->state_lock.  It will now be reliably called in cleanup
  * processing.
  *
- * @param[in,out] entry File to be wiped
+ * @param[in,out] obj File to be wiped
  */
-void state_wipe_file(cache_entry_t *entry)
+void state_wipe_file(struct fsal_obj_handle *obj)
 {
+	bool release;
 	/*
 	 * currently, only REGULAR files can have state; byte range locks and
 	 * stateid (for v4).  In the future, 4.1, directories could have
 	 * delegations, which is state.  At that point, we may need to modify
 	 * this routine to clear state on directories.
 	 */
-	if (entry->type != REGULAR_FILE)
+	if (obj->type != REGULAR_FILE)
 		return;
 
-	PTHREAD_RWLOCK_wrlock(&entry->state_lock);
+	PTHREAD_RWLOCK_wrlock(&obj->state_hdl->state_lock);
 
-	state_lock_wipe(entry);
-	state_share_wipe(entry);
-	state_nfs4_state_wipe(entry);
+	release = state_lock_wipe(obj->state_hdl);
+#ifdef _USE_NLM
+	state_share_wipe(obj->state_hdl);
+#endif /* _USE_NLM */
+	state_nfs4_state_wipe(obj->state_hdl);
 
-	PTHREAD_RWLOCK_unlock(&entry->state_lock);
+	PTHREAD_RWLOCK_unlock(&obj->state_hdl->state_lock);
 
 #ifdef DEBUG_SAL
 	dump_all_states();
 #endif
+
+	if (release) {
+		/* Drop the ref for the lock_list */
+		obj->obj_ops->put_ref(obj);
+	}
 }
 
 #ifdef DEBUG_SAL
@@ -1298,7 +1329,7 @@ void dump_all_owners(void)
 	PTHREAD_MUTEX_lock(&all_state_owners_mutex);
 
 	if (!glist_empty(&state_owners_all)) {
-		char str[LOG_BUFF_LEN];
+		char str[LOG_BUFF_LEN] = "\0";
 		struct display_buffer dspbuf = {sizeof(str), str, str};
 		struct glist_head *glist;
 
@@ -1338,7 +1369,9 @@ void state_release_export(struct gsh_export *export)
 
 	state_export_unlock_all();
 	state_export_release_nfs4_state();
+#ifdef _USE_NLM
 	state_export_unshare_all();
+#endif /* _USE_NLM */
 	release_root_op_context();
 }
 

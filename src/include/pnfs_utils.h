@@ -225,6 +225,30 @@ nfsstat4 FSAL_encode_file_layout(XDR *xdrs,
 nfsstat4 FSAL_encode_v4_multipath(XDR *xdrs, const uint32_t num_hosts,
 				  const fsal_multipath_member_t *hosts);
 
+nfsstat4 FSAL_encode_flex_file_layout(XDR *xdrs,
+				 const struct pnfs_deviceid *deviceid,
+				 const uint64_t ffl_stripe_unit,
+				 const uint32_t	ffl_mirrors_len,
+				 u_int stripes,
+				 const uint32_t num_fhs,
+				 const uint16_t *ds_ids,
+				 const struct gsh_buffdesc *fhs,
+				 const uint32_t ffds_efficiency,
+				 const fattr4_owner ffds_user,
+				 const fattr4_owner_group ffds_group,
+				 const ff_flags4 ffl_flags,
+				 const uint32_t ffl_stats_collect_hint);
+
+nfsstat4 FSAL_encode_ff_device_versions4(XDR *xdrs,
+				const u_int multipath_list4_len,
+				const u_int ffda_versions_len,
+				const fsal_multipath_member_t *hosts,
+				const uint32_t ffdv_version,
+				const uint32_t ffdv_minorversion,
+				const uint32_t ffdv_rsize,
+				const uint32_t ffdv_wsize,
+				const bool_t ffdv_tightly_coupled);
+
 nfsstat4 posix2nfs4_error(int posix_errorcode);
 
 /*
@@ -239,7 +263,7 @@ struct fsal_pnfs_ds *pnfs_ds_get(uint16_t id_servers);
 
 static inline void pnfs_ds_get_ref(struct fsal_pnfs_ds *pds)
 {
-	atomic_inc_int32_t(&pds->refcount);
+	(void) atomic_inc_int32_t(&pds->refcount);
 }
 
 void pnfs_ds_put(struct fsal_pnfs_ds *pds);
@@ -247,6 +271,7 @@ void pnfs_ds_remove(uint16_t id_servers, bool final);
 
 int ReadDataServers(config_file_t in_config,
 		    struct config_error_type *err_type);
+void remove_all_dss(void);
 void server_pkginit(void);
 
 #endif				/* PNFS_UTILS_H */

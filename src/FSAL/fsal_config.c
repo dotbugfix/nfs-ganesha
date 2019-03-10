@@ -72,8 +72,6 @@ bool fsal_supports(struct fsal_staticfsinfo_t *info,
 		return !!info->symlink_support;
 	case fso_lock_support:
 		return !!info->lock_support;
-	case fso_lock_support_owner:
-		return !!info->lock_support_owner;
 	case fso_lock_support_async_block:
 		return !!info->lock_support_async_block;
 	case fso_named_attr:
@@ -94,16 +92,18 @@ bool fsal_supports(struct fsal_staticfsinfo_t *info,
 		return !!info->pnfs_mds;
 	case fso_pnfs_ds_supported:
 		return !!info->pnfs_ds;
-	case fso_share_support:
-		return !!info->share_support;
-	case fso_share_support_owner:
-		return !!info->share_support_owner;
-	case fso_reopen_method:
-		return !!info->reopen_method;
 	case fso_grace_method:
 		return !!info->fsal_grace;
 	case fso_link_supports_permission_checks:
 		return !!info->link_supports_permission_checks;
+	case fso_rename_changes_key:
+		return !!info->rename_changes_key;
+	case fso_compute_readdir_cookie:
+		return !!info->compute_readdir_cookie;
+	case fso_whence_is_name:
+		return !!info->whence_is_name;
+	case fso_readdir_plus:
+		return !!info->readdir_plus;
 	default:
 		return false;	/* whatever I don't know about,
 				 * you can't do
@@ -131,11 +131,6 @@ uint32_t fsal_maxpathlen(struct fsal_staticfsinfo_t *info)
 	return info->maxpathlen;
 }
 
-struct timespec fsal_lease_time(struct fsal_staticfsinfo_t *info)
-{
-	return info->lease_time;
-}
-
 fsal_aclsupp_t fsal_acl_support(struct fsal_staticfsinfo_t *info)
 {
 	return info->acl_support;
@@ -160,10 +155,4 @@ uint32_t fsal_umask(struct fsal_staticfsinfo_t *info)
 {
 	return info->umask;
 }
-
-uint32_t fsal_xattr_access_rights(struct fsal_staticfsinfo_t *info)
-{
-	return info->xattr_access_rights;
-}
-
 /** @} */

@@ -42,6 +42,7 @@
 
 #include "fsal_types.h"
 #include "fsal_pnfs.h"
+#include "sal_shared.h"
 #include "config_parsing.h"
 #include "avltree.h"
 #include "abstract_atomic.h"
@@ -52,6 +53,7 @@
 struct gsh_client;
 struct gsh_export;
 struct fsal_up_vector;		/* From fsal_up.h */
+struct state_t;
 
 /**
  * @page newapi New FSAL API
@@ -189,7 +191,7 @@ struct fsal_up_vector;		/* From fsal_up.h */
  * Overview
  * ========
  *
- * In the FSAL, file handles can take three forms.  There is the full,
+ * In the FSAL, file handles can take four forms.  There is the full,
  * internal handle structure, compose of the @c fsal_obj_handle and
  * the FSAL-private structure that contains it.
  *
@@ -199,23 +201,29 @@ struct fsal_up_vector;		/* From fsal_up.h */
  * to find and use the file even if the file has been completely
  * purged from cache or Ganesha has restarted from nothing.  There may
  * be multiple wire-handles per @c fsal_obj_handle.  The wire-handle
- * is produced by the @c handle_digest method on @c fsal_obj_handle.
- * The @c create_handle on @c fsal_export produces a new
- * @c fsal_obj_handle from a wire-handle.
+ * is produced by the @c handle_to_wire method on @c fsal_obj_handle.
+ * FSALs can produce big endian or little endian wire-handles depending
+ * on the architecture.
  *
- * There is the handle-key, the portion of the handle that contains
- * all and only information that uniquely identifies the handle within
+ * A host-handle is a verion of the wire handle in host endian format.  It is
+ * produced from wire-handle by @c wire_to_host to the host's native endian
+ * type.  @c fsal_export operation @c create_handle produces a new @c
+ * fsal_obj_handle from a host-handle.
+ *
+ * Finally, there is the handle-key, a portion of the handle that contains
+ * all and only information that uniquely identifies the object within
  * the entire FSAL (it is insufficient if it only identifies it within
  * the export or within a filesystem.)  There are two functions that
- * generate a handle-key, one is the @c extract_handle method on @c
- * fsal_export.  It is used to get the key from a wire-handle so that
+ * generate a handle-key, one is the @c host_to_key method on @c
+ * fsal_export.  It is used to get the key from a host-handle so that
  * it can be looked up in the cache.  The other is @c handle_to_key on
  * @c fsal_obj_handle.  This is used after lookup or some other
  * operation that produces a @c fsal_obj_handle so that it can be
  * stored or looked up in the cache.
  *
  * The invariant to be maintained is that given an @c fsal_obj_handle,
- * fh, extract_handle(digest_handle(fh)) = handle_to_key(fh).
+ * obj_hdl, exp_ops.host_to_key(wire_to_host(handle_to_wire(obj_hdl)))
+ * is equal to obj_ops->handle_to_key(obj_hdl).
  *
  * History and Details
  * ===================
@@ -240,11 +248,12 @@ struct fsal_up_vector;		/* From fsal_up.h */
  *
  * 2. The purpose of the @c export_id in the protocol "handle" is to
  *    locate the FSAL that knows what is inside the opaque.  The @c
- *    extract_handle is an export method for that purpose.  It should
- *    be able to take the protocol handle opaque and translate it into
- *    a handle-key that @c cache_inode_get can use to find an entry.
+ *    wire_to_host is an export method for that purpose.  It should
+ *    be able to take the wire-handle opaque and translate it into
+ *    a host-handle. handle-key should be derived from @c host_to_key
+ *    that MDCACHE can use to find an entry.
  *
- * 3. cache_inode_get takes an fh_desc argument which is not a
+ * 3. OBSOLETE - cache_inode_get takes an fh_desc argument which is not a
  *    handle but a _key_.  It is used to generate the hash and to do
  *    the secondary key compares.  That is all it is used for.  The
  *    end result _must_ be a cache entry and its associated
@@ -252,13 +261,14 @@ struct fsal_up_vector;		/* From fsal_up.h */
  *    cache_inode_new to see how this works.
  *
  * 4. The @c handle_to_key method, a @c fsal_obj_handle method,
- *    generates a key for the cache inode hash table from the contents
- *    of the @c fsal_obj_handle.  It is an analogue of extract_handle.
- *    Note where it is called to see why it is there.
+ *    generates a key for the MDCACHE hash table from the contents
+ *    of the @c fsal_obj_handle.  It is an analogue of fsal export
+ *    @c host_to_key method. Note where it is called to see why it is
+ *    there.
  *
- * 5. The digest method is similar in scope but it is the inverse of
- *    @c extract_handle.  It's job is to fill in the opaque part of a
- *    protocol handle.  Note that it gets passed a @c gsh_buffdesc
+ * 5. The @c handle_to_wire method is similar in scope but it is the
+ *    inverse of @c wire_to_host.  It's job is to fill in the opaque
+ *    part of a protocol handle.  Note that it gets passed a @c gsh_buffdesc
  *    that describes the full opaque storage in whatever protocol
  *    specific structure is used.  It's job is to put whatever it
  *    takes into the opaque so the second and third items in this list
@@ -268,7 +278,7 @@ struct fsal_up_vector;		/* From fsal_up.h */
  *    private structure for the object.  Note that there is no handle
  *    member of this public structure.  The bits necessary to both
  *    create a wire handle and use a filesystem handle go into this
- *    private structure. You can put whatever you is required into the
+ *    private structure. You can put whatever is required into the
  *    private part.  Since both @c fsal_export and @c fsal_obj_handle
  *    have private object storage, you could even do things like have
  *    a container anchored in the export object that maps the
@@ -286,15 +296,6 @@ struct fsal_up_vector;		/* From fsal_up.h */
  * obvious case is what you describe in @c nfs[34]_FhandleToCache.  These
  * various methods make that happen.
  *
- * The linkage between a @c cache_entry_t and a @c fsal_obj_handle is
- * 1-to-1 so we should really think of them as one, single object.  In
- * fact, there should never be a cache_entry without its associated @c
- * fsal_obj_handle.  The @c cache_entry_t is the cache inode part
- * where things like locks and object type stuff (the AVL tree for
- * dirs) are kept.  The @c fsal_obj_handle part that it points to
- * holds the FSAL specific part where the FD (or its backend's equiv),
- * open state, and anything needed for talking to the system or
- * libraries.
  */
 
 /**
@@ -304,7 +305,7 @@ struct fsal_up_vector;		/* From fsal_up.h */
  * e.g.  the argument list changed or a method is removed.
  */
 
-#define FSAL_MAJOR_VERSION 4
+#define FSAL_MAJOR_VERSION 8
 
 /**
  * @brief Minor Version
@@ -406,7 +407,7 @@ struct req_op_context {
 	uint32_t nfs_minorvers;	/*< NFSv4 minor version */
 	uint32_t req_type;	/*< request_type NFS | 9P */
 	struct gsh_client *client;	/*< client host info including stats */
-	struct gsh_export *export;	/*< current export */
+	struct gsh_export *ctx_export;	/*< current export */
 	struct fsal_export *fsal_export;	/*< current fsal export */
 	struct export_perms *export_perms;	/*< Effective export perms */
 	nsecs_elapsed_t start_time;	/*< start time of this op/request */
@@ -615,6 +616,22 @@ struct fsal_ops {
  */
 	 void (*fsal_pnfs_ds_ops)(struct fsal_pnfs_ds_ops *ops);
 
+/**
+ * @brief Provides function to extract FSAL stats
+ *
+ * @param[in] fsal_hdl		FSAL module
+ * @param[in] iter		opaque pointer to DBusMessageIter
+ */
+	void (*fsal_extract_stats)(struct fsal_module *const fsal_hdl,
+				   void *iter);
+
+/**
+ * @brief FSAL function to reset FSAL stats
+ *
+ * @param[in] fsal_hdl          FSAL module
+ */
+	void (*fsal_reset_stats)(struct fsal_module *const fsal_hdl);
+
 /**@}*/
 };
 
@@ -626,8 +643,49 @@ struct export_ops {
 /**@{*/
 
 /**
+* Export information
+*/
+
+/**
+ * @brief Get the name of the FSAL provisioning the export
+ *
+ * This function is used to find the name of the ultimate FSAL providing the
+ * filesystem.  If FSALs are stacked, then the super-FSAL may want to pass this
+ * through to the sub-FSAL to get the name, or add the sub-FSAL's name onto it's
+ * own name.
+ *
+ * @param[in] exp_hdl The export to query.
+ * @return Name of FSAL provisioning export
+ */
+	 const char *(*get_name)(struct fsal_export *exp_hdl);
+/**@}*/
+
+/**@{*/
+
+/**
 * Export lifecycle management.
 */
+
+/**
+ * @brief Prepare an export to be unexported
+ *
+ * This function is called prior to unexporting an export. It should do any
+ * preparation that the export requires prior to being removed.
+ */
+	 void (*prepare_unexport)(struct fsal_export *exp_hdl);
+
+/**
+ * @brief Clean up an export when it's unexported
+ *
+ * This function is called when the export is unexported.  It should release any
+ * working data that is not necessary when unexported, but not free the export
+ * itself, as there are still references to it.
+ *
+ * @param[in] exp_hdl	The export to unexport.
+ * @param[in] root_obj	The root object of the export
+ */
+	 void (*unexport)(struct fsal_export *exp_hdl,
+			  struct fsal_obj_handle *root_obj);
 
 /**
  * @brief Finalize an export
@@ -652,15 +710,30 @@ struct export_ops {
  * This function looks up a path within the export, it is typically
  * used to get a handle for the root directory of the export.
  *
- * @param[in]  exp_hdl The export in which to look up
- * @param[in]  path    The path to look up
- * @param[out] handle  The object found
+ * The caller will set the request_mask in attrs_out to indicate the attributes
+ * of interest. ATTR_ACL SHOULD NOT be requested and need not be provided. If
+ * not all the requested attributes can be provided, this method MUST return
+ * an error unless the ATTR_RDATTR_ERR bit was set in the request_mask.
+ *
+ * Since this method instantiates a new fsal_obj_handle, it will be forced
+ * to fetch at least some attributes in order to even know what the object
+ * type is (as well as it's fileid and fsid). For this reason, the operation
+ * as a whole can be expected to fail if the attributes were not able to be
+ * fetched.
+ *
+ * @param[in]     exp_hdl   The export in which to look up
+ * @param[in]     path      The path to look up
+ * @param[out]    handle    The object found
+ * @param[in,out] attrs_out Optional attributes for newly created object
+ *
+ * @note On success, @a handle has been ref'd
  *
  * @return FSAL status.
  */
 	 fsal_status_t (*lookup_path)(struct fsal_export *exp_hdl,
 				      const char *path,
-				      struct fsal_obj_handle **handle);
+				      struct fsal_obj_handle **handle,
+				      struct attrlist *attrs_out);
 
 /**
  * @brief Look up a junction
@@ -683,48 +756,80 @@ struct export_ops {
 					  struct fsal_obj_handle *junction,
 					  struct fsal_obj_handle **handle);
 /**
- * @brief Extract an opaque handle
+ * @brief Convert a wire handle to a host handle
  *
- * This function extracts a "key" handle from a "wire" handle.  That
+ * This function extracts a host handle from a wire handle.  That
  * is, when given a handle as passed to a client, this method will
- * extract the unique bits used to index the inode cache.
+ * extract the handle to create objects.
  *
- * @param[in]     exp_hdl Export in which to look up handle
- * @param[in]     in_type Protocol through which buffer was received.  One
- *                        special case, FSAL_DIGEST_SIZEOF, simply
- *                        requests that fh_desc.len be set to the proper
- *                        size of a wire handle.
+ * @param[in]     exp_hdl Export handle
+ * @param[in]     in_type Protocol through which buffer was received.
+ * @param[in]     flags   Flags to describe the wire handle. Example, if
+ *			  the handle is a big endian handle.
  * @param[in,out] fh_desc Buffer descriptor.  The address of the
  *                        buffer is given in @c fh_desc->buf and must
  *                        not be changed.  @c fh_desc->len is the
  *                        length of the data contained in the buffer,
- *                        and @c fh_desc->maxlen is the total size of
- *                        the buffer, should the FSAL wish to write a
- *                        longer handle.  @c fh_desc->len must be
- *                        updated to the correct size.
+ *                        @c fh_desc->len must be updated to the correct
+ *                        host handle size.
  *
  * @return FSAL type.
  */
-	 fsal_status_t (*extract_handle)(struct fsal_export *exp_hdl,
+	 fsal_status_t (*wire_to_host)(struct fsal_export *exp_hdl,
 					 fsal_digesttype_t in_type,
 					 struct gsh_buffdesc *fh_desc,
 					 int flags);
+
 /**
- * @brief Create a FSAL object handle from a wire handle
+ * @brief extract "key" from a host handle
  *
- * This function creates a FSAL object handle from a client supplied
- * "wire" handle (when an object is no longer in cache but the client
- * still remembers the nandle).
+ * This function extracts a "key" from a host handle.  That is, when
+ * given a handle that is extracted from wire_to_host() above, this
+ * method will extract the unique bits used to index the inode cache.
  *
- * @param[in]  exp_hdl  The export in which to create the handle
- * @param[in]  hdl_desc Buffer descriptor for the "wire" handle
- * @param[out] handle   FSAL object handle
+ * @param[in]     exp_hdl Export handle
+ * @param[in,out] fh_desc Buffer descriptor.  The address of the
+ *                        buffer is given in @c fh_desc->buf and must
+ *                        not be changed.  @c fh_desc->len is the length
+ *                        of the data contained in the buffer, @c
+ *                        fh_desc->len must be updated to the correct
+ *                        size. In other words, the key has to be placed
+ *                        at the beginning of the buffer!
+ */
+	 fsal_status_t (*host_to_key)(struct fsal_export *exp_hdl,
+				      struct gsh_buffdesc *fh_desc);
+
+/**
+ * @brief Create a FSAL object handle from a host handle
+ *
+ * This function creates a FSAL object handle from a host handle
+ * (when an object is no longer in cache but the client still remembers
+ * the handle).
+ *
+ * The caller will set the request_mask in attrs_out to indicate the attributes
+ * of interest. ATTR_ACL SHOULD NOT be requested and need not be provided. If
+ * not all the requested attributes can be provided, this method MUST return
+ * an error unless the ATTR_RDATTR_ERR bit was set in the request_mask.
+ *
+ * Since this method instantiates a new fsal_obj_handle, it will be forced
+ * to fetch at least some attributes in order to even know what the object
+ * type is (as well as it's fileid and fsid). For this reason, the operation
+ * as a whole can be expected to fail if the attributes were not able to be
+ * fetched.
+ *
+ * @param[in]     exp_hdl   The export in which to create the handle
+ * @param[in]     hdl_desc  Buffer descriptor for the host handle
+ * @param[out]    handle    FSAL object handle
+ * @param[in,out] attrs_out Optional attributes for newly created object
+ *
+ * @note On success, @a handle has been ref'd
  *
  * @return FSAL status.
  */
 	 fsal_status_t (*create_handle)(struct fsal_export *exp_hdl,
-					struct gsh_buffdesc *hdl_desc,
-					struct fsal_obj_handle **handle);
+					struct gsh_buffdesc *fh_desc,
+					struct fsal_obj_handle **handle,
+					struct attrlist *attrs_out);
 /**@}*/
 
 /**@{*/
@@ -818,18 +923,6 @@ struct export_ops {
 	 uint32_t (*fs_maxpathlen)(struct fsal_export *exp_hdl);
 
 /**
- * @brief Get the lease time for this filesystem
- *
- * @note Currently this value has no effect, with lease time being
- * configured globally for all filesystems at once.
- *
- * @param[in] exp_hdl Filesystem to interrogate
- *
- * @return Lease time.
- */
-	struct timespec (*fs_lease_time)(struct fsal_export *exp_hdl);
-
-/**
  * @brief Get supported ACL types
  *
  * This function returns a bitmask indicating whether it supports
@@ -872,20 +965,6 @@ struct export_ops {
  * @return creation umask.
  */
 	 uint32_t (*fs_umask)(struct fsal_export *exp_hdl);
-
-/**
- * @brief Get permissions applied to names attributes
- *
- * @note This doesn't make sense to me as an export-level parameter.
- * Permissions on named attributes could reasonably vary with
- * permission and ownership of the associated file, and some
- * attributes may be read/write while others are read-only. -- ACE
- *
- * @param[in] exp_hdl Filesystem to interrogate
- *
- * @return permissions on named attributes.
- */
-	 uint32_t (*fs_xattr_access_rights)(struct fsal_export *exp_hdl);
 /**@}*/
 
 /**@{*/
@@ -919,12 +998,14 @@ struct export_ops {
  * @param[in]  exp_hdl    The export to interrogate
  * @param[in]  filepath   The path within the export to check
  * @param[in]  quota_type Whether we are checking inodes or blocks
+ * @param[in]  quota_id   Id for which quota is set
  * @param[out] quota      The user's quota
  *
  * @return FSAL types.
  */
 	 fsal_status_t (*get_quota)(struct fsal_export *exp_hdl,
 				    const char *filepath, int quota_type,
+				    int quota_id,
 				    fsal_quota_t *quota);
 
 /**
@@ -935,6 +1016,7 @@ struct export_ops {
  * @param[in]  exp_hdl    The export to interrogate
  * @param[in]  filepath   The path within the export to check
  * @param[in]  quota_type Whether we are checking inodes or blocks
+ * @param[in]  quota_id   Id for which quota is set
  * @param[in]  quota      The values to set for the quota
  * @param[out] resquota   New values set (optional)
  *
@@ -942,6 +1024,7 @@ struct export_ops {
  */
 	 fsal_status_t (*set_quota)(struct fsal_export *exp_hdl,
 				    const char *filepath, int quota_type,
+				    int quota_id,
 				    fsal_quota_t *quota,
 				    fsal_quota_t *resquota);
 /**@}*/
@@ -1042,16 +1125,61 @@ struct export_ops {
  * This function is called by write and commit to match the commit verifier
  * with the one returned on  write.
  *
+ * @param[in] exp_hdl	Export to query
  * @param[in,out] verf_desc Address and length of verifier
  */
-	void (*get_write_verifier)(struct gsh_buffdesc *verf_desc);
+	void (*get_write_verifier)(struct fsal_export *exp_hdl,
+				   struct gsh_buffdesc *verf_desc);
 
 /**@}*/
+
+/**
+ * @brief Allocate a state_t structure
+ *
+ * Note that this is not expected to fail since memory allocation is
+ * expected to abort on failure.
+ *
+ * @param[in] exp_hdl               Export state_t will be associated with
+ * @param[in] state_type            Type of state to allocate
+ * @param[in] related_state         Related state if appropriate
+ *
+ * @returns a state structure.
+ */
+
+	struct state_t *(*alloc_state)(struct fsal_export *exp_hdl,
+				       enum state_type state_type,
+				       struct state_t *related_state);
+
+/**
+ * @brief Free a state_t structure
+ *
+ * @param[in] exp_hdl               Export state_t is associated with
+ * @param[in] state                 state_t structure to free.
+ *
+ * @returns NULL on failure otherwise a state structure.
+ */
+
+	void (*free_state)(struct fsal_export *exp_hdl, struct state_t *state);
+
+/**
+ * @brief Check to see if a user is superuser
+ *
+ * @param[in] exp_hdl               Export state_t is associated with
+ * @param[in] creds                 Credentials to check for superuser
+ *
+ * @returns NULL on failure otherwise a state structure.
+ */
+
+	bool (*is_superuser)(struct fsal_export *exp_hdl,
+			     const struct user_cred *creds);
 };
 
 /**
  * @brief Filesystem operations
  */
+
+typedef void (*fsal_async_cb)(struct fsal_obj_handle *obj, fsal_status_t ret,
+			      void *obj_data, void *caller_data);
 
 typedef int (*claim_filesystem_cb)(struct fsal_filesystem *fs,
 				   struct fsal_export *exp);
@@ -1096,8 +1224,74 @@ static inline int sizeof_fsid(enum fsid_type type)
 
 typedef uint64_t fsal_cookie_t;
 
-typedef bool (*fsal_readdir_cb)(const char *name, void *dir_state,
-				fsal_cookie_t cookie);
+/* Cookie values 0, 1, and 2 are reserved by NFS:
+ * 0 is "start from beginning"
+ * 1 is the cookie associated with the "." entry
+ * 2 is the cookie associated with the ".." entry
+ *
+ * FSALs that support compute_readdir_cookie that are for some reason unable
+ * to compute the cookie for the very first entry (other than . and ..)
+ * should return FIRST_COOKIE. Caching layers such as MDCACHE should treat an
+ * insert of an entry with cookie 3 as inserting a new first entry, and then
+ * compute a new cookie for the old first entry - they can safely assume the
+ * sort order doesn't change which may allow for optimization of things like'
+ * AVL trees.
+ */
+#define FIRST_COOKIE 3
+
+enum fsal_dir_result {
+	/** Continue readdir, call back with another dirent. */
+	DIR_CONTINUE,
+	/** Continue supplying entries if readahead is supported, otherwise
+	 *  stop providing entries.
+	 */
+	DIR_READAHEAD,
+	/** Terminate readdir. */
+	DIR_TERMINATE,
+};
+
+const char *fsal_dir_result_str(enum fsal_dir_result result);
+
+/**
+ * @brief Callback to provide readdir caller with each directory entry
+ *
+ * The called function will indicate if readdir should continue, terminate,
+ * terminate and mark cookie, or continue and mark cookie. In the last case,
+ * the called function may also return a cookie if requested in the ret_cookie
+ * parameter (which may be NULL if the caller doesn't need to mark cookies).
+ * If ret_cookie is 0, the caller had no cookie to return.
+ *
+ * @param[in]      name         The name of the entry
+ * @param[in]      obj          The fsal_obj_handle describing the entry
+ * @param[in]      attrs        The requested attribues for the entry (see
+ *                              readdir attrmask parameter)
+ * @param[in]      dir_state    Opaque pointer to be passed to callback
+ * @param[in]      cookie       An FSAL generated cookie for the entry
+ *
+ * @returns fsal_dir_result above
+ */
+typedef enum fsal_dir_result (*fsal_readdir_cb)(
+				const char *name, struct fsal_obj_handle *obj,
+				struct attrlist *attrs,
+				void *dir_state, fsal_cookie_t cookie);
+
+/**
+ * @brief Argument for read2/write2 and their callbacks
+ *
+ */
+struct fsal_io_arg {
+	size_t io_amount;	/**< Total amount of I/O actually done */
+	struct io_info *info;	/**< More information about data */
+	union {
+		bool end_of_file;	/**< True if end-of-file reached */
+		bool fsal_stable;	/**< requested/achieved stability */
+	};
+	struct state_t *state;	/**< State to use for read (or NULL) */
+	uint64_t offset;	/**< Offset into file to read */
+	int iov_count;		/**< Number of vectors in iov */
+	struct iovec iov[];	/**< Vector of buffers to fill */
+};
+
 /**
  * @brief FSAL object operations vector
  */
@@ -1110,15 +1304,55 @@ struct fsal_obj_ops {
  */
 
 /**
+ * @brief Get a reference to a handle
+ *
+ * Refcounting is required for all FSALs. An FSAL that will have FSAL_MDCACHE
+ * stacked on top need not handle this as FSAL_MDCACHE will handle it.
+ *
+ * @param[in] obj_hdl Handle to release
+ */
+	 void (*get_ref)(struct fsal_obj_handle *obj_hdl);
+
+/**
+ * @brief Put a reference to a handle
+ *
+ * Refcounting is required for all FSALs. An FSAL that will have FSAL_MDCACHE
+ * stacked on top need not handle this as FSAL_MDCACHE will handle it.
+ *
+ * @param[in] obj_hdl Handle to release
+ */
+	 void (*put_ref)(struct fsal_obj_handle *obj_hdl);
+
+/**
  * @brief Clean up a filehandle
  *
  * This function cleans up private resources associated with a
  * filehandle and deallocates it.  Implement this method or you will
- * leak.
+ * leak.  Refcount (if used) should be 1
  *
  * @param[in] obj_hdl Handle to release
  */
 	 void (*release)(struct fsal_obj_handle *obj_hdl);
+
+/**
+ * @brief Merge a duplicate handle with an original handle
+ *
+ * This function is used if an upper layer detects that a duplicate
+ * object handle has been created. It allows the FSAL to merge anything
+ * from the duplicate back into the original.
+ *
+ * The caller must release the object (the caller may have to close
+ * files if the merge is unsuccessful).
+ *
+ * @param[in]  orig_hdl  Original handle
+ * @param[in]  dupe_hdl Handle to merge into original
+ *
+ * @return FSAL status.
+ *
+ */
+	 fsal_status_t (*merge)(struct fsal_obj_handle *orig_hdl,
+				struct fsal_obj_handle *dupe_hdl);
+
 /**@}*/
 
 /**@{*/
@@ -1137,15 +1371,30 @@ struct fsal_obj_ops {
  * NULL, a handle to the root of the export was returned.  This
  * special case is no longer supported and should not be implemented.
  *
- * @param[in]  dir_hdl Directory to search
- * @param[in]  path    Name to look up
- * @param[out] handle  Object found
+ * The caller will set the request_mask in attrs_out to indicate the attributes
+ * of interest. ATTR_ACL SHOULD NOT be requested and need not be provided. If
+ * not all the requested attributes can be provided, this method MUST return
+ * an error unless the ATTR_RDATTR_ERR bit was set in the request_mask.
+ *
+ * Since this method instantiates a new fsal_obj_handle, it will be forced
+ * to fetch at least some attributes in order to even know what the object
+ * type is (as well as it's fileid and fsid). For this reason, the operation
+ * as a whole can be expected to fail if the attributes were not able to be
+ * fetched.
+ *
+ * @param[in]     dir_hdl   Directory to search
+ * @param[in]     path      Name to look up
+ * @param[out]    handle    Object found
+ * @param[in,out] attrs_out Optional attributes for newly created object
+ *
+ * @note On success, @a handle has been ref'd
  *
  * @return FSAL status.
  */
 	 fsal_status_t (*lookup)(struct fsal_obj_handle *dir_hdl,
 				 const char *path,
-				 struct fsal_obj_handle **handle);
+				 struct fsal_obj_handle **handle,
+				 struct attrlist *attrs_out);
 
 /**
  * @brief Read a directory
@@ -1158,17 +1407,64 @@ struct fsal_obj_ops {
  *                       start at beginning.
  * @param[in]  dir_state Opaque pointer to be passed to callback
  * @param[in]  cb        Callback to receive names
+ * @param[in]  attrmask  Indicate which attributes the caller is interested in
  * @param[out] eof       true if the last entry was reached
  *
- * @retval true if more entries are required
- * @retval false if no more entries are required (and the current one
- *               has not been consumed)
+ * @return FSAL status.
  */
 	 fsal_status_t (*readdir)(struct fsal_obj_handle *dir_hdl,
 				  fsal_cookie_t *whence,
 				  void *dir_state,
 				  fsal_readdir_cb cb,
+				  attrmask_t attrmask,
 				  bool *eof);
+
+/**
+ * @brief Compute the readdir cookie for a given filename.
+ *
+ * Some FSALs are able to compute the cookie for a filename deterministically
+ * from the filename. They also have a defined order of entries in a directory
+ * based on the name (could be strcmp sort, could be strict alpha sort, could
+ * be deterministic order based on cookie - in any case, the dirent_cmp method
+ * will also be provided.
+ *
+ * The returned cookie is the cookie that can be passed as whence to FIND that
+ * directory entry. This is different than the cookie passed in the readdir
+ * callback (which is the cookie of the NEXT entry).
+ *
+ * @param[in]  parent  Directory file name belongs to.
+ * @param[in]  name    File name to produce the cookie for.
+ *
+ * @retval 0 if not supported.
+ * @returns The cookie value.
+ */
+	fsal_cookie_t (*compute_readdir_cookie)(struct fsal_obj_handle *parent,
+						const char *name);
+
+/**
+ * @brief Help sort dirents.
+ *
+ * For FSALs that are able to compute the cookie for a filename
+ * deterministically from the filename, there must also be a defined order of
+ * entries in a directory based on the name (could be strcmp sort, could be
+ * strict alpha sort, could be deterministic order based on cookie).
+ *
+ * Although the cookies could be computed, the caller will already have them
+ * and thus will provide them to save compute time.
+ *
+ * @param[in]  parent   Directory entries belong to.
+ * @param[in]  name1    File name of first dirent
+ * @param[in]  cookie1  Cookie of first dirent
+ * @param[in]  name2    File name of second dirent
+ * @param[in]  cookie2  Cookie of second dirent
+ *
+ * @retval < 0 if name1 sorts before name2
+ * @retval == 0 if name1 sorts the same as name2
+ * @retval >0 if name1 sorts after name2
+ */
+	int (*dirent_cmp)(struct fsal_obj_handle *parent,
+			  const char *name1, fsal_cookie_t cookie1,
+			  const char *name2, fsal_cookie_t cookie2);
 /**@}*/
 
 /**@{*/
@@ -1178,81 +1474,130 @@ struct fsal_obj_ops {
  */
 
 /**
- * @brief Create a regular file
- *
- * This function creates a new regular file.
- *
- * @param[in]     dir_hdl Directory in which to create the file
- * @param[in]     name    Name of file to create
- * @param[in,out] attrib  Attributes to set on newly created
- *                        object/attributes you actually got.
- * @param[out]    new_obj Newly created object
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*create)(struct fsal_obj_handle *dir_hdl,
-				 const char *name, struct attrlist *attrib,
-				 struct fsal_obj_handle **new_obj);
-
-/**
  * @brief Create a directory
  *
  * This function creates a new directory.
  *
- * @param[in]     dir_hdl Directory in which to create the directory
- * @param[in]     name    Name of directory to create
- * @param[in,out] attrib  Attributes to set on newly created
- *                        object/attributes you actually got.
- * @param[out]    new_obj Newly created object
+ * For support_ex, this method will handle attribute setting. The caller
+ * MUST include the mode attribute and SHOULD NOT include the owner or
+ * group attributes if they are the same as the op_ctx->cred.
+ *
+ * The caller is expected to invoke fsal_release_attrs to release any
+ * resources held by the set attributes. The FSAL layer MAY have added an
+ * inherited ACL.
+ *
+ * The caller will set the request_mask in attrs_out to indicate the attributes
+ * of interest. ATTR_ACL SHOULD NOT be requested and need not be provided. If
+ * not all the requested attributes can be provided, this method MUST return
+ * an error unless the ATTR_RDATTR_ERR bit was set in the request_mask.
+ *
+ * Since this method instantiates a new fsal_obj_handle, it will be forced
+ * to fetch at least some attributes in order to even know what the object
+ * type is (as well as it's fileid and fsid). For this reason, the operation
+ * as a whole can be expected to fail if the attributes were not able to be
+ * fetched.
+ *
+ * @param[in]     dir_hdl   Directory in which to create the directory
+ * @param[in]     name      Name of directory to create
+ * @param[in]     attrs_in  Attributes to set on newly created object
+ * @param[out]    new_obj   Newly created object
+ * @param[in,out] attrs_out Optional attributes for newly created object
+ *
+ * @note On success, @a new_obj has been ref'd
  *
  * @return FSAL status.
  */
 	 fsal_status_t (*mkdir)(struct fsal_obj_handle *dir_hdl,
-				const char *name, struct attrlist *attrib,
-				struct fsal_obj_handle **new_obj);
+				const char *name, struct attrlist *attrs_in,
+				struct fsal_obj_handle **new_obj,
+				struct attrlist *attrs_out);
 
 /**
  * @brief Create a special file
  *
  * This function creates a new special file.
  *
- * @param[in]     dir_hdl  Directory in which to create the object
- * @param[in]     name     Name of object to create
- * @param[in]     nodetype Type of special file to create
- * @param[in]     dev      Major and minor device numbers for block or
- *                         character special
- * @param[in,out] attrib   Attributes to set on newly created
- *                         object/attributes you actually got.
- * @param[out]    new_obj  Newly created object
+ * For support_ex, this method will handle attribute setting. The caller
+ * MUST include the mode attribute and SHOULD NOT include the owner or
+ * group attributes if they are the same as the op_ctx->cred.
+ *
+ * If the node type has rawdev info, then @a attrs_in MUST have the rawdev field
+ * set.
+ *
+ * The caller is expected to invoke fsal_release_attrs to release any
+ * resources held by the set attributes. The FSAL layer MAY have added an
+ * inherited ACL.
+ *
+ * The caller will set the request_mask in attrs_out to indicate the attributes
+ * of interest. ATTR_ACL SHOULD NOT be requested and need not be provided. If
+ * not all the requested attributes can be provided, this method MUST return
+ * an error unless the ATTR_RDATTR_ERR bit was set in the request_mask.
+ *
+ * Since this method instantiates a new fsal_obj_handle, it will be forced
+ * to fetch at least some attributes in order to even know what the object
+ * type is (as well as it's fileid and fsid). For this reason, the operation
+ * as a whole can be expected to fail if the attributes were not able to be
+ * fetched.
+ *
+ * @param[in]     dir_hdl   Directory in which to create the object
+ * @param[in]     name      Name of object to create
+ * @param[in]     nodetype  Type of special file to create
+ * @param[in]     attrs_in  Attributes to set on newly created object
+ * @param[out]    new_obj   Newly created object
+ * @param[in,out] attrs_out Optional attributes for newly created object
+ *
+ * @note On success, @a new_obj has been ref'd
  *
  * @return FSAL status.
  */
 	 fsal_status_t (*mknode)(struct fsal_obj_handle *dir_hdl,
 				 const char *name,
 				 object_file_type_t nodetype,
-				 fsal_dev_t *dev,
-				 struct attrlist *attrib,
-				 struct fsal_obj_handle **new_obj);
+				 struct attrlist *attrs_in,
+				 struct fsal_obj_handle **new_obj,
+				 struct attrlist *attrs_out);
 
 /**
  * @brief Create a symbolic link
  *
  * This function creates a new symbolic link.
  *
+ * For support_ex, this method will handle attribute setting. The caller
+ * MUST include the mode attribute and SHOULD NOT include the owner or
+ * group attributes if they are the same as the op_ctx->cred.
+ *
+ * The caller is expected to invoke fsal_release_attrs to release any
+ * resources held by the set attributes. The FSAL layer MAY have added an
+ * inherited ACL.
+ *
+ * The caller will set the request_mask in attrs_out to indicate the attributes
+ * of interest. ATTR_ACL SHOULD NOT be requested and need not be provided. If
+ * not all the requested attributes can be provided, this method MUST return
+ * an error unless the ATTR_RDATTR_ERR bit was set in the request_mask.
+ *
+ * Since this method instantiates a new fsal_obj_handle, it will be forced
+ * to fetch at least some attributes in order to even know what the object
+ * type is (as well as it's fileid and fsid). For this reason, the operation
+ * as a whole can be expected to fail if the attributes were not able to be
+ * fetched.
+ *
  * @param[in]     dir_hdl   Directory in which to create the object
  * @param[in]     name      Name of object to create
  * @param[in]     link_path Content of symbolic link
- * @param[in,out] attrib    Attributes to set on newly created
- *                          object/attributes you actually got.
- * @param[out] new_obj      Newly created object
+ * @param[in]     attrs_in  Attributes to set on newly created object
+ * @param[out]    new_obj   Newly created object
+ * @param[in,out] attrs_out Optional attributes for newly created object
+ *
+ * @note On success, @a new_obj has been ref'd
  *
  * @return FSAL status.
  */
 	 fsal_status_t (*symlink)(struct fsal_obj_handle *dir_hdl,
 				  const char *name,
 				  const char *link_path,
-				  struct attrlist *attrib,
-				  struct fsal_obj_handle **new_obj);
+				  struct attrlist *attrs_in,
+				  struct fsal_obj_handle **new_obj,
+				  struct attrlist *attrs_out);
 /**@}*/
 
 /**@{*/
@@ -1295,44 +1640,45 @@ struct fsal_obj_ops {
  * allow filesystem specific semantics to be applied to cached
  * metadata.
  *
+ * This method must read attributes and/or get them from a cache.
+ *
  * @param[in] obj_hdl     Handle to check
  * @param[in] access_type Access requested
  * @param[out] allowed    Returned access that could be granted
  * @param[out] denied     Returned access that would be granted
+ * @param[in] owner_skip  Skip test if op_ctx->creds is owner
  *
  * @return FSAL status.
  */
 	 fsal_status_t (*test_access)(struct fsal_obj_handle *obj_hdl,
 				      fsal_accessflags_t access_type,
 				      fsal_accessflags_t *allowed,
-				      fsal_accessflags_t *denied);
+				      fsal_accessflags_t *denied,
+				      bool owner_skip);
 
 /**
  * @brief Get attributes
  *
- * This function freshens the cached attributes stored on the handle.
- * Since the caller can take the attribute lock and read them off the
- * public filehandle, they are not copied out.
+ * This function fetches the attributes for the object. The attributes
+ * requested in the mask are copied out (though other attributes might
+ * be copied out).
  *
- * @param[in]  obj_hdl  Object to query
+ * The caller will set the request_mask in attrs_out to indicate the attributes
+ * of interest. ATTR_ACL SHOULD NOT be requested and need not be provided. If
+ * not all the requested attributes can be provided, this method MUST return
+ * an error unless the ATTR_RDATTR_ERR bit was set in the request_mask.
  *
- * @return FSAL status.
- */
-	 fsal_status_t (*getattrs)(struct fsal_obj_handle *obj_hdl);
-
-/**
- * @brief Set attributes on an object
+ * The caller MUST call fsal_release_attrs when done with the copied
+ * out attributes. This will release any attributes that might take
+ * additional memory.
  *
- * This function sets attributes on an object.  Which attributes are
- * set is determined by @c attrib_set->mask.
- *
- * @param[in] obj_hdl    The object to modify
- * @param[in] attrib_set Attributes to set
+ * @param[in]  obj_hdl    Object to query
+ * @param[out] attrs_out  Attribute list for file
  *
  * @return FSAL status.
  */
-	 fsal_status_t (*setattrs)(struct fsal_obj_handle *obj_hdl,
-				   struct attrlist *attrib_set);
+	 fsal_status_t (*getattrs)(struct fsal_obj_handle *obj_hdl,
+				   struct attrlist *attrs_out);
 
 /**
  * @brief Create a new link
@@ -1348,19 +1694,6 @@ struct fsal_obj_ops {
 	 fsal_status_t (*link)(struct fsal_obj_handle *obj_hdl,
 			       struct fsal_obj_handle *destdir_hdl,
 			       const char *name);
-
-/**
- * @brief get fs_locations
- *
- * This function returns the fs locations for an object.
- *
- * @param[in] obj_hdl        Object to get fs locations for
- * @param[out] fs_locations4 fs locations
- *
- * @return FSAL status
- */
-	 fsal_status_t (*fs_locations)(struct fsal_obj_handle *obj_hdl,
-				       struct fs_locations4 *fs_locs);
 
 /**
  * @brief Rename a file
@@ -1386,12 +1719,14 @@ struct fsal_obj_ops {
  * This function removes a name from a directory and possibly deletes
  * the file so named.
  *
- * @param[in] obj_hdl The directory from which to remove the name
+ * @param[in] dir_hdl The directory from which to remove the name
+ * @param[in] obj_hdl The object being removed
  * @param[in] name    The name to remove
  *
  * @return FSAL status.
  */
-	 fsal_status_t (*unlink)(struct fsal_obj_handle *obj_hdl,
+	 fsal_status_t (*unlink)(struct fsal_obj_handle *dir_hdl,
+				 struct fsal_obj_handle *obj_hdl,
 				 const char *name);
 
 /**@}*/
@@ -1401,147 +1736,6 @@ struct fsal_obj_ops {
  * I/O management
  */
 
-/**
- * @brief Open a file for read or write
- *
- * This function opens a file for read or write.  The file should not
- * already be opened when this function is called.  The thread calling
- * this function will have hold the Cache inode content lock
- * exclusively and the FSAL may assume whatever private state it uses
- * to manage open/close status is protected.
- *
- * @param[in] obj_hdl   File to open
- * @param[in] openflags Mode for open
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*open)(struct fsal_obj_handle *obj_hdl,
-			       fsal_openflags_t openflags);
-
-/**
- * @brief Re-open a file that may be already opened
- *
- * This function reopens the file with the given open flags. You can
- * atomically go from read only flag to readwrite or vice versa.
- * This is used to reopen a file for readwrite, if the file is already
- * opened for readonly. This will not lose any file locks that are
- * already placed. May not be supported by all FSALs.
- */
-	 fsal_status_t (*reopen)(struct fsal_obj_handle *obj_hdl,
-				 fsal_openflags_t openflags);
-
-/**
- * @brief Return open status
- *
- * This function returns open flags representing the current open
- * status.
- *
- * @param[in] obj_hdl File to interrogate
- *
- * @retval Flags representing current open status
- */
-	 fsal_openflags_t (*status)(struct fsal_obj_handle *obj_hdl);
-
-/**
- * @brief Read data from a file
- *
- * This function reads data from the given file.
- *
- * @note We probably want to keep end_of_file.  There may be reasons
- * other than end of file while less data are returned than requested
- * (FSAL_PROXY, for example, might do this depending on the will of
- * the remote server.) -- ACE
- *
- * @param[in]  obj_hdl     File to read
- * @param[in]  offset      Position from which to read
- * @param[in]  buffer_size Amount of data to read
- * @param[out] buffer      Buffer to which data are to be copied
- * @param[out] read_amount Amount of data read
- * @param[out] end_of_file true if the end of file has been reached
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*read)(struct fsal_obj_handle *obj_hdl,
-			       uint64_t offset,
-			       size_t buffer_size,
-			       void *buffer,
-			       size_t *read_amount,
-			       bool *end_of_file);	/* needed? */
-
-/**
- * @brief Read data from a file plus
- *
- * This function reads data from the given file.
- *
- * @note We probably want to keep end_of_file.  There may be reasons
- * other than end of file while less data are returned than requested
- * (FSAL_PROXY, for example, might do this depending on the will of
- * the remote server.) -- ACE
- *
- * @param[in]  obj_hdl     File to read
- * @param[in]  offset      Position from which to read
- * @param[in]  buffer_size Amount of data to read
- * @param[out] buffer      Buffer to which data are to be copied
- * @param[out] read_amount Amount of data read
- * @param[out] end_of_file true if the end of file has been reached
- * @param[in,out] info     more information about the data
- *
- * @return FSAL status.
- */
-	fsal_status_t (*read_plus)(struct fsal_obj_handle *obj_hdl,
-				   uint64_t offset,
-				   size_t buffer_size,
-				   void *buffer,
-				   size_t *read_amount,
-				   bool *end_of_file,
-				   struct io_info *info);
-
-/**
- * @brief Write data to a file
- *
- * This function writes data to a file.
- *
- * @note Should buffer be const? -- ACE
- *
- * @param[in]  obj_hdl      File to be written
- * @param[in]  offset       Position at which to write
- * @param[in]  buffer       Data to be written
- * @param[in,out] fsal_stable In, if on, the fsal is requested to write data
- *                            to stable store. Out, the fsal reports what
- *                            it did.
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*write)(struct fsal_obj_handle *obj_hdl,
-				uint64_t offset,
-				size_t buffer_size,
-				void *buffer,
-				size_t *wrote_amount,
-				bool *fsal_stable);
-/**
- * @brief Write data to a file plus
- *
- * This function writes data to a file.
- *
- * @note Should buffer be const? -- ACE
- *
- * @param[in]  obj_hdl      File to be written
- * @param[in]  offset       Position at which to write
- * @param[in]  buffer       Data to be written
- * @param[in,out] fsal_stable In, if on, the fsal is requested to write data
- *                            to stable store. Out, the fsal reports what
- *                            it did.
- * @param[in,out] info     more information about the data
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*write_plus)(struct fsal_obj_handle *obj_hdl,
-				     uint64_t offset,
-				     size_t buffer_size,
-				     void *buffer,
-				     size_t *wrote_amount,
-				     bool *fsal_stable,
-				     struct io_info *info);
 /**
  * @brief Seek to data or hole
  *
@@ -1566,66 +1760,34 @@ struct fsal_obj_ops {
  */
 	 fsal_status_t (*io_advise)(struct fsal_obj_handle *obj_hdl,
 				    struct io_hints *hints);
-/**
- * @brief Commit written data
- *
- * This function flushes possibly buffered data to a file.
- *
- * @param[in] obj_hdl File to commit
- * @param[in] offset  Start of range to commit
- * @param[in] len     Length of range to commit
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*commit)(struct fsal_obj_handle *obj_hdl,  /* sync */
-				 off_t offset, size_t len);
 
-/**
- * @brief Perform a lock operation
- *
- * This function performs a lock operation (lock, unlock, test) on a
- * file.
- *
- * @param[in]  obj_hdl          File on which to operate
- * @param[in]  owner            Lock owner (Not yet implemented)
- * @param[in]  lock_op          Operation to perform
- * @param[in]  request_lock     Lock to take/release/test
- * @param[out] conflicting_lock Conflicting lock
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*lock_op)(struct fsal_obj_handle *obj_hdl,
-				  void *owner,
-				  fsal_lock_op_t lock_op,
-				  fsal_lock_param_t *request_lock,
-				  fsal_lock_param_t *conflicting_lock);
-
-/**
- * @brief Handle share reservations
- *
- * This function handles acquiring and releasing Microsoft share
- * reservations.
- *
- * @param[in] obj_hdl       Handle on which to operate
- * @param[in] owner         Share owner
- * @param[in] request_share Share reservation requested
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*share_op)(struct fsal_obj_handle *obj_hdl,
-				   void *owner,
-				   fsal_share_param_t request_share);
 /**
  * @brief Close a file
  *
  * This function closes a file.  It is protected by the Cache inode
- * content lock.
+ * content lock.  This should return ERR_FSAL_NOT_OPENED if the global FD for
+ * this obj was not open.
  *
  * @param[in] obj_hdl File to close
  *
  * @return FSAL status.
  */
 	 fsal_status_t (*close)(struct fsal_obj_handle *obj_hdl);
+
+/**
+ * @brief Reserve/Deallocate space in a region of a file
+ *
+ * @param[in] obj_hdl File to which bytes should be allocated
+ * @param[in] state   open stateid under which to do the allocation
+ * @param[in] offset  offset at which to begin the allocation
+ * @param[in] length  length of the data to be allocated
+ * @param[in] allocate Should space be allocated or deallocated?
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*fallocate)(struct fsal_obj_handle *obj_hdl,
+				    struct state_t *state, uint64_t offset,
+				    uint64_t length, bool allocate);
 /**@}*/
 
 /**@{*/
@@ -1676,6 +1838,13 @@ struct fsal_obj_ops {
  * This function returns the value of an extended attribute as
  * specified by name.
  *
+ * As a special rule, because it is implemented that way in the linux
+ * getxattr call, giving a buffer_size of 0 is allowed and should set
+ * output_size appropriately to fit the xattr.
+ *
+ * Please note that the xattr could change between the query-size call
+ * and that actual fetch, so this is not fail-proof.
+ *
  * @param[in]  obj_hdl     File to interrogate
  * @param[in]  xattr_name  Name of attribute
  * @param[out] buffer_addr Buffer to store content
@@ -1687,7 +1856,7 @@ struct fsal_obj_ops {
 	 fsal_status_t (*getextattr_value_by_name)(struct fsal_obj_handle *
 						   obj_hdl,
 						   const char *xattr_name,
-						   caddr_t buffer_addr,
+						   void *buffer_addr,
 						   size_t buffer_size,
 						   size_t *output_size);
 
@@ -1708,7 +1877,7 @@ struct fsal_obj_ops {
 	 fsal_status_t (*getextattr_value_by_id)(struct fsal_obj_handle *
 						 obj_hdl,
 						 unsigned int xattr_id,
-						 caddr_t buffer_addr,
+						 void *buffer_addr,
 						 size_t buffer_size,
 						 size_t *output_size);
 
@@ -1727,7 +1896,7 @@ struct fsal_obj_ops {
  */
 	 fsal_status_t (*setextattr_value)(struct fsal_obj_handle *obj_hdl,
 					   const char *xattr_name,
-					   caddr_t buffer_addr,
+					   void *buffer_addr,
 					   size_t buffer_size, int create);
 
 /**
@@ -1745,23 +1914,8 @@ struct fsal_obj_ops {
 	 fsal_status_t (*setextattr_value_by_id)(struct fsal_obj_handle *
 						 obj_hdl,
 						 unsigned int xattr_id,
-						 caddr_t buffer_addr,
+						 void *buffer_addr,
 						 size_t buffer_size);
-
-/**
- * @brief Get attributes on a named attribute
- *
- * This function gets the attributes on a named attribute.
- *
- * @param[in]  obj_hdl    File to interrogate
- * @param[in]  xattr_id   ID of attribute
- * @param[out] attributes Attributes on named attribute
- *
- * @return FSAL status.
- */
-	 fsal_status_t (*getextattr_attrs)(struct fsal_obj_handle *obj_hdl,
-					   unsigned int xattr_id,
-					   struct attrlist *attrs);
 
 /**
  * @brief Remove an extended attribute by id
@@ -1797,32 +1951,6 @@ struct fsal_obj_ops {
  */
 
 /**
- * @brief Test handle type
- *
- * This function tests that a handle is of the specified type.
- *
- * @retval true if it is.
- * @retval false if it isn't.
- */
-	 bool (*handle_is)(struct fsal_obj_handle *obj_hdl,
-			   object_file_type_t type);
-
-/**
- * @brief Perform cleanup as requested by the LRU
- *
- * This function performs cleanup tasks as requested by the LRU
- * thread, specifically to close file handles or free memory
- * associated with a file.
- *
- * @param[in] obj_hdl  File to clean up
- * @param[in] requests Things to clean up about file
- *
- * @return FSAL status
- */
-	 fsal_status_t (*lru_cleanup)(struct fsal_obj_handle *obj_hdl,
-				      lru_actions_t requests);
-
-/**
  * @brief Write wire handle
  *
  * This function writes a "wire" handle or file ID to the given
@@ -1836,9 +1964,9 @@ struct fsal_obj_ops {
  *
  * @return FSAL status
  */
-	 fsal_status_t (*handle_digest)(const struct fsal_obj_handle *obj_hdl,
-					fsal_digesttype_t output_type,
-					struct gsh_buffdesc *fh_desc);
+	 fsal_status_t (*handle_to_wire)(const struct fsal_obj_handle *obj_hdl,
+					 fsal_digesttype_t output_type,
+					 struct gsh_buffdesc *fh_desc);
 /**
  * @brief Get key for handle
  *
@@ -1851,6 +1979,18 @@ struct fsal_obj_ops {
  */
 	void (*handle_to_key)(struct fsal_obj_handle *obj_hdl,
 			      struct gsh_buffdesc *fh_desc);
+/**
+ * @brief Compare two handles
+ *
+ * This function compares two handles to see if they reference the same file
+ *
+ * @param[in]     obj_hdl1    The first handle to compare
+ * @param[in]     obj_hdl2    The second handle to compare
+ *
+ * @return True if match, false otherwise
+ */
+	 bool (*handle_cmp)(struct fsal_obj_handle *obj_hdl1,
+			    struct fsal_obj_handle *obj_hdl2);
 /**@}*/
 
 /**@{*/
@@ -1945,6 +2085,423 @@ struct fsal_obj_ops {
 				 XDR * lou_body,
 				 const struct fsal_layoutcommit_arg *arg,
 				 struct fsal_layoutcommit_res *res);
+
+/**
+ * @brief Get Extended Attribute
+ *
+ * This function gets an extended attribute of an object.
+ *
+ * @param[in]  obj_hdl  Input object to query
+ * @param[in]  xa_name  Input xattr name
+ * @param[out] xa_value Output xattr value
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*getxattrs)(struct fsal_obj_handle *obj_hdl,
+				    xattrname4 *xa_name,
+				    xattrvalue4 *xa_value);
+
+/**
+ * @brief Set Extended Attribute
+ *
+ * This function sets an extended attribute of an object.
+ *
+ * @param[in]  obj_hdl  Input object to set
+ * @param[in]  xa_type  Input xattr type
+ * @param[in]  xa_name  Input xattr name to set
+ * @param[in]  xa_value Input xattr value to set
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*setxattrs)(struct fsal_obj_handle *obj_hdl,
+				    setxattr_type4 sa_type,
+				    xattrname4 *xa_name,
+				    xattrvalue4 *xa_value);
+
+/**
+ * @brief Remove Extended Attribute
+ *
+ * This function remove an extended attribute of an object.
+ *
+ * @param[in]  obj_hdl  Input object to set
+ * @param[in]  xa_name  Input xattr name to remove
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*removexattrs)(struct fsal_obj_handle *obj_hdl,
+				    xattrname4 *xa_name);
+
+/**
+ * @brief List Extended Attributes
+ *
+ * This function list the extended attributes of an object.
+ *
+ * @param[in]      obj_hdl       Input object to list
+ * @param[in]      la_maxcount   Input maximum number of bytes for names
+ * @param[in,out]  la_cookie     In/out cookie
+ * @param[in,out]  la_cookieverf In/out cookie verifier
+ * @param[out]     lr_eof        Output eof set if no more extended attributes
+ * @param[out]     lr_names      Output list of extended attribute names
+ *				 this buffer size is double the size of
+ *				 la_maxcount to allow for component4 overhead
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*listxattrs)(struct fsal_obj_handle *obj_hdl,
+				     count4 la_maxcount,
+				     nfs_cookie4 *la_cookie,
+				     verifier4 *la_cookieverf,
+				     bool_t *lr_eof,
+				     xattrlist4 * lr_names);
+
+
+/**@}*/
+
+/**@{*/
+
+/**
+ * Extended API functions.
+ *
+ * With these new operations, the FSAL becomes responsible for managing
+ * share reservations. The FSAL is also granted more control over the
+ * state of a "file descriptor" and has more control of what a "file
+ * descriptor" even is. Ultimately, it is whatever the FSAL needs in
+ * order to manage the share reservations and lock state.
+ *
+ * The open2 method also allows atomic create/setattr/open (just like the
+ * NFS v4 OPEN operation).
+ *
+ */
+
+/**
+ * @brief Open a file descriptor for read or write and possibly create
+ *
+ * This function opens a file for read or write, possibly creating it.
+ * If the caller is passing a state, it must hold the state_lock
+ * exclusive.
+ *
+ * state can be NULL which indicates a stateless open (such as via the
+ * NFS v3 CREATE operation), in which case the FSAL must assure protection
+ * of any resources. If the file is being created, such protection is
+ * simple since no one else will have access to the object yet, however,
+ * in the case of an exclusive create, the common resources may still need
+ * protection.
+ *
+ * If Name is NULL, obj_hdl is the file itself, otherwise obj_hdl is the
+ * parent directory.
+ *
+ * On an exclusive create, the upper layer may know the object handle
+ * already, so it MAY call with name == NULL. In this case, the caller
+ * expects just to check the verifier.
+ *
+ * On a call with an existing object handle for an UNCHECKED create,
+ * we can set the size to 0.
+ *
+ * At least the mode attribute must be set if createmode is not FSAL_NO_CREATE.
+ * Some FSALs may still have to pass a mode on a create call for exclusive,
+ * and even with FSAL_NO_CREATE, and empty set of attributes MUST be passed.
+ *
+ * If an open by name succeeds and did not result in Ganesha creating a file,
+ * the caller will need to do a subsequent permission check to confirm the
+ * open. This is because the permission attributes were not available
+ * beforehand.
+ *
+ * The caller is expected to invoke fsal_release_attrs to release any
+ * resources held by the set attributes. The FSAL layer MAY have added an
+ * inherited ACL.
+ *
+ * The caller will set the request_mask in attrs_out to indicate the attributes
+ * of interest. ATTR_ACL SHOULD NOT be requested and need not be provided. If
+ * not all the requested attributes can be provided, this method MUST return
+ * an error unless the ATTR_RDATTR_ERR bit was set in the request_mask.
+ *
+ * Since this method may instantiate a new fsal_obj_handle, it will be forced
+ * to fetch at least some attributes in order to even know what the object
+ * type is (as well as it's fileid and fsid). For this reason, the operation
+ * as a whole can be expected to fail if the attributes were not able to be
+ * fetched.
+ *
+ * The attributes will not be returned if this is an open by object as
+ * opposed to an open by name.
+ *
+ * @note If the file was created, @a new_obj has been ref'd
+ *
+ * @param[in] obj_hdl               File to open or parent directory
+ * @param[in,out] state             state_t to use for this operation
+ * @param[in] openflags             Mode for open
+ * @param[in] createmode            Mode for create
+ * @param[in] name                  Name for file if being created or opened
+ * @param[in] attrs_in              Attributes to set on created file
+ * @param[in] verifier              Verifier to use for exclusive create
+ * @param[in,out] new_obj           Newly created object
+ * @param[in,out] attrs_out         Optional attributes for newly created object
+ * @param[in,out] caller_perm_check The caller must do a permission check
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*open2)(struct fsal_obj_handle *obj_hdl,
+				struct state_t *state,
+				fsal_openflags_t openflags,
+				enum fsal_create_mode createmode,
+				const char *name,
+				struct attrlist *attrs_in,
+				fsal_verifier_t verifier,
+				struct fsal_obj_handle **new_obj,
+				struct attrlist *attrs_out,
+				bool *caller_perm_check);
+
+/**
+ * @brief Check the exclusive create verifier for a file.
+ *
+ * @param[in] obj_hdl     File to check verifier
+ * @param[in] verifier    Verifier to use for exclusive create
+ *
+ * @retval true if verifier matches
+ */
+	 bool (*check_verifier)(struct fsal_obj_handle *obj_hdl,
+				fsal_verifier_t verifier);
+
+/**
+ * @brief Return open status of a state.
+ *
+ * This function returns open flags representing the current open
+ * status for a state. The state_lock must be held.
+ *
+ * @param[in] obj_hdl     File owning state
+ * @param[in] state File state to interrogate
+ *
+ * @retval Flags representing current open status
+ */
+	fsal_openflags_t (*status2)(struct fsal_obj_handle *obj_hdl,
+				    struct state_t *state);
+
+/**
+ * @brief Re-open a file that may be already opened
+ *
+ * This function supports changing the access mode of a share reservation and
+ * thus should only be called with a share state. The state_lock must be held.
+ *
+ * This MAY be used to open a file the first time if there is no need for
+ * open by name or create semantics. One example would be 9P lopen.
+ *
+ * @param[in] obj_hdl     File on which to operate
+ * @param[in] state       state_t to use for this operation
+ * @param[in] openflags   Mode for re-open
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*reopen2)(struct fsal_obj_handle *obj_hdl,
+				  struct state_t *state,
+				  fsal_openflags_t openflags);
+
+/**
+ * @brief Read data from a file
+ *
+ * This function reads data from the given file. The FSAL must be able to
+ * perform the read whether a state is presented or not. This function also
+ * is expected to handle properly bypassing or not share reservations.  This is
+ * an (optionally) asynchronous call.  When the I/O is complete, the done
+ * callback is called with the results.
+ *
+ * @param[in]     obj_hdl	File on which to operate
+ * @param[in]     bypass	If state doesn't indicate a share reservation,
+ *				bypass any deny read
+ * @param[in,out] done_cb	Callback to call when I/O is done
+ * @param[in,out] read_arg	Info about read, passed back in callback
+ * @param[in,out] caller_arg	Opaque arg from the caller for callback
+ *
+ * @return Nothing; results are in callback
+ */
+	 void (*read2)(struct fsal_obj_handle *obj_hdl,
+		       bool bypass,
+		       fsal_async_cb done_cb,
+		       struct fsal_io_arg *read_arg,
+		       void *caller_arg);
+
+/**
+ * @brief Write data to a file
+ *
+ * This function writes data to a file. The FSAL must be able to
+ * perform the write whether a state is presented or not. This function also
+ * is expected to handle properly bypassing or not share reservations. Even
+ * with bypass == true, it will enforce a mandatory (NFSv4) deny_write if
+ * an appropriate state is not passed).
+ *
+ * The FSAL is expected to enforce sync if necessary.
+ *
+ * This is an (optionally) asynchronous call.  When the I/O is complete, the @a
+ * done_cb callback is called.
+ *
+ * @param[in]     obj_hdl       File on which to operate
+ * @param[in]     bypass        If state doesn't indicate a share reservation,
+ *                              bypass any non-mandatory deny write
+ * @param[in,out] done_cb	Callback to call when I/O is done
+ * @param[in,out] write_arg	Info about write, passed back in callback
+ * @param[in,out] caller_arg	Opaque arg from the caller for callback
+ */
+	 void (*write2)(struct fsal_obj_handle *obj_hdl,
+			bool bypass,
+			fsal_async_cb done_cb,
+			struct fsal_io_arg *write_arg,
+			void *caller_arg);
+
+/**
+ * @brief Seek to data or hole
+ *
+ * This function seek to data or hole in a file.
+ *
+ * @param[in]     obj_hdl   File on which to operate
+ * @param[in]     state     state_t to use for this operation
+ * @param[in,out] info      Information about the data
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*seek2)(struct fsal_obj_handle *obj_hdl,
+				struct state_t *state,
+				struct io_info *info);
+/**
+ * @brief IO Advise
+ *
+ * This function give hints to fs.
+ *
+ * @param[in]     obj_hdl          File on which to operate
+ * @param[in]     state            state_t to use for this operation
+ * @param[in,out] info             Information about the data
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*io_advise2)(struct fsal_obj_handle *obj_hdl,
+				     struct state_t *state,
+				     struct io_hints *hints);
+
+/**
+ * @brief Commit written data
+ *
+ * This function flushes possibly buffered data to a file. This method
+ * differs from commit due to the need to interact with share reservations
+ * and the fact that the FSAL manages the state of "file descriptors". The
+ * FSAL must be able to perform this operation without being passed a specific
+ * state.
+ *
+ * @param[in] obj_hdl          File on which to operate
+ * @param[in] state            state_t to use for this operation
+ * @param[in] offset           Start of range to commit
+ * @param[in] len              Length of range to commit
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*commit2)(struct fsal_obj_handle *obj_hdl,
+				  off_t offset,
+				  size_t len);
+
+/**
+ * @brief Perform a lock operation
+ *
+ * This function performs a lock operation (lock, unlock, test) on a
+ * file. This method assumes the FSAL is able to support lock owners,
+ * though it need not support asynchronous blocking locks. Passing the
+ * lock state allows the FSAL to associate information with a specific
+ * lock owner for each file (which may include use of a "file descriptor".
+ *
+ * @param[in]  obj_hdl          File on which to operate
+ * @param[in]  state            state_t to use for this operation
+ * @param[in]  owner            Lock owner
+ * @param[in]  lock_op          Operation to perform
+ * @param[in]  request_lock     Lock to take/release/test
+ * @param[out] conflicting_lock Conflicting lock
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*lock_op2)(struct fsal_obj_handle *obj_hdl,
+				   struct state_t *state,
+				   void *owner,
+				   fsal_lock_op_t lock_op,
+				   fsal_lock_param_t *request_lock,
+				   fsal_lock_param_t *conflicting_lock);
+
+/**
+ * @brief Acquire or Release delegation
+ *
+ * This functions acquires/releases delegation/lease_lock.
+ *
+ * @param[in]  obj_hdl          File on which to operate
+ * @param[in]  state            state_t to use for this operation
+ * @param[in]  owner            Opaque state owner token
+ * @param[in]  deleg            Requested delegation state
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*lease_op2)(struct fsal_obj_handle *obj_hdl,
+				    struct state_t *state,
+				    void *owner,
+				    fsal_deleg_t deleg);
+
+/**
+ * @brief Set attributes on an object
+ *
+ * This function sets attributes on an object.  Which attributes are
+ * set is determined by attrib_set->mask. The FSAL must manage bypass
+ * or not of share reservations, and a state may be passed.
+ *
+ * The caller is expected to invoke fsal_release_attrs to release any
+ * resources held by the set attributes. The FSAL layer MAY have added an
+ * inherited ACL.
+ *
+ * @param[in] obj_hdl    File on which to operate
+ * @param[in] bypass     If state doesn't indicate a share reservation,
+ *                       bypass any non-mandatory deny write
+ * @param[in] state      state_t to use for this operation
+ * @param[in] attrib_set Attributes to set
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*setattr2)(struct fsal_obj_handle *obj_hdl,
+				   bool bypass,
+				   struct state_t *state,
+				   struct attrlist *attrib_set);
+
+/**
+ * @brief Manage closing a file when a state is no longer needed.
+ *
+ * When the upper layers are ready to dispense with a state, this method is
+ * called to allow the FSAL to close any file descriptors or release any other
+ * resources associated with the state. A call to free_state should be assumed
+ * to follow soon.
+ *
+ * @param[in] obj_hdl    File on which to operate
+ * @param[in] state      state_t to use for this operation
+ *
+ * @return FSAL status.
+ */
+	 fsal_status_t (*close2)(struct fsal_obj_handle *obj_hdl,
+				 struct state_t *state);
+
+/**@}*/
+
+/**
+ * @brief Determine if the given handle is a referral point
+ *
+ * @param[in]	  obj_hdl	Handle on which to operate
+ * @param[in|out] attrs		Attributes of the handle
+ * @param[in]	  cache_attrs	Cache the received attrs
+ *
+ * @return true if it is a referral point, false otherwise
+ */
+
+	 bool (*is_referral)(struct fsal_obj_handle *obj_hdl,
+			     struct attrlist *attrs,
+			     bool cache_attrs);
+
+/**@{*/
+
+/**
+ * ASYNC API functions.
+ *
+ * These are asyncronous versions of some of the API functions.  FSALs are
+ * expected to implement these, but the upper layers are not expected to call
+ * them.  Instead, they will be called by MDCACHE at the appropriate points.
+ */
+
 /**@}*/
 };
 
@@ -2221,7 +2778,21 @@ struct fsal_module {
 	pthread_rwlock_t lock;		/*< Lock to be held when
 					    manipulating its lists (above). */
 	int32_t refcount;		/*< Reference count */
+	struct fsal_stats *stats;   /*< for storing the FSAL specific stats */
+	struct fsal_staticfsinfo_t fs_info; /*< for storing FSAL static info */
 };
+
+/**
+ * @brief Get a reference to a module
+ *
+ * @param[in] fsal_hdl FSAL on which to acquire reference.
+ */
+
+static inline void fsal_get(struct fsal_module *fsal_hdl)
+{
+	(void) atomic_inc_int32_t(&fsal_hdl->refcount);
+	assert(fsal_hdl->refcount > 0);
+}
 
 /**
  * @brief Relinquish a reference to the module
@@ -2262,6 +2833,10 @@ struct fsal_export {
 	struct fsal_module *fsal;	/*< Link back to the FSAL module */
 	const struct fsal_up_vector *up_ops;	/*< Upcall operations */
 	struct export_ops exp_ops;	/*< Vector of operations */
+	struct fsal_export *sub_export;	/*< Sub export for stacking */
+	struct fsal_export *super_export;/*< Super export for stacking */
+	uint16_t export_id; /*< Export ID copied from gsh_export, initialized
+				by  fsal_export_init */
 };
 
 /**
@@ -2281,7 +2856,7 @@ struct fsal_filesystem {
 					    file systems */
 	struct fsal_filesystem *parent;	/*< Parent file system */
 	struct fsal_module *fsal;	/*< Link back to fsal module */
-	void *private;			/*< Private data for owning FSAL */
+	void *private_data;		/*< Private data for owning FSAL */
 	char *path;			/*< Path to root of this file system */
 	char *device;			/*< Path to block device */
 	char *type;			/*< fs type */
@@ -2324,24 +2899,18 @@ struct fsal_obj_handle {
 					   the same FSAL. */
 	struct fsal_filesystem *fs;	/*< Owning filesystem */
 	struct fsal_module *fsal;	/*< Link back to fsal module */
-	struct fsal_obj_ops obj_ops;	/*< Operations vector */
+	struct fsal_obj_ops *obj_ops;	/*< Operations vector */
 
-	pthread_rwlock_t lock;		/*< Lock on handle */
+	pthread_rwlock_t obj_lock;		/*< Lock on handle */
 
-	/** Pointer to the cached attributes.
-	 *
-	 * This pointer should be set by the fsal when the handle is created.
-	 * Its value should not be changed once initialized. The release
-	 * of this field is also done by the FSAL.
-	 *
-	 * Typically the attributes are part of the FSAL's private handle,
-	 * however, some FSALs, particularly stackable FSALs may point to
-	 * some other field (for example, the underlying FSAL's attributes
-	 * in the case of FSAL_NULL).
-	 */
-	struct attrlist *attrs;
-
+	/* Static attributes */
 	object_file_type_t type;	/*< Object file type */
+	fsal_fsid_t fsid;	/*< Filesystem on which this object is
+				   stored */
+	uint64_t fileid;	/*< Unique identifier for this object within
+				   the scope of the fsid, (e.g. inode number) */
+
+	struct state_hdl *state_hdl;	/*< State related to this handle */
 };
 
 /**
@@ -2359,20 +2928,29 @@ enum pnfs_ds_status {
 	PNFS_DS_STALE,			/*< is no longer valid */
 };
 
+/**
+ * @brief PNFS Data Server
+ *
+ * This represents a Data Server for PNFS.  It may be stand-alone, or may be
+ * associated with an export (which represents an MDS).
+ */
 struct fsal_pnfs_ds {
-	struct glist_head server;	/*< Link in list of Data Servers under
+	struct glist_head ds_list;	/**< Entry in list of all DSs */
+	struct glist_head server;	/**< Link in list of Data Servers under
 					   the same FSAL. */
-	struct glist_head ds_handles;	/*< Head of list of DS handles */
-	struct fsal_module *fsal;	/*< Link back to fsal module */
-	struct fsal_pnfs_ds_ops s_ops;	/*< Operations vector */
-	struct gsh_export *mds_export;	/*< related export */
+	struct glist_head ds_handles;	/**< Head of list of DS handles */
+	struct fsal_module *fsal;	/**< Link back to fsal module */
+	struct fsal_pnfs_ds_ops s_ops;	/**< Operations vector */
+	struct gsh_export *mds_export;	/**< related export */
+	struct fsal_export *mds_fsal_export;	/**< related FSAL export (avoids
+						  MDS stacking) */
 
-	struct avltree_node ds_node;	/*< Node in tree of all Data Servers. */
-	pthread_rwlock_t lock;		/*< Lock to be held when
+	struct avltree_node ds_node;	/**< Node in tree of all Data Servers */
+	pthread_rwlock_t lock;		/**< Lock to be held when
 					    manipulating its list (above). */
-	int32_t refcount;		/*< Reference count */
-	uint16_t id_servers;		/*< Identifier */
-	uint8_t pnfs_ds_status;		/*< current condition */
+	int32_t refcount;		/**< Reference count */
+	uint16_t id_servers;		/**< Identifier */
+	uint8_t pnfs_ds_status;		/**< current condition */
 };
 
 /**
@@ -2404,7 +2982,7 @@ struct fsal_ds_handle {
 
 static inline void ds_handle_get_ref(struct fsal_ds_handle *const ds_hdl)
 {
-	atomic_inc_int64_t (&ds_hdl->refcount);
+	(void) atomic_inc_int64_t (&ds_hdl->refcount);
 }
 
 /**

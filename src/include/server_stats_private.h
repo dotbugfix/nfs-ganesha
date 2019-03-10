@@ -174,6 +174,35 @@ struct export_stats {
 	.direction = "out"   \
 }
 
+/* We are passing back FSAL name so that ganesha_stats can show it as per
+ * the FSAL name
+ * The fsal_stats is an array with below items in it
+ * OP_NAME, NUMBER_OF_OP, AVG_RES_TIME, MIN_RES_TIME & MAX_RES_TIME
+ */
+#define FSAL_OPS_REPLY      \
+{                               \
+	.name = "fsal_name",         \
+	.type = "s",            \
+	.direction = "out"       \
+},				\
+{                            \
+	.name = "fsal_stats",        \
+	.type = "a(stddd)",     \
+	.direction = "out"   \
+}
+
+#define STATS_STATUS_REPLY	\
+{	\
+	.name = "nfs_status",	\
+	.type = "b(tt)",	\
+	.direction = "out"	\
+},	\
+{	\
+	.name = "fsal_status",	\
+	.type = "b(tt)",	\
+	.direction = "out"	\
+}
+
 #define LAYOUTS_REPLY		\
 {				\
 	.name = "getdevinfo",	\
@@ -236,7 +265,7 @@ struct export_stats {
 }
 
 
-void server_stats_summary(DBusMessageIter *iter, struct gsh_stats *st);
+void server_stats_summary(DBusMessageIter * iter, struct gsh_stats *st);
 void server_dbus_v3_iostats(struct nfsv3_stats *v3p, DBusMessageIter *iter);
 void server_dbus_v40_iostats(struct nfsv40_stats *v40p, DBusMessageIter *iter);
 void server_dbus_v41_iostats(struct nfsv41_stats *v41p, DBusMessageIter *iter);
@@ -250,7 +279,11 @@ void server_dbus_total_ops(struct export_stats *export_st,
 			   DBusMessageIter *iter);
 void global_dbus_total_ops(DBusMessageIter *iter);
 void server_dbus_fast_ops(DBusMessageIter *iter);
-void cache_inode_dbus_show(DBusMessageIter *iter);
+void mdcache_dbus_show(DBusMessageIter *iter);
+void reset_server_stats(void);
+void reset_export_stats(void);
+void reset_client_stats(void);
+void reset_gsh_stats(struct gsh_stats *st);
 
 #ifdef _USE_9P
 void server_dbus_9p_iostats(struct _9p_stats *_9pp, DBusMessageIter *iter);
@@ -260,6 +293,8 @@ void server_dbus_9p_rdmastats(struct _9p_stats *_9pp, DBusMessageIter *iter);
 void server_dbus_9p_opstats(struct _9p_stats *_9pp, u8 opcode,
 			    DBusMessageIter *iter);
 #endif
+
+extern struct glist_head fsal_list;
 
 #endif				/* USE_DBUS */
 

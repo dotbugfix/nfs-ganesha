@@ -30,7 +30,6 @@
 #include "nfs23.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "mount.h"
 #include "rquota.h"
@@ -47,7 +46,7 @@
 int rquota_setactivequota(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
 	LogFullDebug(COMPONENT_NFSPROTO,
-		     "REQUEST PROCESSING: Calling rquota_setactivequota");
+		     "REQUEST PROCESSING: Calling RQUOTA_SETACTIVEQUOTA");
 	/* 0 is success */
 	return 0;
 }

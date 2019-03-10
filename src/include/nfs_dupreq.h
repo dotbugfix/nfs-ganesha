@@ -117,11 +117,7 @@ extern pool_t *nfs_res_pool;
 
 static inline nfs_res_t *alloc_nfs_res(void)
 {
-	/* XXX can pool/ctor zero mem? */
-	nfs_res_t *res = pool_alloc(nfs_res_pool, NULL);
-
-	memset(res, 0, sizeof(nfs_res_t));
-	return res;
+	return pool_alloc(nfs_res_pool);
 }
 
 static inline void free_nfs_res(nfs_res_t *res)
@@ -142,7 +138,7 @@ void dupreq2_pkgshutdown(void);
 
 drc_t *drc_get_tcp_drc(struct svc_req *);
 void drc_release_tcp_drc(drc_t *);
-void nfs_dupreq_put_drc(SVCXPRT *xprt, drc_t *drc, uint32_t flags);
+void nfs_dupreq_put_drc(drc_t *drc, uint32_t flags);
 
 dupreq_status_t nfs_dupreq_start(nfs_request_t *,
 				 struct svc_req *);

@@ -40,9 +40,9 @@
 #include <sys/file.h>		/* for having FNDELAY */
 #include "hashtable.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "nfs_file_handle.h"
 #include "sal_data.h"
+#include "fsal.h"
 
 /* Hard and soft limit for nfsv4 quotas */
 #define NFS_V4_MAX_QUOTA_SOFT 4294967296LL	/*  4 GB */
@@ -75,6 +75,12 @@ struct xdr_attrs_args {
 					   of a filesystem, the fileid of
 					   the directory on which the
 					   filesystem is mounted. */
+	/* Static attributes */
+	object_file_type_t type;	/*< Object file type */
+	fsal_fsid_t fsid;	/*< Filesystem on which this object is
+				   stored */
+	uint64_t fileid;	/*< Unique identifier for this object within
+				   the scope of the fsid, (e.g. inode number) */
 	int nfs_status;
 	compound_data_t *data;
 	bool statfscalled;
@@ -218,23 +224,26 @@ static inline bool clear_attribute_in_bitmap(struct bitmap4 *bits, int attr)
 	return true;
 }
 
+#ifdef _USE_NFS3
 void nfs_SetWccData(const struct pre_op_attr *before_attr,
-		    cache_entry_t *entry,
+		    struct fsal_obj_handle *entry,
 		    wcc_data * pwcc_data);
 
-void nfs_SetPostOpAttr(cache_entry_t *entry,
-		       post_op_attr *attr);
+void nfs_SetPostOpAttr(struct fsal_obj_handle *entry,
+		       post_op_attr *attr,
+		       struct attrlist *attrs);
 
-void nfs_SetPreOpAttr(cache_entry_t *entry,
+void nfs_SetPreOpAttr(struct fsal_obj_handle *entry,
 		      pre_op_attr *attr);
+#endif
 
-bool nfs_RetryableError(cache_inode_status_t cache_status);
+bool nfs_RetryableError(fsal_errors_t fsal_errors);
 
 int nfs3_Sattr_To_FSAL_attr(struct attrlist *pFSALattr, sattr3 *psattr);
 
 void nfs4_Fattr_Free(fattr4 *fattr);
 
-nfsstat4 nfs4_return_one_state(cache_entry_t *entry,
+nfsstat4 nfs4_return_one_state(struct fsal_obj_handle *obj,
 			       layoutreturn_type4 return_type,
 			       enum fsal_layoutreturn_circumstance circumstance,
 			       state_t *layout_state,
@@ -247,30 +256,34 @@ typedef enum {
 	UTF8_SCAN_NOSLASH = 1,	/* disallow '/' */
 	UTF8_SCAN_NODOT = 2,	/* disallow '.' and '..' */
 	UTF8_SCAN_CKUTF8 = 4,	/* validate utf8 */
-	UTF8_SCAN_SYMLINK = 6,	/* a symlink, allow '/', no "." or "..", utf8 */
+	UTF8_SCAN_PATH = 8,	/* validate path */
 	UTF8_SCAN_NAME = 3,	/* a name (no embedded /, "." or "..") */
-	UTF8_SCAN_ALL = 7	/* do the whole thing, name+valid utf8 */
+	UTF8_SCAN_ALL = 7,	/* do the whole thing, name+valid utf8 */
+	UTF8_SCAN_SYMLINK = 12	/* a symlink, allow '/', ".", "..", utf8 */
 } utf8_scantype_t;
 
 nfsstat4 nfs4_utf8string2dynamic(const utf8string *input, utf8_scantype_t scan,
 				 char **obj_name);
 
-nfsstat4 cache_entry_To_Fattr(cache_entry_t *, fattr4 *,
-			      compound_data_t *, nfs_fh4 *,
-			      struct bitmap4 *);
+int bitmap4_to_attrmask_t(bitmap4 *bitmap4, attrmask_t *mask);
+
+nfsstat4 file_To_Fattr(compound_data_t *data,
+		       attrmask_t mask,
+		       struct attrlist *attr,
+		       fattr4 *Fattr,
+		       struct bitmap4 *Bitmap);
 
 bool nfs4_Fattr_Check_Access(fattr4 *, int);
 bool nfs4_Fattr_Check_Access_Bitmap(struct bitmap4 *, int);
 bool nfs4_Fattr_Supported(fattr4 *);
-bool nfs4_Fattr_Supported_Bitmap(struct bitmap4 *);
 int nfs4_Fattr_cmp(fattr4 *, fattr4 *);
 
-bool nfs3_FSALattr_To_Fattr(struct gsh_export *, const struct attrlist *,
-			    fattr3 *);
+bool nfs3_FSALattr_To_Fattr(struct fsal_obj_handle *obj,
+			    const struct attrlist *FSAL_attr,
+			    fattr3 *Fattr);
 
-bool is_sticky_bit_set(const struct attrlist *attr);
-
-bool cache_entry_to_nfs3_Fattr(cache_entry_t *, fattr3 *);
+bool is_sticky_bit_set(struct fsal_obj_handle *obj,
+		       const struct attrlist *attr);
 
 bool nfs3_Sattr_To_FSALattr(struct attrlist *, sattr3 *);
 
@@ -278,7 +291,8 @@ int nfs4_Fattr_To_FSAL_attr(struct attrlist *, fattr4 *, compound_data_t *);
 
 int nfs4_Fattr_To_fsinfo(fsal_dynamicfsinfo_t *, fattr4 *);
 
-int nfs4_Fattr_Fill_Error(fattr4 *, nfsstat4);
+int nfs4_Fattr_Fill_Error(compound_data_t *, fattr4 *, nfsstat4,
+			  struct bitmap4 *, struct xdr_attrs_args *args);
 
 int nfs4_FSALattr_To_Fattr(struct xdr_attrs_args *, struct bitmap4 *,
 			   fattr4 *);
@@ -290,5 +304,13 @@ enum nfs4_minor_vers {
 	NFS4_MINOR_VERS_1,
 	NFS4_MINOR_VERS_2
 };
+
+void nfs4_pathname4_alloc(pathname4 *, char *);
+
+void nfs4_pathname4_free(pathname4 *);
+
+uint32_t resp_room(compound_data_t *data);
+
+nfsstat4 check_resp_room(compound_data_t *data, uint32_t op_resp_size);
 
 #endif				/* _NFS_PROTO_TOOLS_H */

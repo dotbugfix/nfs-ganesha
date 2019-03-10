@@ -65,10 +65,8 @@ static digest_pool_entry_t *digest_alloc()
 	digest_pool_entry_t *p_new;
 
 	PTHREAD_MUTEX_lock(&digest_pool_mutex);
-	p_new = pool_alloc(digest_pool, NULL);
+	p_new = pool_alloc(digest_pool);
 	PTHREAD_MUTEX_unlock(&digest_pool_mutex);
-
-	memset(p_new, 0, sizeof(digest_pool_entry_t));
 
 	return p_new;
 }
@@ -87,10 +85,8 @@ static handle_pool_entry_t *handle_alloc()
 	handle_pool_entry_t *p_new;
 
 	PTHREAD_MUTEX_lock(&handle_pool_mutex);
-	p_new = pool_alloc(handle_pool, NULL);
+	p_new = pool_alloc(handle_pool);
 	PTHREAD_MUTEX_unlock(&handle_pool_mutex);
-
-	memset(p_new, 0, sizeof(handle_pool_entry_t));
 
 	return p_new;
 }
@@ -198,10 +194,10 @@ int handle_mapping_hash_add(hash_table_t *p_hash, uint64_t object_id,
 	memcpy(handle->fh_data, data, datalen);
 	handle->fh_len = datalen;
 
-	buffkey.addr = (caddr_t) digest;
+	buffkey.addr = digest;
 	buffkey.len = sizeof(digest_pool_entry_t);
 
-	buffval.addr = (caddr_t) handle;
+	buffval.addr = handle;
 	buffval.len = sizeof(handle_pool_entry_t);
 
 	rc = hashtable_test_and_set(handle_map_hash, &buffkey, &buffval,
@@ -272,12 +268,10 @@ int HandleMap_Init(const handle_map_param_t *p_param)
 	/* initialize memory pool of digests and handles */
 
 	digest_pool =
-	    pool_init(NULL, sizeof(digest_pool_entry_t), pool_basic_substrate,
-		      NULL, NULL, NULL);
+	    pool_basic_init("digest_pool", sizeof(digest_pool_entry_t));
 
 	handle_pool =
-	    pool_init(NULL, sizeof(handle_pool_entry_t), pool_basic_substrate,
-		      NULL, NULL, NULL);
+	    pool_basic_init("handle_pool", sizeof(handle_pool_entry_t));
 
 	/* create hash table */
 
@@ -313,7 +307,8 @@ int HandleMap_Init(const handle_map_param_t *p_param)
  * @note The caller must provide storage for nfs_fh4_val.
  *
  * @retval HANDLEMAP_SUCCESS if the handle is available
- * @retval HANDLEMAP_STALE if the disgest is unknown or the handle has been deleted
+ * @retval HANDLEMAP_STALE if the disgest is unknown or the handle has been
+ *                         deleted
  */
 int HandleMap_GetFH(const nfs23_map_handle_t *nfs23_digest,
 		    struct gsh_buffdesc *fsal_handle)
@@ -327,7 +322,7 @@ int HandleMap_GetFH(const nfs23_map_handle_t *nfs23_digest,
 
 	digest.nfs23_digest = *nfs23_digest;
 
-	buffkey.addr = (caddr_t) &digest;
+	buffkey.addr = &digest;
 	buffkey.len = sizeof(digest_pool_entry_t);
 
 	rc = hashtable_getlatch(handle_map_hash, &buffkey, &buffval, 0, &hl);
@@ -397,7 +392,7 @@ int HandleMap_DelFH(nfs23_map_handle_t *p_in_nfs23_digest)
 
 	digest.nfs23_digest = *p_in_nfs23_digest;
 
-	buffkey.addr = (caddr_t) &digest;
+	buffkey.addr = &digest;
 	buffkey.len = sizeof(digest_pool_entry_t);
 
 	rc = HashTable_Del(handle_map_hash, &buffkey, &stored_buffkey,

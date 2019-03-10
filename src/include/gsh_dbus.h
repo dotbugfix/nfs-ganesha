@@ -123,6 +123,20 @@
 	.direction = "in"	\
 }
 
+#define FSAL_ARG		\
+{				\
+	.name = "fsal",		\
+	.type = "s",		\
+	.direction = "in"	\
+}
+
+#define STAT_TYPE_ARG		\
+{				\
+	.name = "stat_type",		\
+	.type = "s",		\
+	.direction = "in"	\
+}
+
 /* Properties list helper macros
  */
 
@@ -171,8 +185,6 @@ struct gsh_dbus_interface {
 	struct gsh_dbus_method **methods;
 	struct gsh_dbus_signal **signals;
 };
-
-struct gsh_dbus_interface log_interface;
 
 /**
   * @brief Default value for heartbeat frequency in ms

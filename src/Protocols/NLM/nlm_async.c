@@ -45,24 +45,14 @@ int nlm_send_async_res_nlm4(state_nlm_client_t *host, state_async_func_t func,
 	state_nlm_async_data_t *nlm_arg;
 	state_status_t status;
 
-	if (arg != NULL) {
-		nlm_arg = &arg->state_async_data.state_nlm_async_data;
-		memset(arg, 0, sizeof(*arg));
-		arg->state_async_func = func;
-		nlm_arg->nlm_async_host = host;
-		nlm_arg->nlm_async_args.nlm_async_res = *pres;
-		if (!copy_netobj
-		    (&nlm_arg->nlm_async_args.nlm_async_res.res_nlm4.cookie,
-		     &pres->res_nlm4.cookie)) {
-			LogCrit(COMPONENT_NLM,
-				"Unable to copy async response file handle");
-			gsh_free(arg);
-			return NFS_REQ_DROP;
-		}
-	} else {
-		LogCrit(COMPONENT_NLM, "Unable to allocate async response");
-		return NFS_REQ_DROP;
-	}
+	nlm_arg = &arg->state_async_data.state_nlm_async_data;
+	memset(arg, 0, sizeof(*arg));
+	arg->state_async_func = func;
+	nlm_arg->nlm_async_host = host;
+	nlm_arg->nlm_async_args.nlm_async_res = *pres;
+
+	copy_netobj(&nlm_arg->nlm_async_args.nlm_async_res.res_nlm4.cookie,
+		    &pres->res_nlm4.cookie);
 
 	status = state_async_schedule(arg);
 
@@ -80,48 +70,27 @@ int nlm_send_async_res_nlm4test(state_nlm_client_t *host,
 	state_async_queue_t *arg = gsh_malloc(sizeof(*arg));
 	state_nlm_async_data_t *nlm_arg;
 	state_status_t status;
+	nfs_res_t *res;
 
-	if (arg != NULL) {
-		nlm_arg = &arg->state_async_data.state_nlm_async_data;
-		memset(arg, 0, sizeof(*arg));
-		arg->state_async_func = func;
-		nlm_arg->nlm_async_host = host;
-		nlm_arg->nlm_async_args.nlm_async_res = *pres;
-		if (!copy_netobj(
-		     &nlm_arg->nlm_async_args.nlm_async_res.res_nlm4test.cookie,
-		     &pres->res_nlm4test.cookie)) {
-			LogCrit(COMPONENT_NLM,
-				"Unable to copy async response file handle");
-			gsh_free(arg);
-			return NFS_REQ_DROP;
-		} else if (pres->res_nlm4test.test_stat.stat == NLM4_DENIED) {
-			if (!copy_netobj(
-			     &nlm_arg->nlm_async_args.nlm_async_res.
-			      res_nlm4test.test_stat.nlm4_testrply_u.holder.oh,
-			     &pres->res_nlm4test.test_stat.nlm4_testrply_u.
-			      holder.oh)) {
-				LogCrit(COMPONENT_NLM,
-					"Unable to copy async response oh");
-				netobj_free(&nlm_arg->nlm_async_args.
-					    nlm_async_res.res_nlm4test.cookie);
-				gsh_free(arg);
-				return NFS_REQ_DROP;
-			}
-		}
-	} else {
-		LogCrit(COMPONENT_NLM, "Unable to allocate async response");
-		return NFS_REQ_DROP;
+	nlm_arg = &arg->state_async_data.state_nlm_async_data;
+	res = &nlm_arg->nlm_async_args.nlm_async_res;
+	memset(arg, 0, sizeof(*arg));
+	arg->state_async_func = func;
+	nlm_arg->nlm_async_host = host;
+	*res = *pres;
+
+	copy_netobj(&res->res_nlm4test.cookie, &pres->res_nlm4test.cookie);
+
+	if (pres->res_nlm4test.test_stat.stat == NLM4_DENIED) {
+		copy_netobj(
+		     &res->res_nlm4test.test_stat.nlm4_testrply_u.holder.oh,
+		     &pres->res_nlm4test.test_stat.nlm4_testrply_u.holder.oh);
 	}
 
 	status = state_async_schedule(arg);
 
 	if (status != STATE_SUCCESS) {
-		netobj_free(
-		    &nlm_arg->nlm_async_args.nlm_async_res.res_nlm4test.cookie);
-		if (pres->res_nlm4test.test_stat.stat == NLM4_DENIED)
-			netobj_free(&nlm_arg->nlm_async_args.nlm_async_res.
-				    res_nlm4test.test_stat.nlm4_testrply_u.
-				    holder.oh);
+		nlm4_Test_Free(res);
 		gsh_free(arg);
 		return NFS_REQ_DROP;
 	}
@@ -140,22 +109,26 @@ xdrproc_t nlm_reply_proc[] = {
 static void *resp_key;
 
 static const int MAX_ASYNC_RETRY = 2;
+static const struct timespec tout = { 0, 0 }; /* one-shot */
 
 /* Client routine  to send the asynchrnous response,
  * key is used to wait for a response
  */
 int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 {
-	struct timeval tout = { 0, 10 };
-	int retval, retry;
+	struct clnt_req *cc;
+	char *t;
 	struct timeval start, now;
 	struct timespec timeout;
+	int retval, retry;
+	char *caller_name = host->slc_nsm_client->ssc_nlm_caller_name;
+	const char *client_type_str = xprt_type_to_str(host->slc_client_type);
 
 	for (retry = 0; retry < MAX_ASYNC_RETRY; retry++) {
 		if (host->slc_callback_clnt == NULL) {
 			LogFullDebug(COMPONENT_NLM,
-				     "gsh_clnt_create %s",
-				     host->slc_nsm_client->ssc_nlm_caller_name);
+				     "clnt_ncreate %s",
+				     caller_name);
 
 			if (host->slc_client_type == XPRT_TCP) {
 				int fd;
@@ -183,20 +156,16 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 				}
 
 				buf = rpcb_find_mapped_addr(
-				     (char *) xprt_type_to_str(
-							host->slc_client_type),
-				     NLMPROG, NLM4_VERS,
-				     host->slc_nsm_client->ssc_nlm_caller_name);
+						(char *) client_type_str,
+						NLMPROG, NLM4_VERS,
+						caller_name);
 				/* handle error here, for example,
 				 * client side blocking rpc call
 				 */
 				if (buf == NULL) {
 					LogMajor(COMPONENT_NLM,
 						 "Cannot create NLM async %s connection to client %s",
-						 xprt_type_to_str(
-							host->slc_client_type),
-						 host->slc_nsm_client->
-						 ssc_nlm_caller_name);
+						 client_type_str, caller_name);
 					close(fd);
 					return -1;
 				}
@@ -219,8 +188,7 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 				gsh_free(buf);
 
 				/* get the IPv4 mapped IPv6 address */
-				retval = getaddrinfo(host->slc_nsm_client->
-						     ssc_nlm_caller_name,
+				retval = getaddrinfo(caller_name,
 						     port_str,
 						     &hints,
 						     &result);
@@ -230,8 +198,7 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 				    retval == EAI_AGAIN) {
 					LogEvent(COMPONENT_NLM,
 						 "failed to resolve %s to an address: %s",
-						 host->slc_nsm_client->
-						 ssc_nlm_caller_name,
+						 caller_name,
 						 gai_strerror(retval));
 					/* getaddrinfo() failed, retry */
 					retval = RPC_UNKNOWNADDR;
@@ -240,8 +207,7 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 				} else if (retval != 0) {
 					LogMajor(COMPONENT_NLM,
 						 "failed to resolve %s to an address: %s",
-						 host->slc_nsm_client->
-						 ssc_nlm_caller_name,
+						 caller_name,
 						 gai_strerror(retval));
 					return -1;
 				}
@@ -257,26 +223,28 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 				freeaddrinfo(result);
 			} else {
 
-				host->slc_callback_clnt = gsh_clnt_create(
-				    host->slc_nsm_client->ssc_nlm_caller_name,
-				    NLMPROG,
-				    NLM4_VERS,
-				    (char *) xprt_type_to_str(
-						host->slc_client_type));
+				host->slc_callback_clnt =
+				    clnt_ncreate(caller_name, NLMPROG,
+						 NLM4_VERS,
+						 (char *) client_type_str);
 			}
 
-			if (host->slc_callback_clnt == NULL) {
+			if (CLNT_FAILURE(host->slc_callback_clnt)) {
+				char *err = rpc_sperror(
+					&host->slc_callback_clnt->cl_error,
+					"failed");
+
 				LogMajor(COMPONENT_NLM,
-					 "Cannot create NLM async %s connection to client %s",
-					 xprt_type_to_str(host->
-							  slc_client_type),
-					 host->slc_nsm_client->
-					 ssc_nlm_caller_name);
+					 "Create NLM async %s connection to client %s %s",
+					 client_type_str, caller_name, err);
+				gsh_free(err);
+				CLNT_DESTROY(host->slc_callback_clnt);
+				host->slc_callback_clnt = NULL;
 				return -1;
 			}
 
 			/* split auth (for authnone, idempotent) */
-			host->slc_callback_auth = authnone_create();
+			host->slc_callback_auth = authnone_ncreate();
 		}
 
 		PTHREAD_MUTEX_lock(&nlm_async_resp_mutex);
@@ -285,28 +253,33 @@ int nlm_send_async(int proc, state_nlm_client_t *host, void *inarg, void *key)
 
 		LogFullDebug(COMPONENT_NLM, "About to make clnt_call");
 
-		retval = clnt_call(host->slc_callback_clnt,
-				   host->slc_callback_auth,
-				   proc,
-				   nlm_reply_proc[proc],
-				   inarg,
-				   (xdrproc_t) xdr_void,
-				   NULL,
-				   tout);
+		cc = gsh_malloc(sizeof(*cc));
+		clnt_req_fill(cc, host->slc_callback_clnt,
+			      host->slc_callback_auth, proc,
+			      (xdrproc_t) nlm_reply_proc[proc], inarg,
+			      (xdrproc_t) xdr_void, NULL);
+		retval = clnt_req_setup(cc, tout);
+		if (retval == RPC_SUCCESS) {
+			cc->cc_refreshes = 0;
+			retval = CLNT_CALL_ONCE(cc);
+		}
 
 		LogFullDebug(COMPONENT_NLM, "Done with clnt_call");
 
 		if (retval == RPC_TIMEDOUT || retval == RPC_SUCCESS) {
 			retval = RPC_SUCCESS;
+			clnt_req_release(cc);
 			break;
 		}
 
+		t = rpc_sperror(&cc->cc_error, "failed");
 		LogCrit(COMPONENT_NLM,
-			"NLM async Client procedure call %d failed with return code %d %s",
-			proc, retval,
-			clnt_sperror(host->slc_callback_clnt, ""));
+			"NLM async Client procedure call %d %s",
+			proc, t);
+		gsh_free(t);
 
-		gsh_clnt_destroy(host->slc_callback_clnt);
+		clnt_req_release(cc);
+		CLNT_DESTROY(host->slc_callback_clnt);
 		host->slc_callback_clnt = NULL;
 	}
 

@@ -27,8 +27,6 @@
  */
 #include "config.h"
 
-#include <stdlib.h>		/* for malloc */
-#include <ctype.h>		/* for isdigit */
 #include <pthread.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -42,12 +40,12 @@
 #include <string.h>
 #include <signal.h>
 #include <libgen.h>
-#include <execinfo.h>
 #include <sys/resource.h>
+#include <execinfo.h>
 
 #include "log.h"
 #include "gsh_list.h"
-#include "rpc/rpc.h"
+#include "gsh_rpc.h"
 #include "common_utils.h"
 #include "abstract_mem.h"
 
@@ -232,8 +230,8 @@ static struct log_facility *default_facility;
 
 log_header_t max_headers = LH_COMPONENT;
 
-char const_log_str[LOG_BUFF_LEN];
-char date_time_fmt[MAX_TD_FMT_LEN];
+char const_log_str[LOG_BUFF_LEN] = "\0";
+char date_time_fmt[MAX_TD_FMT_LEN] = "\0";
 
 typedef struct loglev {
 	char *str;
@@ -271,7 +269,7 @@ static int syslog_opened;
  * Variables specifiques aux threads.
  */
 
-__thread char thread_name[16];
+__thread char thread_name[32];
 __thread char log_buffer[LOG_BUFF_LEN + 1];
 __thread char *clientip = NULL;
 
@@ -281,17 +279,17 @@ __thread char *clientip = NULL;
 		if (component_log_level[COMPONENT_LOG] == \
 		    NIV_FULL_DEBUG) \
 			DisplayLogComponentLevel(COMPONENT_LOG, \
-						 (char *) __FILE__, \
+						 __FILE__, \
 						 __LINE__, \
-						 (char *) __func__, \
+						 __func__, \
 						 NIV_NULL, \
 						 "LOG: " format, \
 						 ## args); \
 	} while (0)
 
-cleanup_list_element *cleanup_list = NULL;
+struct cleanup_list_element *cleanup_list;
 
-void RegisterCleanup(cleanup_list_element *clean)
+void RegisterCleanup(struct cleanup_list_element *clean)
 {
 	clean->next = cleanup_list;
 	cleanup_list = clean;
@@ -299,7 +297,7 @@ void RegisterCleanup(cleanup_list_element *clean)
 
 void Cleanup(void)
 {
-	cleanup_list_element *c = cleanup_list;
+	struct cleanup_list_element *c = cleanup_list;
 
 	while (c != NULL) {
 		c->clean();
@@ -453,8 +451,11 @@ static void _SetLevelDebug(int level_to_set)
 	if (level_to_set >= NB_LOG_LEVEL)
 		level_to_set = NB_LOG_LEVEL - 1;
 
-	for (i = COMPONENT_ALL; i < COMPONENT_COUNT; i++)
-		component_log_level[i] = level_to_set;
+	/* COMPONENT_ALL is a pseudo component, handle it separately */
+	component_log_level[COMPONENT_ALL] = level_to_set;
+	for (i = COMPONENT_ALL + 1; i < COMPONENT_COUNT; i++) {
+		SetComponentLogLevel(i, level_to_set);
+	}
 }				/* _SetLevelDebug */
 
 static void SetLevelDebug(int level_to_set)
@@ -465,18 +466,48 @@ static void SetLevelDebug(int level_to_set)
 		   ReturnLevelInt(component_log_level[COMPONENT_ALL]));
 }
 
-void SetComponentLogLevel(log_components_t component, int level_to_set)
+static void SetNTIRPCLogLevel(int level_to_set)
 {
-	if (component == COMPONENT_ALL) {
-		SetLevelDebug(level_to_set);
-		return;
+	switch (level_to_set) {
+	case NIV_NULL:
+	case NIV_FATAL:
+		ntirpc_pp.debug_flags = 0; /* disable all flags */
+		break;
+	case NIV_CRIT:
+	case NIV_MAJ:
+		ntirpc_pp.debug_flags = TIRPC_DEBUG_FLAG_ERROR;
+		break;
+	case NIV_WARN:
+		ntirpc_pp.debug_flags = TIRPC_DEBUG_FLAG_ERROR |
+					TIRPC_DEBUG_FLAG_WARN;
+		break;
+	case NIV_EVENT:
+		ntirpc_pp.debug_flags = TIRPC_DEBUG_FLAG_ERROR |
+					TIRPC_DEBUG_FLAG_WARN |
+					TIRPC_DEBUG_FLAG_EVENT;
+		break;
+	case NIV_DEBUG:
+	case NIV_MID_DEBUG:
+		/* set by log_conf_commit() */
+		break;
+	case NIV_FULL_DEBUG:
+		ntirpc_pp.debug_flags = 0xFFFFFFFF; /* enable all flags */
+		break;
+	default:
+		ntirpc_pp.debug_flags = TIRPC_DEBUG_FLAG_DEFAULT;
+		break;
 	}
 
-	if (level_to_set < NIV_NULL)
-		level_to_set = NIV_NULL;
+	if (!tirpc_control(TIRPC_SET_DEBUG_FLAGS, &ntirpc_pp.debug_flags))
+		LogCrit(COMPONENT_CONFIG, "Setting nTI-RPC debug_flags failed");
+}
 
-	if (level_to_set >= NB_LOG_LEVEL)
-		level_to_set = NB_LOG_LEVEL - 1;
+void SetComponentLogLevel(log_components_t component, int level_to_set)
+{
+
+	assert(level_to_set >= NIV_NULL);
+	assert(level_to_set < NB_LOG_LEVEL);
+	assert(component != COMPONENT_ALL);
 
 	if (LogComponents[component].comp_env_set) {
 		LogWarn(COMPONENT_CONFIG,
@@ -487,13 +518,17 @@ void SetComponentLogLevel(log_components_t component, int level_to_set)
 		return;
 	}
 
-	if (component_log_level[component] != level_to_set) {
-		LogChanges("Changing log level of %s from %s to %s",
-			   LogComponents[component].comp_name,
-			   ReturnLevelInt(component_log_level[component]),
-			   ReturnLevelInt(level_to_set));
-		component_log_level[component] = level_to_set;
-	}
+	if (component_log_level[component] == level_to_set)
+		return;
+
+	LogChanges("Changing log level of %s from %s to %s",
+		   LogComponents[component].comp_name,
+		   ReturnLevelInt(component_log_level[component]),
+		   ReturnLevelInt(level_to_set));
+	component_log_level[component] = level_to_set;
+
+	if (component == COMPONENT_TIRPC)
+		SetNTIRPCLogLevel(level_to_set);
 }
 
 static inline int ReturnLevelDebug(void)
@@ -532,7 +567,8 @@ void set_const_log_str(void)
 	const_log_str[0] = '\0';
 
 	if (b_left > 0 && logfields->disp_epoch)
-		b_left = display_printf(&dspbuf, ": epoch %08x ", ServerEpoch);
+		b_left = display_printf(&dspbuf,
+			": epoch %08x ", nfs_ServerEpoch);
 
 	if (b_left > 0 && logfields->disp_host)
 		b_left = display_printf(&dspbuf, ": %s ", hostname);
@@ -614,6 +650,11 @@ void set_const_log_str(void)
 		}
 
 	}
+
+	/* Trim trailing blank from date time format. */
+	if (date_time_fmt[0] != '\0' &&
+	    date_time_fmt[strlen(date_time_fmt) - 1] == ' ')
+		date_time_fmt[strlen(date_time_fmt) - 1] = '\0';
 }
 
 static void set_logging_from_env(void)
@@ -635,7 +676,10 @@ static void set_logging_from_env(void)
 			continue;
 		}
 		oldlevel = component_log_level[component];
-		component_log_level[component] = newlevel;
+		if (component == COMPONENT_ALL)
+			_SetLevelDebug(newlevel);
+		else
+			SetComponentLogLevel(component, newlevel);
 		LogComponents[component].comp_env_set = true;
 		LogChanges(
 		     "Using environment variable to switch log level for %s from %s to %s",
@@ -687,10 +731,8 @@ static struct log_facility *find_log_facility(const char *name)
  * @return 0 on success, -errno for failure
  */
 
-int create_log_facility(char *name,
-			lf_function_t *log_func,
-			log_levels_t max_level,
-			log_header_t header,
+int create_log_facility(const char *name, lf_function_t *log_func,
+			log_levels_t max_level, log_header_t header,
 			void *private)
 {
 	struct log_facility *facility;
@@ -735,28 +777,16 @@ int create_log_facility(char *name,
 
 	facility = gsh_calloc(1, sizeof(*facility));
 
-	if (facility == NULL) {
-		PTHREAD_RWLOCK_unlock(&log_rwlock);
-
-		LogCrit(COMPONENT_LOG, "Can not allocate a facility for %s",
-			 name);
-
-		return -ENOMEM;
-	}
 	facility->lf_name = gsh_strdup(name);
 	facility->lf_func = log_func;
 	facility->lf_max_level = max_level;
 	facility->lf_headers = header;
-	if (log_func == log_to_file && private != NULL) {
-		facility->lf_private = gsh_strdup(private);
-		if (facility->lf_private == NULL) {
-			PTHREAD_RWLOCK_unlock(&log_rwlock);
-			gsh_free(facility);
 
-			return -ENOMEM;
-		}
-	} else
+	if (log_func == log_to_file && private != NULL)
+		facility->lf_private = gsh_strdup(private);
+	else
 		facility->lf_private = private;
+
 	glist_add_tail(&facility_list, &facility->lf_list);
 
 	PTHREAD_RWLOCK_unlock(&log_rwlock);
@@ -780,7 +810,7 @@ int create_log_facility(char *name,
  * @returns always.  The logger is not disabled or released on errors
  */
 
-void release_log_facility(char *name)
+void release_log_facility(const char *name)
 {
 	struct log_facility *facility;
 
@@ -822,7 +852,7 @@ void release_log_facility(char *name)
  * @return 0 on success, -errno on errors.
  */
 
-int enable_log_facility(char *name)
+int enable_log_facility(const char *name)
 {
 	struct log_facility *facility;
 
@@ -857,7 +887,7 @@ int enable_log_facility(char *name)
  * @return 0 on success, -errno on errors.
  */
 
-int disable_log_facility(char *name)
+int disable_log_facility(const char *name)
 {
 	struct log_facility *facility;
 
@@ -872,10 +902,10 @@ int disable_log_facility(char *name)
 	}
 	if (glist_null(&facility->lf_active)) {
 		PTHREAD_RWLOCK_unlock(&log_rwlock);
-		LogCrit(COMPONENT_LOG,
+		LogDebug(COMPONENT_LOG,
 			 "Log facility (%s) is already disabled",
 			 name);
-		return -EINVAL;
+		return 0;
 	}
 	if (facility == default_facility) {
 		PTHREAD_RWLOCK_unlock(&log_rwlock);
@@ -965,7 +995,7 @@ out:
  * @return 0 on success, -errno on errors
  */
 
-int set_log_destination(char *name, char *dest)
+int set_log_destination(const char *name, char *dest)
 {
 	struct log_facility *facility;
 	int rc;
@@ -1003,15 +1033,7 @@ int set_log_destination(char *name, char *dest)
 			return -errno;
 		}
 		logfile = gsh_strdup(dest);
-		if (logfile == NULL) {
-			PTHREAD_RWLOCK_unlock(&log_rwlock);
-			LogCrit(COMPONENT_LOG,
-				"No memory for log file name (%s) for %s",
-				dest, facility->lf_name);
-			return -ENOMEM;
-		}
-		if (facility->lf_private != NULL)
-			gsh_free(facility->lf_private);
+		gsh_free(facility->lf_private);
 		facility->lf_private = logfile;
 	} else if (facility->lf_func == log_to_stream) {
 		FILE *out;
@@ -1031,7 +1053,7 @@ int set_log_destination(char *name, char *dest)
 	} else {
 		PTHREAD_RWLOCK_unlock(&log_rwlock);
 		LogCrit(COMPONENT_LOG,
-			 "Log facility %s destination is not changable",
+			 "Log facility %s destination is not changeable",
 			facility->lf_name);
 		return -EINVAL;
 	}
@@ -1049,7 +1071,7 @@ int set_log_destination(char *name, char *dest)
  * @return 0 on success, -errno on errors
  */
 
-int set_log_level(char *name, log_levels_t max_level)
+int set_log_level(const char *name, log_levels_t max_level)
 {
 	struct log_facility *facility;
 
@@ -1200,7 +1222,7 @@ static int log_to_file(log_header_t headers, void *private,
 	buffer->b_start[len] = '\n';
 	buffer->b_start[len + 1] = '\0';
 
-	fd = open(path, O_WRONLY | O_SYNC | O_APPEND | O_CREAT, log_mask);
+	fd = open(path, O_WRONLY | O_APPEND | O_CREAT, log_mask);
 
 	if (fd != -1) {
 		rc = write(fd, buffer->b_start, len + 1);
@@ -1282,6 +1304,72 @@ static int log_to_stream(log_header_t headers, void *private,
 		return 0;
 }
 
+int display_timeval(struct display_buffer *dspbuf, struct timeval *tv)
+{
+	char *fmt = date_time_fmt;
+	int b_left = display_start(dspbuf);
+	struct tm the_date;
+	char tbuf[MAX_TD_FMT_LEN];
+	time_t tm = tv->tv_sec;
+
+	if (b_left <= 0)
+		return b_left;
+
+	if (logfields->datefmt == TD_NONE && logfields->timefmt == TD_NONE)
+		fmt = "%c ";
+
+	Localtime_r(&tm, &the_date);
+
+	/* Earlier we build the date/time format string in
+	 * date_time_fmt, now use that to format the time and/or date.
+	 * If time format is TD_SYSLOG_USEC, then we need an additional
+	 * step to add the microseconds (since strftime just takes a
+	 * struct tm which was filled in from a time_t and thus does not
+	 * have microseconds.
+	 */
+	if (strftime(tbuf, sizeof(tbuf), fmt, &the_date) != 0) {
+		if (logfields->timefmt == TD_SYSLOG_USEC)
+			b_left = display_printf(dspbuf, tbuf, tv->tv_usec);
+		else
+			b_left = display_cat(dspbuf, tbuf);
+	}
+
+	return b_left;
+}
+
+int display_timespec(struct display_buffer *dspbuf, struct timespec *ts)
+{
+	char *fmt = date_time_fmt;
+	int b_left = display_start(dspbuf);
+	struct tm the_date;
+	char tbuf[MAX_TD_FMT_LEN];
+	time_t tm = ts->tv_sec;
+
+	if (b_left <= 0)
+		return b_left;
+
+	if (logfields->datefmt == TD_NONE && logfields->timefmt == TD_NONE)
+		fmt = "%c ";
+
+	Localtime_r(&tm, &the_date);
+
+	/* Earlier we build the date/time format string in
+	 * date_time_fmt, now use that to format the time and/or date.
+	 * If time format is TD_SYSLOG_USEC, then we need an additional
+	 * step to add the microseconds (since strftime just takes a
+	 * struct tm which was filled in from a time_t and thus does not
+	 * have microseconds.
+	 */
+	if (strftime(tbuf, sizeof(tbuf), fmt, &the_date) != 0) {
+		if (logfields->timefmt == TD_SYSLOG_USEC)
+			b_left = display_printf(dspbuf, tbuf, ts->tv_nsec);
+		else
+			b_left = display_cat(dspbuf, tbuf);
+	}
+
+	return b_left;
+}
+
 static int display_log_header(struct display_buffer *dsp_log)
 {
 	int b_left = display_start(dsp_log);
@@ -1293,38 +1381,19 @@ static int display_log_header(struct display_buffer *dsp_log)
 	if (b_left > 0
 	    && (logfields->datefmt != TD_NONE
 		|| logfields->timefmt != TD_NONE)) {
-		struct tm the_date;
-		char tbuf[MAX_TD_FMT_LEN];
-		time_t tm;
 		struct timeval tv;
 
 		if (logfields->timefmt == TD_SYSLOG_USEC) {
 			gettimeofday(&tv, NULL);
-			tm = tv.tv_sec;
 		} else {
-			tm = time(NULL);
+			tv.tv_sec = time(NULL);
+			tv.tv_usec = 0;
 		}
 
-		Localtime_r(&tm, &the_date);
+		b_left = display_timeval(dsp_log, &tv);
 
-		/* Earlier we build the date/time format string in
-		 * date_time_fmt, now use that to format the time and/or date.
-		 * If time format is TD_SYSLOG_USEC, then we need an additional
-		 * step to add the microseconds (since strftime just takes a
-		 * struct tm which was filled in from a time_t and thus does not
-		 * have microseconds.
-		 */
-		if (strftime(tbuf,
-			     sizeof(tbuf),
-			     date_time_fmt,
-			     &the_date) != 0) {
-			if (logfields->timefmt == TD_SYSLOG_USEC)
-				b_left =
-				    display_printf(dsp_log, tbuf,
-						   tv.tv_usec);
-			else
-				b_left = display_cat(dsp_log, tbuf);
-		}
+		if (b_left > 0)
+			b_left = display_cat(dsp_log, " ");
 	}
 
 	if (b_left > 0 && const_log_str[0] != '\0')
@@ -1345,7 +1414,7 @@ static int display_log_header(struct display_buffer *dsp_log)
 }
 
 static int display_log_component(struct display_buffer *dsp_log,
-				 log_components_t component, char *file,
+				 log_components_t component, const char *file,
 				 int line, const char *function, int level)
 {
 	int b_left = display_start(dsp_log);
@@ -1402,9 +1471,10 @@ static int display_log_component(struct display_buffer *dsp_log,
 	return b_left;
 }
 
-void display_log_component_level(log_components_t component, char *file,
-				 int line, char *function, log_levels_t level,
-				 char *format, va_list arguments)
+void display_log_component_level(log_components_t component, const char *file,
+				int line, const char *function,
+				log_levels_t level, const char *format,
+				va_list arguments)
 {
 	char *compstr;
 	char *message;
@@ -1469,7 +1539,7 @@ void display_log_component_level(log_components_t component, char *file,
 static log_levels_t default_log_levels[] = {
 	[COMPONENT_ALL] = NIV_NULL,
 	[COMPONENT_LOG] = NIV_EVENT,
-	[COMPONENT_LOG_EMERG] = NIV_EVENT,
+	[COMPONENT_MEM_ALLOC] = NIV_EVENT,
 	[COMPONENT_MEMLEAKS] = NIV_EVENT,
 	[COMPONENT_FSAL] = NIV_EVENT,
 	[COMPONENT_NFSPROTO] = NIV_EVENT,
@@ -1494,6 +1564,7 @@ static log_levels_t default_log_levels[] = {
 	[COMPONENT_RW_LOCK] = NIV_EVENT,
 	[COMPONENT_NLM] = NIV_EVENT,
 	[COMPONENT_RPC] = NIV_EVENT,
+	[COMPONENT_TIRPC] = NIV_EVENT,
 	[COMPONENT_NFS_CB] = NIV_EVENT,
 	[COMPONENT_THREAD] = NIV_EVENT,
 	[COMPONENT_NFS_V4_ACL] = NIV_EVENT,
@@ -1514,9 +1585,9 @@ struct log_component_info LogComponents[COMPONENT_COUNT] = {
 	[COMPONENT_LOG] = {
 		.comp_name = "COMPONENT_LOG",
 		.comp_str = "LOG",},
-	[COMPONENT_LOG_EMERG] = {
-		.comp_name = "COMPONENT_LOG_EMERG",
-		.comp_str = "LOG_EMERG",},
+	[COMPONENT_MEM_ALLOC] = {
+		.comp_name = "COMPONENT_MEM_ALLOC",
+		.comp_str = "MEM ALLOC",},
 	[COMPONENT_MEMLEAKS] = {
 		.comp_name = "COMPONENT_MEMLEAKS",
 		.comp_str = "LEAKS",},
@@ -1589,6 +1660,9 @@ struct log_component_info LogComponents[COMPONENT_COUNT] = {
 	[COMPONENT_RPC] = {
 		.comp_name = "COMPONENT_RPC",
 		.comp_str = "RPC",},
+	[COMPONENT_TIRPC] = {
+		.comp_name = "COMPONENT_TIRPC",
+		.comp_str = "TIRPC",},
 	[COMPONENT_NFS_CB] = {
 		.comp_name = "COMPONENT_NFS_CB",
 		.comp_str = "NFS CB",},
@@ -1618,9 +1692,9 @@ struct log_component_info LogComponents[COMPONENT_COUNT] = {
 		.comp_str = "NFS_MSK",}
 };
 
-void DisplayLogComponentLevel(log_components_t component, char *file, int line,
-			      char *function, log_levels_t level, char *format,
-			      ...)
+void DisplayLogComponentLevel(log_components_t component, const char *file,
+			int line, const char *function, log_levels_t level,
+			const char *format, ...)
 {
 	va_list arguments;
 
@@ -1632,6 +1706,15 @@ void DisplayLogComponentLevel(log_components_t component, char *file, int line,
 	va_end(arguments);
 }
 
+void LogMallocFailure(const char *file, int line, const char *function,
+		      const char *allocator)
+{
+	DisplayLogComponentLevel(COMPONENT_MEM_ALLOC, (char *) file, line,
+				 (char *)function, NIV_NULL,
+				 "Aborting %s due to out of memory",
+				 allocator);
+}
+
 /*
  *  Re-export component logging to TI-RPC internal logging
  */
@@ -1639,13 +1722,14 @@ void rpc_warnx(char *fmt, ...)
 {
 	va_list ap;
 
-	if (component_log_level[COMPONENT_RPC] < NIV_DEBUG)
+	if (component_log_level[COMPONENT_TIRPC] <= NIV_FATAL)
 		return;
 
 	va_start(ap, fmt);
 
-	display_log_component_level(COMPONENT_RPC, "<no-file>", 0, "rpc",
-				    NIV_DEBUG, fmt, ap);
+	display_log_component_level(COMPONENT_TIRPC, "<no-file>", 0, "rpc",
+				    component_log_level[COMPONENT_TIRPC],
+				    fmt, ap);
 
 	va_end(ap);
 
@@ -1691,7 +1775,7 @@ static bool dbus_prop_set(log_components_t component, DBusMessageIter *arg)
 			   LogComponents[component].comp_name,
 			   ReturnLevelInt(component_log_level[component]),
 			   ReturnLevelInt(log_level));
-		component_log_level[component] = log_level;
+		SetComponentLogLevel(component, log_level);
 	}
 	return true;
 }
@@ -1732,7 +1816,7 @@ static struct gsh_dbus_prop COMPONENT_##component##_prop = {	\
 
 HANDLE_PROP(ALL);
 HANDLE_PROP(LOG);
-HANDLE_PROP(LOG_EMERG);
+HANDLE_PROP(MEM_ALLOC);
 HANDLE_PROP(MEMLEAKS);
 HANDLE_PROP(FSAL);
 HANDLE_PROP(NFSPROTO);
@@ -1757,6 +1841,7 @@ HANDLE_PROP(PNFS);
 HANDLE_PROP(RW_LOCK);
 HANDLE_PROP(NLM);
 HANDLE_PROP(RPC);
+HANDLE_PROP(TIRPC);
 HANDLE_PROP(NFS_CB);
 HANDLE_PROP(THREAD);
 HANDLE_PROP(NFS_V4_ACL);
@@ -1770,7 +1855,7 @@ HANDLE_PROP(NFS_MSK);
 static struct gsh_dbus_prop *log_props[] = {
 	LOG_PROPERTY_ITEM(ALL),
 	LOG_PROPERTY_ITEM(LOG),
-	LOG_PROPERTY_ITEM(LOG_EMERG),
+	LOG_PROPERTY_ITEM(MEM_ALLOC),
 	LOG_PROPERTY_ITEM(MEMLEAKS),
 	LOG_PROPERTY_ITEM(FSAL),
 	LOG_PROPERTY_ITEM(NFSPROTO),
@@ -1795,6 +1880,7 @@ static struct gsh_dbus_prop *log_props[] = {
 	LOG_PROPERTY_ITEM(RW_LOCK),
 	LOG_PROPERTY_ITEM(NLM),
 	LOG_PROPERTY_ITEM(RPC),
+	LOG_PROPERTY_ITEM(TIRPC),
 	LOG_PROPERTY_ITEM(NFS_CB),
 	LOG_PROPERTY_ITEM(THREAD),
 	LOG_PROPERTY_ITEM(NFS_V4_ACL),
@@ -1839,10 +1925,11 @@ struct facility_config {
  */
 
 struct logger_config {
-	log_levels_t default_level;
 	struct glist_head facility_list;
 	struct logfields *logfields;
 	log_levels_t *comp_log_level;
+	log_levels_t default_level;
+	uint32_t rpc_debug_flags;
 };
 
 /**
@@ -1870,10 +1957,10 @@ static struct config_item_list timeformats[] = {
  */
 
 static struct config_item format_options[] = {
-	CONF_ITEM_ENUM("date_format", TD_GANESHA, timeformats,
-		       logfields, datefmt),
-	CONF_ITEM_ENUM("time_format", TD_GANESHA, timeformats,
-		       logfields, timefmt),
+	CONF_ITEM_TOKEN("date_format", TD_GANESHA, timeformats,
+			logfields, datefmt),
+	CONF_ITEM_TOKEN("time_format", TD_GANESHA, timeformats,
+			logfields, timefmt),
 	CONF_ITEM_STR("user_date_format", 1, MAX_TD_FMT_LEN, NULL,
 		       logfields, user_date_fmt),
 	CONF_ITEM_STR("user_time_format", 1, MAX_TD_FMT_LEN, NULL,
@@ -2004,8 +2091,8 @@ static struct config_item component_levels[] = {
 			 COMPONENT_ALL, int),
 	CONF_INDEX_TOKEN("LOG", NB_LOG_LEVEL, log_levels,
 			 COMPONENT_LOG, int),
-	CONF_INDEX_TOKEN("LOG_EMERG", NB_LOG_LEVEL, log_levels,
-			 COMPONENT_LOG_EMERG, int),
+	CONF_INDEX_TOKEN("MEM_ALLOC", NB_LOG_LEVEL, log_levels,
+			 COMPONENT_MEM_ALLOC, int),
 	CONF_INDEX_TOKEN("MEMLEAKS", NB_LOG_LEVEL, log_levels,
 			 COMPONENT_MEMLEAKS, int),
 	CONF_INDEX_TOKEN("LEAKS", NB_LOG_LEVEL, log_levels,
@@ -2076,6 +2163,8 @@ static struct config_item component_levels[] = {
 			 COMPONENT_NLM, int),
 	CONF_INDEX_TOKEN("RPC", NB_LOG_LEVEL, log_levels,
 			 COMPONENT_RPC, int),
+	CONF_INDEX_TOKEN("TIRPC", NB_LOG_LEVEL, log_levels,
+			 COMPONENT_TIRPC, int),
 	CONF_INDEX_TOKEN("NFS_CB", NB_LOG_LEVEL, log_levels,
 			 COMPONENT_NFS_CB, int),
 	CONF_INDEX_TOKEN("THREAD", NB_LOG_LEVEL, log_levels,
@@ -2096,7 +2185,7 @@ static struct config_item component_levels[] = {
 			 COMPONENT_FSAL_UP, int),
 	CONF_INDEX_TOKEN("DBUS", NB_LOG_LEVEL, log_levels,
 			 COMPONENT_DBUS, int),
-	CONF_INDEX_TOKEN("COMPONENT_NFS_MSK", NB_LOG_LEVEL, log_levels,
+	CONF_INDEX_TOKEN("NFS_MSK", NB_LOG_LEVEL, log_levels,
 			 COMPONENT_NFS_MSK, int),
 	CONFIG_EOL
 };
@@ -2254,7 +2343,7 @@ static int facility_commit(void *node, void *link_mem, void *self_struct,
 			"No facility name given");
 		err_type->missing = true;
 		errcnt++;
-		goto out;
+		return errcnt;
 	}
 	if (conf->dest != NULL) {
 		if (strcasecmp(conf->dest, "stderr") == 0) {
@@ -2283,7 +2372,7 @@ static int facility_commit(void *node, void *link_mem, void *self_struct,
 			conf->facility_name);
 		err_type->missing = true;
 		errcnt++;
-		goto out;
+		return errcnt;
 	}
 	if (conf->func != log_to_syslog && conf->headers < LH_ALL)
 		LogWarn(COMPONENT_CONFIG,
@@ -2294,10 +2383,6 @@ static int facility_commit(void *node, void *link_mem, void *self_struct,
 	fac_list = link_mem;
 	glist_add_tail(fac_list, &conf->fac_list);
 	return 0;
-
-out:
-	gsh_free(self_struct); /* got the bits, be done with it */
-	return errcnt;
 }
 
 static void *log_conf_init(void *link_mem, void *self_struct)
@@ -2461,6 +2546,8 @@ static int log_conf_commit(void *node, void *link_mem, void *self_struct,
 				gsh_free(component_log_level);
 			component_log_level = logger->comp_log_level;
 		}
+		ntirpc_pp.debug_flags = logger->rpc_debug_flags;
+		SetNTIRPCLogLevel(component_log_level[COMPONENT_TIRPC]);
 	} else {
 		if (logger->logfields != NULL) {
 			struct logfields *lf = logger->logfields;
@@ -2482,6 +2569,9 @@ static int log_conf_commit(void *node, void *link_mem, void *self_struct,
 static struct config_item logging_params[] = {
 	CONF_ITEM_TOKEN("Default_log_level", NB_LOG_LEVEL, log_levels,
 			 logger_config, default_level),
+	CONF_ITEM_UI32("RPC_Debug_Flags", 0, UINT32_MAX,
+		       TIRPC_DEBUG_FLAG_DEFAULT,
+		       logger_config, rpc_debug_flags),
 	CONF_ITEM_BLOCK("Facility", facility_params,
 			facility_init, facility_commit,
 			logger_config, facility_list),
@@ -2531,45 +2621,46 @@ int read_log_config(config_file_t in_config,
 		return -1;
 }				/* read_log_config */
 
-void reread_log_config(void)
+void gsh_backtrace(void)
 {
-	int status = 0;
-	int i;
-	config_file_t config_struct;
-	struct config_error_type err_type;
+#define MAX_STACK_DEPTH		32	/* enough ? */
+	void *buffer[MAX_STACK_DEPTH];
+	struct log_facility *facility;
+	struct glist_head *glist;
+	int fd = -1;
+	char **traces;
+	int i, nlines;
 
-	/* Clear out the flag indicating component was set from environment. */
-	for (i = COMPONENT_ALL; i < COMPONENT_COUNT; i++)
-		LogComponents[i].comp_env_set = false;
+	nlines = backtrace(buffer, MAX_STACK_DEPTH);
 
-	/* If no configuration file is given, then the caller must want to
-	 * reparse the configuration file from startup.
+	/* Find an active log facility that is file based to
+	 * log the backtrace symbols.
 	 */
-	if (config_path[0] == '\0') {
-		LogCrit(COMPONENT_CONFIG,
-			"No configuration file was specified for reloading log config.");
-		return;
+	PTHREAD_RWLOCK_rdlock(&log_rwlock);
+	glist_for_each(glist, &active_facility_list) {
+		facility = glist_entry(glist, struct log_facility, lf_active);
+		if (facility->lf_func == log_to_file) {
+			fd = open((char *)facility->lf_private,
+				  O_WRONLY | O_APPEND | O_CREAT, log_mask);
+			break;
+		}
 	}
 
-	/* Create a memstream for parser+processing error messages */
-	if (!init_error_type(&err_type))
-		return;
-	/* Attempt to parse the new configuration file */
-	config_struct = config_ParseFile(config_path, &err_type);
-	if (!config_error_no_error(&err_type)) {
-		config_Free(config_struct);
-		LogCrit(COMPONENT_CONFIG,
-			"Error while parsing new configuration file %s",
-			config_path);
-		report_config_errors(&err_type, NULL, config_errs_to_log);
-		return;
+	if (fd != -1) {
+		LogMajor(COMPONENT_INIT, "stack backtrace follows:");
+		backtrace_symbols_fd(buffer, nlines, fd);
+		close(fd);
+	} else {
+		/* No file based logging, hope malloc call inside
+		 * backtrace_symbols() doesn't hang!
+		 */
+		traces = backtrace_symbols(buffer, nlines);
+		if (traces) {
+			for (i = 0; i < nlines; i++) {
+				LogMajor(COMPONENT_INIT, "%s", traces[i]);
+			}
+			free(traces);
+		}
 	}
-
-	/* Create the new exports list */
-	status = read_log_config(config_struct, &err_type);
-	if (status < 0)
-		LogCrit(COMPONENT_CONFIG, "Error while parsing LOG entries");
-
-	report_config_errors(&err_type, NULL, config_errs_to_log);
-	config_Free(config_struct);
+	PTHREAD_RWLOCK_unlock(&log_rwlock);
 }

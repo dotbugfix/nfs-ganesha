@@ -39,9 +39,13 @@
 #include <errno.h>
 #include "fsal.h"
 #include "log.h"
+#include "gsh_rpc.h"
 #include "nfs_init.h"
 #include "nfs_exports.h"
 #include "pnfs_utils.h"
+#include "config_parsing.h"
+#include "conf_url.h"
+#include "sal_functions.h"
 
 /**
  * @brief LTTng trace enabling magic
@@ -63,27 +67,28 @@
 #define TRACEPOINT_PROBE_DYNAMIC_LINKAGE
 
 #include "gsh_lttng/logger.h"
+#include "gsh_lttng/mdcache.h"
 #include "gsh_lttng/nfs_rpc.h"
+#include "gsh_lttng/nfs4.h"
+#include "gsh_lttng/state.h"
+#include "gsh_lttng/fsal_mem.h"
 #endif /* USE_LTTNG */
 
 /* parameters for NFSd startup and default values */
 
-nfs_start_info_t my_nfs_start_info = {
+static nfs_start_info_t my_nfs_start_info = {
 	.dump_default_config = false,
-	.lw_mark_trigger = false
+	.lw_mark_trigger = false,
+	.drop_caps = true
 };
 
-config_file_t config_struct;
-char *log_path = NULL;
-char *exec_name = "nfs-ganesha";
-char *host_name = "localhost";
-int debug_level = -1;
-int detach_flag = true;
+config_file_t nfs_config_struct;
+char *nfs_host_name = "localhost";
 
 /* command line syntax */
 
-char options[] = "v@L:N:f:p:FRTE:h";
-char usage[] =
+static const char options[] = "v@L:N:f:p:FRTE:Ch";
+static const char usage[] =
 	"Usage: %s [-hd][-L <logfile>][-N <dbg_lvl>][-f <config_file>]\n"
 	"\t[-v]                display version information\n"
 	"\t[-L <logfile>]      set the default logfile for the daemon\n"
@@ -93,7 +98,8 @@ char usage[] =
 	"\t[-F]                the program stays in foreground\n"
 	"\t[-R]                daemon will manage RPCSEC_GSS (default is no RPCSEC_GSS)\n"
 	"\t[-T]                dump the default configuration on stdout\n"
-	"\t[-E] <epoch<]       overrides ServerBootTime for ServerEpoch\n"
+	"\t[-E] <epoch>]       overrides ServerBootTime for ServerEpoch\n"
+	"\t[-C]                dump trace when segfault\n"
 	"\t[-h]                display this help\n"
 	"----------------- Signals ----------------\n"
 	"SIGUSR1    : Enable/Disable File Content Cache forced flush\n"
@@ -102,6 +108,18 @@ char usage[] =
 	"LogFile    : SYSLOG\n"
 	"PidFile    : "GANESHA_PIDFILE_PATH"\n"
 	"DebugLevel : NIV_EVENT\n" "ConfigFile : "GANESHA_CONFIG_PATH"\n";
+
+static inline char *main_strdup(const char *var, const char *str)
+{
+	char *s = strdup(str);
+
+	if (s == NULL) {
+		fprintf(stderr, "strdup failed for %s value %s\n", var, str);
+		abort();
+	}
+
+	return s;
+}
 
 /**
  * main: simply the main function.
@@ -123,6 +141,11 @@ int main(int argc, char *argv[])
 	int dsc;
 	int rc;
 	int pidfile;
+	char *log_path = NULL;
+	char *exec_name = "nfs-ganesha";
+	int debug_level = -1;
+	int detach_flag = true;
+	bool dump_trace = false;
 #ifndef HAVE_DAEMON
 	int dev_null_fd = 0;
 	pid_t son_pid;
@@ -131,18 +154,13 @@ int main(int argc, char *argv[])
 	struct config_error_type err_type;
 
 	/* Set the server's boot time and epoch */
-	now(&ServerBootTime);
-	ServerEpoch = (time_t) ServerBootTime.tv_sec;
+	now(&nfs_ServerBootTime);
+	nfs_ServerEpoch = (time_t) nfs_ServerBootTime.tv_sec;
+	srand(nfs_ServerEpoch);
 
 	tempo_exec_name = strrchr(argv[0], '/');
-	if (tempo_exec_name != NULL) {
-		exec_name = gsh_strdup(tempo_exec_name + 1);
-		if (!exec_name) {
-			fprintf(stderr,
-				"Unable to allocate memory for exec name, exiting...\n");
-			exit(1);
-		}
-	}
+	if (tempo_exec_name != NULL)
+		exec_name = main_strdup("exec_name", tempo_exec_name + 1);
 
 	if (*exec_name == '\0')
 		exec_name = argv[0];
@@ -152,12 +170,7 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Could not get local host name, exiting...\n");
 		exit(1);
 	} else {
-		host_name = gsh_strdup(localmachine);
-		if (!host_name) {
-			fprintf(stderr,
-				"Unable to allocate memory for hostname, exiting...\n");
-			exit(1);
-		}
+		nfs_host_name = main_strdup("host_name", localmachine);
 	}
 
 	/* now parsing options with getopt */
@@ -165,24 +178,21 @@ int main(int argc, char *argv[])
 		switch (c) {
 		case 'v':
 		case '@':
-			/* A litlle backdoor to keep track of binary versions */
+			printf("NFS-Ganesha Release = V%s\n", GANESHA_VERSION);
+#if !GANESHA_BUILD_RELEASE
+			/* A little backdoor to keep track of binary versions */
 			printf("%s compiled on %s at %s\n", exec_name, __DATE__,
 			       __TIME__);
-			printf("Release = V%s\n", GANESHA_VERSION);
 			printf("Release comment = %s\n", VERSION_COMMENT);
 			printf("Git HEAD = %s\n", _GIT_HEAD_COMMIT);
 			printf("Git Describe = %s\n", _GIT_DESCRIBE);
+#endif
 			exit(0);
 			break;
 
 		case 'L':
 			/* Default Log */
-			log_path = gsh_strdup(optarg);
-			if (!log_path) {
-				fprintf(stderr,
-					"Unable to allocate memory for log path.\n");
-				exit(1);
-			}
+			log_path = main_strdup("log_path", optarg);
 			break;
 
 		case 'N':
@@ -198,23 +208,12 @@ int main(int argc, char *argv[])
 		case 'f':
 			/* config file */
 
-			config_path = gsh_strdup(optarg);
-			if (!config_path) {
-				fprintf(stderr,
-					"Unable to allocate memory for config path.\n");
-				exit(1);
-			}
+			nfs_config_path = main_strdup("config_path", optarg);
 			break;
 
 		case 'p':
 			/* PID file */
-			pidfile_path = gsh_strdup(optarg);
-			if (!pidfile_path) {
-				fprintf(stderr,
-					"Path %s too long for option 'f'.\n",
-					optarg);
-				exit(1);
-			}
+			nfs_pidfile_path = main_strdup("pidfile_path", optarg);
 			break;
 
 		case 'F':
@@ -241,8 +240,12 @@ int main(int argc, char *argv[])
 			my_nfs_start_info.dump_default_config = true;
 			break;
 
+		case 'C':
+			dump_trace = true;
+			break;
+
 		case 'E':
-			ServerEpoch = (time_t) atoll(optarg);
+			nfs_ServerEpoch = (time_t) atoll(optarg);
 			break;
 
 		case 'h':
@@ -256,12 +259,22 @@ int main(int argc, char *argv[])
 	}
 
 	/* initialize memory and logging */
-	nfs_prereq_init(exec_name, host_name, debug_level, log_path);
-	LogEvent(COMPONENT_MAIN,
-		 "%s Starting: %s",
+	nfs_prereq_init(exec_name, nfs_host_name, debug_level, log_path,
+			dump_trace);
+#if GANESHA_BUILD_RELEASE
+	LogEvent(COMPONENT_MAIN, "%s Starting: Ganesha Version %s",
+		 exec_name, GANESHA_VERSION);
+#else
+	LogEvent(COMPONENT_MAIN, "%s Starting: %s",
 		 exec_name,
 		 "Ganesha Version " _GIT_DESCRIBE ", built at "
 		 __DATE__ " " __TIME__ " on " BUILD_HOST);
+#endif
+
+	/* initialize nfs_init */
+	nfs_init_init();
+
+	nfs_check_malloc();
 
 	/* Start in background, if wanted */
 	if (detach_flag) {
@@ -359,10 +372,10 @@ int main(int argc, char *argv[])
 #endif
 
 	/* Echo PID into pidfile */
-	pidfile = open(pidfile_path, O_CREAT | O_RDWR, 0644);
+	pidfile = open(nfs_pidfile_path, O_CREAT | O_RDWR, 0644);
 	if (pidfile == -1) {
 		LogFatal(COMPONENT_MAIN, "Can't open pid file %s for writing",
-			 pidfile_path);
+			 nfs_pidfile_path);
 	} else {
 		char linebuf[1024];
 		struct flock lk;
@@ -379,7 +392,7 @@ int main(int argc, char *argv[])
 		(void)snprintf(linebuf, sizeof(linebuf), "%u\n", getpid());
 		if (write(pidfile, linebuf, strlen(linebuf)) == -1)
 			LogCrit(COMPONENT_MAIN, "Couldn't write pid to file %s",
-				pidfile_path);
+				nfs_pidfile_path);
 	}
 
 	/* Set up for the signal handler.
@@ -393,18 +406,22 @@ int main(int argc, char *argv[])
 		LogFatal(COMPONENT_MAIN,
 			 "Could not start nfs daemon, pthread_sigmask failed");
 
+	/* init URL package */
+	config_url_init();
+
 	/* Create a memstream for parser+processing error messages */
 	if (!init_error_type(&err_type))
 		goto fatal_die;
 
 	/* Parse the configuration file so we all know what is going on. */
 
-	if (config_path == NULL || config_path[0] == '\0') {
+	if (nfs_config_path == NULL || nfs_config_path[0] == '\0') {
 		LogWarn(COMPONENT_INIT,
 			"No configuration file named.");
-		config_struct = NULL;
+		nfs_config_struct = NULL;
 	} else
-		config_struct = config_ParseFile(config_path, &err_type);
+		nfs_config_struct =
+			config_ParseFile(nfs_config_path, &err_type);
 
 	if (!config_error_no_error(&err_type)) {
 		char *errstr = err_type_str(&err_type);
@@ -413,18 +430,20 @@ int main(int argc, char *argv[])
 			LogCrit(COMPONENT_INIT,
 				 "Error %s while parsing (%s)",
 				 errstr != NULL ? errstr : "unknown",
-				 config_path);
+				 nfs_config_path);
+			if (errstr != NULL)
+				gsh_free(errstr);
 			goto fatal_die;
 		} else
 			LogWarn(COMPONENT_INIT,
 				"Error %s while parsing (%s)",
 				errstr != NULL ? errstr : "unknown",
-				config_path);
+				nfs_config_path);
 		if (errstr != NULL)
 			gsh_free(errstr);
 	}
 
-	if (read_log_config(config_struct, &err_type) < 0) {
+	if (read_log_config(nfs_config_struct, &err_type) < 0) {
 		LogCrit(COMPONENT_INIT,
 			 "Error while parsing log configuration");
 		goto fatal_die;
@@ -437,7 +456,7 @@ int main(int argc, char *argv[])
 
 	/* parse configuration file */
 
-	if (nfs_set_param_from_conf(config_struct,
+	if (nfs_set_param_from_conf(nfs_config_struct,
 				    &my_nfs_start_info,
 				    &err_type)) {
 		LogCrit(COMPONENT_INIT,
@@ -454,17 +473,33 @@ int main(int argc, char *argv[])
 	/* Load Data Server entries from parsed file
 	 * returns the number of DS entries.
 	 */
-	dsc = ReadDataServers(config_struct, &err_type);
+	dsc = ReadDataServers(nfs_config_struct, &err_type);
 	if (dsc < 0) {
 		LogCrit(COMPONENT_INIT,
 			"Error while parsing DS entries");
 		goto fatal_die;
 	}
 
+	/* Create stable storage directory, this needs to be done before
+	 * starting the recovery thread.
+	 */
+	rc = nfs4_recovery_init();
+	if (rc) {
+		LogCrit(COMPONENT_INIT,
+			  "Recovery backend initialization failed!");
+		goto fatal_die;
+	}
+
+	/* Start grace period */
+	nfs_start_grace(NULL);
+
+	/* Wait for enforcement to begin */
+	nfs_wait_for_grace_enforcement();
+
 	/* Load export entries from parsed file
 	 * returns the number of export entries.
 	 */
-	rc = ReadExports(config_struct, &err_type);
+	rc = ReadExports(nfs_config_struct, &err_type);
 	if (rc < 0) {
 		LogCrit(COMPONENT_INIT,
 			  "Error while parsing export entries");
@@ -477,7 +512,7 @@ int main(int argc, char *argv[])
 
 	/* freeing syntax tree : */
 
-	config_Free(config_struct);
+	config_Free(nfs_config_struct);
 
 	/* Everything seems to be OK! We can now start service threads */
 	nfs_start(&my_nfs_start_info);

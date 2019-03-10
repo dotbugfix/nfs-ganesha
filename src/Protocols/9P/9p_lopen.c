@@ -40,8 +40,6 @@
 #include <sys/stat.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
-#include "cache_inode_lru.h"
 #include "fsal.h"
 #include "9p.h"
 
@@ -52,7 +50,7 @@ int _9p_lopen(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	u32 *fid = NULL;
 	u32 *flags = NULL;
 
-	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status;
 	fsal_openflags_t openflags = 0;
 
 	struct _9p_fid *pfid = NULL;
@@ -77,39 +75,34 @@ int _9p_lopen(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	}
 
 	_9p_openflags2FSAL(flags, &openflags);
-	pfid->state.state_data.fid.share_access =
+
+	pfid->state->state_data.fid.share_access =
 		_9p_openflags_to_share_access(flags);
 
 	_9p_init_opctx(pfid, req9p);
 	if (pfid->pentry->type == REGULAR_FILE) {
 		/** @todo: Maybe other types (FIFO, SOCKET,...) require
 		 * to be opened too */
-		if (!atomic_postinc_uint32_t(&pfid->opens)) {
-			cache_status = cache_inode_inc_pin_ref(pfid->pentry);
-			if (cache_status != CACHE_INODE_SUCCESS)
-				return _9p_rerror(req9p, msgtag,
-						  _9p_tools_errno(cache_status),
-						  plenout, preply);
-		}
+		if (*flags & 0x10)
+			openflags |= FSAL_O_TRUNC;
 
-		cache_status =
-		    cache_inode_open(pfid->pentry, openflags, 0);
-		if (cache_status != CACHE_INODE_SUCCESS)
+		fsal_status = fsal_reopen2(pfid->pentry, pfid->state,
+					   openflags, true);
+
+		if (FSAL_IS_ERROR(fsal_status))
 			return _9p_rerror(req9p, msgtag,
-					  _9p_tools_errno(cache_status),
+					  _9p_tools_errno(fsal_status),
 					  plenout, preply);
 
+		atomic_inc_uint32_t(&pfid->opens);
 	}
-
-	/* iounit = 0 by default */
-	pfid->specdata.iounit = _9P_IOUNIT;
 
 	/* Build the reply */
 	_9p_setinitptr(cursor, preply, _9P_RLOPEN);
 	_9p_setptr(cursor, msgtag, u16);
 
 	_9p_setqid(cursor, pfid->qid);
-	_9p_setptr(cursor, &pfid->specdata.iounit, u32);
+	_9p_setvalue(cursor, _9P_IOUNIT, u32);
 
 	_9p_setendptr(cursor, preply);
 	_9p_checkbound(cursor, preply, plenout);
@@ -117,7 +110,7 @@ int _9p_lopen(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	LogDebug(COMPONENT_9P,
 		 "RLOPEN: tag=%u fid=%u qid=(type=%u,version=%u,path=%llu) iounit=%u",
 		 *msgtag, *fid, (u32) pfid->qid.type, pfid->qid.version,
-		 (unsigned long long)pfid->qid.path, pfid->specdata.iounit);
+		 (unsigned long long)pfid->qid.path, _9P_IOUNIT);
 
 	return 1;
 }

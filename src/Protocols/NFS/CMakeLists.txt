@@ -9,29 +9,10 @@ SET(nfsproto_STAT_SRCS
    mnt_Umnt.c
    mnt_UmntAll.c
    nfs_null.c
-   nfs3_access.c
-   nfs3_commit.c
-   nfs3_create.c
-   nfs3_fsinfo.c
-   nfs3_fsstat.c
-   nfs3_getattr.c
-   nfs3_link.c
-   nfs3_lookup.c
-   nfs3_mkdir.c
-   nfs3_mknod.c
-   nfs3_pathconf.c
-   nfs3_read.c
-   nfs3_readdir.c
-   nfs3_readdirplus.c
-   nfs3_readlink.c
-   nfs3_remove.c
-   nfs3_rename.c
-   nfs3_rmdir.c
-   nfs3_setattr.c
-   nfs3_symlink.c
-   nfs3_write.c
    nfs4_Compound.c
    nfs4_op_access.c
+   nfs4_op_allocate.c
+   nfs4_op_bind_conn.c
    nfs4_op_close.c
    nfs4_op_commit.c
    nfs4_op_create.c
@@ -78,6 +59,7 @@ SET(nfsproto_STAT_SRCS
    nfs4_op_sequence.c
    nfs4_op_set_ssv.c
    nfs4_op_setattr.c
+   nfs4_op_xattr.c
    nfs4_op_setclientid.c
    nfs4_op_setclientid_confirm.c
    nfs4_op_destroy_clientid.c
@@ -88,11 +70,40 @@ SET(nfsproto_STAT_SRCS
    nfs_proto_tools.c
 )
 
+if(USE_NFS3)
+  SET(nfsproto_STAT_SRCS
+    ${nfsproto_STAT_SRCS}
+    nfs3_access.c
+    nfs3_commit.c
+    nfs3_create.c
+    nfs3_fsinfo.c
+    nfs3_fsstat.c
+    nfs3_getattr.c
+    nfs3_link.c
+    nfs3_lookup.c
+    nfs3_mkdir.c
+    nfs3_mknod.c
+    nfs3_pathconf.c
+    nfs3_read.c
+    nfs3_readdir.c
+    nfs3_readdirplus.c
+    nfs3_readlink.c
+    nfs3_remove.c
+    nfs3_rename.c
+    nfs3_rmdir.c
+    nfs3_setattr.c
+    nfs3_symlink.c
+    nfs3_write.c
+    )
+endif(USE_NFS3)
+
 add_library(nfsproto STATIC ${nfsproto_STAT_SRCS})
+add_sanitizers(nfsproto)
 
 set(nfs4callbackSRCS
    nfs4_cb_Compound.c
 )
 
 add_library(nfs4callbacks STATIC ${nfs4callbackSRCS})
+add_sanitizers(nfs4callbacks)
 

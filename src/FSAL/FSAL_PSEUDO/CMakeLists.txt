@@ -9,13 +9,12 @@ set( LIB_PREFIX 64)
 
 SET(fsalpseudo_LIB_SRCS
    handle.c
-   file.c
-   xattrs.c
    pseudofs_methods.h
    main.c
    export.c
 )
 
 add_library(fsalpseudo STATIC ${fsalpseudo_LIB_SRCS})
+add_sanitizers(fsalpseudo)
 
 ########### install files ###############

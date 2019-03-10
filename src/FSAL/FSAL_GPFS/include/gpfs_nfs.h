@@ -50,6 +50,7 @@ struct flock
 #define kGanesha 140             /* Must be the same as Ganesha in enum kxOps */
 
 #define OPENHANDLE_GET_VERSION    100
+#define OPENHANDLE_GET_VERSION2   1002
 #define OPENHANDLE_NAME_TO_HANDLE 101
 #define OPENHANDLE_OPEN_BY_HANDLE 102
 #define OPENHANDLE_LAYOUT_TYPE    106
@@ -90,9 +91,30 @@ struct flock
 #define OPENHANDLE_FADVISE_BY_FD  141
 #define OPENHANDLE_SEEK_BY_FD     142
 #define OPENHANDLE_STATFS_BY_FH   143
+#define OPENHANDLE_GETXATTRS      144
+#define OPENHANDLE_SETXATTRS      145
+#define OPENHANDLE_REMOVEXATTRS   146
+#define OPENHANDLE_LISTXATTRS     147
+#define OPENHANDLE_MKNODE_BY_NAME 148
+#define OPENHANDLE_reserved       149
 #define OPENHANDLE_TRACE_ME       150
 #define OPENHANDLE_QUOTA          151
 #define OPENHANDLE_FS_LOCATIONS   152
+
+/* If there is any change in above constants, then update below values.
+ * Currently ignoring opcode 1002 */
+#define GPFS_MIN_OP		 OPENHANDLE_GET_VERSION
+#define GPFS_MAX_OP		 OPENHANDLE_FS_LOCATIONS
+#define GPFS_STAT_NO_OP_1           3
+#define GPFS_STAT_NO_OP_2           4
+#define GPFS_STAT_NO_OP_3           5
+/* max stat ops including placeholder for phantom ops  */
+#define GPFS_STAT_MAX_OPS (GPFS_MAX_OP-GPFS_MIN_OP+2)
+/* placeholder index is the last index in the array */
+#define GPFS_STAT_PH_INDEX (GPFS_STAT_MAX_OPS-1)
+/* total ops excluding the missing ops 103, 104 and 105 and the placeholder
+ * for phantom ops */
+#define GPFS_TOTAL_OPS     (GPFS_STAT_MAX_OPS-4)
 
 struct trace_arg
 {
@@ -101,18 +123,14 @@ struct trace_arg
   char     *str;
 };
 
+#define ganesha_v1 1
+#define ganesha_v2 2
+
 int gpfs_ganesha(int op, void *oarg);
 
 #define OPENHANDLE_HANDLE_LEN 40
-#define OPENHANDLE_SHORT_HANDLE_LEN 32
 #define OPENHANDLE_KEY_LEN 28
-#define OPENHANDLE_VERSION 1
-
-/* gpfs_max_fh_size will be OPENHANDLE_SHORT_HANDLE_LEN if
- * short_file_handle is enabled. Otherwise, it is set to
- * OPENHANDLE_HANDLE_LEN.
- */
-extern int gpfs_max_fh_size;
+#define OPENHANDLE_VERSION 2
 
 struct xstat_cred_t
 {
@@ -146,6 +164,7 @@ struct name_handle_arg
   int flag;
   const char *name;
   struct gpfs_file_handle *handle;
+  int expfd;
 };
 
 struct get_handle_arg
@@ -163,6 +182,7 @@ struct open_arg
   int flags;
   int openfd;
   struct gpfs_file_handle *handle;
+	const char *cli_ip;
 };
 
 struct link_fh_arg
@@ -570,7 +590,7 @@ struct create_name_arg
 {
     int mountdirfd;                 /* in     */
     struct gpfs_file_handle *dir_fh;/* in     */
-    uint32_t dev;                   /* in     */
+    uint32_t dev;                   /* in dev or posix flags */
     int mode;                       /* in     */
     int len;                        /* in     */
     const char *name;               /* in     */
@@ -668,6 +688,42 @@ struct xstat_arg
     uint32_t *expire_attr;
 };
 
+struct getxattr_arg {
+	int mountdirfd;
+	struct gpfs_file_handle *handle;
+	uint32_t name_len;
+	char *name;
+	uint32_t value_len;
+	void *value;
+};
+
+struct setxattr_arg {
+	int mountdirfd;
+	struct gpfs_file_handle *handle;
+	int type;
+	uint32_t name_len;
+	char *name;
+	uint32_t value_len;
+	void *value;
+};
+
+struct removexattr_arg {
+	int mountdirfd;
+	struct gpfs_file_handle *handle;
+	uint32_t name_len;
+	char *name;
+};
+
+struct listxattr_arg {
+	int mountdirfd;
+	struct gpfs_file_handle *handle;
+	uint64_t cookie;
+	uint64_t verifier;
+	uint32_t eof;
+	uint32_t name_len;
+	void *names;
+};
+
 struct fs_loc_arg {
     int mountdirfd;
     struct gpfs_file_handle *handle;
@@ -701,5 +757,7 @@ struct quotactl_arg
 #ifdef __cplusplus
 }
 #endif
+
+extern struct fsal_stats gpfs_stats;
 
 #endif /* H_GPFS_NFS */

@@ -43,10 +43,15 @@
 #include "fsal_types.h"
 
 /* convert error codes */
-int posix2fsal_error(int posix_errorcode);
+fsal_errors_t posix2fsal_error(int posix_errorcode);
 
-/** converts an fsal open flag to an hpss open flag. */
-int fsal2posix_openflags(fsal_openflags_t fsal_flags, int *p_posix_flags);
+static inline fsal_status_t posix2fsal_status(int posix_errorcode)
+{
+	return fsalstat(posix2fsal_error(posix_errorcode), posix_errorcode);
+}
+
+/** converts an fsal open flag to a POSIX open flag. */
+void fsal2posix_openflags(fsal_openflags_t fsal_flags, int *p_posix_flags);
 
 /** converts an FSAL permission test to a Posix permission test. */
 int fsal2posix_testperm(fsal_accessflags_t testperm);
@@ -57,6 +62,8 @@ int fsal2posix_testperm(fsal_accessflags_t testperm);
  */
 void posix2fsal_attributes(const struct stat *buffstat,
 			   struct attrlist *fsalattr_out);
+void posix2fsal_attributes_all(const struct stat *buffstat,
+			       struct attrlist *fsalattr_out);
 
 /** converts FSAL access mode to unix mode. */
 mode_t fsal2unix_mode(uint32_t fsal_mode);
@@ -64,7 +71,7 @@ mode_t fsal2unix_mode(uint32_t fsal_mode);
 /** converts unix access mode to fsal mode. */
 uint32_t unix2fsal_mode(mode_t unix_mode);
 
-/** converts hpss object type to fsal object type. */
+/** converts POSIX object type to fsal object type. */
 object_file_type_t posix2fsal_type(mode_t posix_type_in);
 
 /** converts posix fsid to fsal FSid. */

@@ -48,8 +48,8 @@
 
 static void _XDR_2_ioctlxdr_read_begin(XDR *xdr, struct pan_ioctl_xdr *pixdr)
 {
-	pixdr->xdr_buff = xdr_inline(xdr, 0);
-	pixdr->xdr_alloc_len = xdr->x_handy; /* xdr_size_inline(xdr); */
+	pixdr->xdr_buff = xdr_inline_encode(xdr, 0);
+	pixdr->xdr_alloc_len = xdr_size_inline(xdr);
 	pixdr->xdr_len = 0;
 	LogDebug(COMPONENT_FSAL,
 		 "alloc_len=%d xdr_buff=%p",
@@ -60,7 +60,7 @@ static void _XDR_2_ioctlxdr_read_begin(XDR *xdr, struct pan_ioctl_xdr *pixdr)
 /* We need to update the XDR with the encoded bytes */
 static void _XDR_2_ioctlxdr_read_end(XDR *xdr, struct pan_ioctl_xdr *pixdr)
 {
-	void *p = xdr_inline(xdr, pixdr->xdr_len);
+	void *p = xdr_inline_encode(xdr, pixdr->xdr_len);
 
 	LogDebug(COMPONENT_FSAL,
 		 "xdr_len=%d xdr_buff_end=%p",
@@ -74,7 +74,7 @@ static void _XDR_2_ioctlxdr_write(XDR *xdr, struct pan_ioctl_xdr *pixdr)
 		pixdr->xdr_len = xdr_getpos(xdr);
 		xdr_setpos(xdr, 0);
 		/* return the head of the buffer, and reset the pos again */
-		pixdr->xdr_buff = xdr_inline(xdr, pixdr->xdr_len);
+		pixdr->xdr_buff = xdr_inline_decode(xdr, pixdr->xdr_len);
 	} else {
 		/* ensure NULL for next test */
 		pixdr->xdr_buff = NULL;
@@ -112,8 +112,8 @@ static inline int _get_obj_fd(struct fsal_obj_handle *obj_hdl)
 	struct vfs_fsal_obj_handle *myself;
 
 	myself = container_of(obj_hdl, struct vfs_fsal_obj_handle, obj_handle);
-	if (myself->u.file.openflags != FSAL_O_CLOSED)
-		return myself->u.file.fd;
+	if (myself->u.file.fd.openflags != FSAL_O_CLOSED)
+		return myself->u.file.fd.fd;
 	else
 		return -1;
 }
@@ -210,14 +210,14 @@ nfsstat4 layoutget(struct fsal_obj_handle *obj_hdl,
 	_XDR_2_ioctlxdr_read_begin(loc_body, &pixdr);
 
 	/* Take read lock on object to protect file descriptor. */
-	PTHREAD_RWLOCK_rdlock(&obj_hdl->lock);
+	PTHREAD_RWLOCK_rdlock(&obj_hdl->obj_lock);
 
 	ret = panfs_um_layoutget(_get_obj_fd(obj_hdl), &pixdr, clientid,
 				 myself, arg, res);
 	if (!ret)
 		_XDR_2_ioctlxdr_read_end(loc_body, &pixdr);
 
-	PTHREAD_RWLOCK_unlock(&obj_hdl->lock);
+	PTHREAD_RWLOCK_unlock(&obj_hdl->obj_lock);
 
 	LogDebug(COMPONENT_FSAL,
 		 "layout[0x%lx,0x%lx,0x%x] ret => %d", res->segment.offset,
@@ -241,11 +241,11 @@ nfsstat4 layoutreturn(struct fsal_obj_handle *obj_hdl,
 	_XDR_2_ioctlxdr_write(lrf_body, &pixdr);
 
 	/* Take read lock on object to protect file descriptor. */
-	PTHREAD_RWLOCK_rdlock(&obj_hdl->lock);
+	PTHREAD_RWLOCK_rdlock(&obj_hdl->obj_lock);
 
 	ret = panfs_um_layoutreturn(_get_obj_fd(obj_hdl), &pixdr, arg);
 
-	PTHREAD_RWLOCK_unlock(&obj_hdl->lock);
+	PTHREAD_RWLOCK_unlock(&obj_hdl->obj_lock);
 
 	LogDebug(COMPONENT_FSAL,
 		 "layout[0x%lx,0x%lx,0x%x] ret => %d",
@@ -266,11 +266,11 @@ nfsstat4 layoutcommit(struct fsal_obj_handle *obj_hdl,
 	_XDR_2_ioctlxdr_write(lou_body, &pixdr);
 
 	/* Take read lock on object to protect file descriptor. */
-	PTHREAD_RWLOCK_rdlock(&obj_hdl->lock);
+	PTHREAD_RWLOCK_rdlock(&obj_hdl->obj_lock);
 
 	ret = panfs_um_layoutcommit(_get_obj_fd(obj_hdl), &pixdr, arg, res);
 
-	PTHREAD_RWLOCK_unlock(&obj_hdl->lock);
+	PTHREAD_RWLOCK_unlock(&obj_hdl->obj_lock);
 
 	LogDebug(COMPONENT_FSAL,
 		 "layout[0x%lx,0x%lx,0x%x] last_write=0x%lx ret => %d",
@@ -292,7 +292,7 @@ static void initiate_recall(struct vfs_fsal_obj_handle *myself,
 	/* For layoutrecall up_ops are probably set to default recieved at
 	 * vfs_create_export
 	 */
-	myself->up_ops->layoutrecall(myself->obj_handle.fsal,
+	myself->up_ops->layoutrecall(myself->up_ops->export,
 				     &handle, LAYOUT4_OSD2_OBJECTS,
 				     false, &up_segment, r_cookie, NULL);
 
@@ -322,7 +322,7 @@ static void *callback_thread(void *callback_info)
 
 		if (err) {
 			LogDebug(COMPONENT_FSAL,
-				 "callback_thread: => %d (%s)", err,
+				 "callback thread: => %d (%s)", err,
 				 strerror(err));
 			break;
 		}
@@ -351,8 +351,6 @@ static int _start_callback_thread(int root_fd, void **pnfs_data)
 	int err;
 
 	_rt = gsh_calloc(1, sizeof(*_rt));
-	if (!_rt)
-		return ENOMEM;
 
 	_rt->fd = root_fd;
 

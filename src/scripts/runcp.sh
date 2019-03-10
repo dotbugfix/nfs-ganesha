@@ -243,7 +243,7 @@ EXTERNAL="$EXTERNAL|test/test_atomic_x86_86.c|avl/|FSAL/FSAL_GPFS/include"
 
 NO_EXTERNAL=0
 
-IGNORE="config_parsing|Protocols/XDR|NodeList|include/nodelist.h"
+IGNORE="config_parsing|Protocols/XDR"
 IGNORE="$IGNORE|include/gsh_intrinsic.h"
 
 NO_IGNORE=0
@@ -267,7 +267,6 @@ NO_COMPLEX_MACRO_FILES="$NO_COMPLEX_MACRO_FILES|support/export_mgr.c"
 NO_COMPLEX_MACRO_FILES="$NO_COMPLEX_MACRO_FILES|include/gsh_dbus.h"
 
 NO_MACRO_W_FLOW_FILES="FSAL/FSAL_PROXY/handle_mapping/handle_mapping_db.c"
-NO_MACRO_W_FLOW_FILES="$NO_MACRO_W_FLOW_FILES|FSAL/FSAL_PT/fsi_ipc_ccl.h"
 NO_MACRO_W_FLOW_FILES="$NO_MACRO_W_FLOW_FILES|include/9p.h"
 NO_MACRO_W_FLOW_FILES="$NO_MACRO_W_FLOW_FILES|multilock/ml_functions.c"
 

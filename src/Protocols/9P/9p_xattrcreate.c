@@ -38,11 +38,10 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/xattr.h>
+#include "os/xattr.h"
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
@@ -60,8 +59,8 @@ int _9p_xattrcreate(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 
 	struct _9p_fid *pfid = NULL;
 
-	fsal_status_t fsal_status;
-	char name[MAXNAMLEN];
+	fsal_status_t fsal_status = { .major = ERR_FSAL_NO_ERROR, .minor = 0 };
+	char name[MAXNAMLEN+1];
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -78,6 +77,9 @@ int _9p_xattrcreate(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	if (*fid >= _9P_FID_PER_CONN)
 		return _9p_rerror(req9p, msgtag, ERANGE, plenout, preply);
 
+	if (*size > _9P_XATTR_MAX_SIZE)
+		return _9p_rerror(req9p, msgtag, ENOSPC, plenout, preply);
+
 	pfid = req9p->pconn->fids[*fid];
 
 	/* Check that it is a valid fid */
@@ -93,7 +95,13 @@ int _9p_xattrcreate(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 				 EXPORT_OPTION_WRITE_ACCESS) == 0)
 		return _9p_rerror(req9p, msgtag, EROFS, plenout, preply);
 
-	snprintf(name, MAXNAMLEN, "%.*s", *name_len, name_str);
+	if (*name_len >= sizeof(name)) {
+		LogDebug(COMPONENT_9P, "request with name too long (%u)",
+			 *name_len);
+		return _9p_rerror(req9p, msgtag, ENAMETOOLONG, plenout,
+				  preply);
+	}
+	snprintf(name, sizeof(name), "%.*s", *name_len, name_str);
 
 	if (*size == 0LL) {
 		/* Size == 0 : this is in fact a call to removexattr */
@@ -102,41 +110,32 @@ int _9p_xattrcreate(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 			 (u32) *msgtag, *fid, name);
 
 		fsal_status =
-		    pfid->pentry->obj_handle->obj_ops.remove_extattr_by_name(
-			pfid->pentry->obj_handle,
-			name);
+		    pfid->pentry->obj_ops->remove_extattr_by_name(pfid->pentry,
+								 name);
 
 		if (FSAL_IS_ERROR(fsal_status))
 			return _9p_rerror(req9p, msgtag,
-					  _9p_tools_errno
-					  (cache_inode_error_convert
-					   (fsal_status)), plenout, preply);
-	} else if (!strncmp(name, "system.posix_acl_access", MAXNAMLEN)) {
+					  _9p_tools_errno(fsal_status), plenout,
+					  preply);
+	} else {
+		/* Size != 0 , this is a creation/replacement of xattr */
+
+		/* Create the xattr at the FSAL level and cache result */
+		pfid->xattr = gsh_malloc(sizeof(*pfid->xattr) + *size);
+		pfid->xattr->xattr_size = *size;
+		pfid->xattr->xattr_offset = 0LL;
+		pfid->xattr->xattr_write = _9P_XATTR_CAN_WRITE;
+
+
+		strncpy(pfid->xattr->xattr_name, name, MAXNAMLEN);
+
 		/* /!\  POSIX_ACL RELATED HOOK
 		 * Setting a POSIX ACL (using setfacl for example) means
 		 * settings a xattr named system.posix_acl_access BUT this
 		 * attribute is to be used and should not be created
 		 * (it exists already since acl feature is on) */
-		fsal_status.major = ERR_FSAL_NO_ERROR;
-		fsal_status.minor = 0;
-
-		/* Create the xattr at the FSAL level and cache result */
-		pfid->specdata.xattr.xattr_content =
-		     gsh_malloc(XATTR_BUFFERSIZE);
-		if (pfid->specdata.xattr.xattr_content == NULL)
-			return _9p_rerror(req9p, msgtag, ENOMEM,
-					  plenout, preply);
-		/* Special Value */
-		pfid->specdata.xattr.xattr_id = ACL_ACCESS_XATTR_ID;
-	} else {
-		/* Size != 0 , this is a creation/replacement of xattr */
-
-		/* Create the xattr at the FSAL level and cache result */
-		pfid->specdata.xattr.xattr_content =
-		     gsh_malloc(XATTR_BUFFERSIZE);
-		if (pfid->specdata.xattr.xattr_content == NULL)
-			return _9p_rerror(req9p, msgtag, ENOMEM,
-					  plenout, preply);
+		if (!strcmp(name, "system.posix_acl_access"))
+			goto skip_create;
 
 		/* try to create if flag doesn't have REPLACE bit */
 		if ((*flag & XATTR_REPLACE) == 0)
@@ -145,48 +144,30 @@ int _9p_xattrcreate(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 			create = false;
 
 		fsal_status =
-		    pfid->pentry->obj_handle->obj_ops.setextattr_value(
-			pfid->pentry->obj_handle,
-			name,
-			pfid->specdata.xattr.xattr_content,
-			*size, create);
+		    pfid->pentry->obj_ops->setextattr_value(pfid->pentry, name,
+				pfid->xattr->xattr_content,
+				*size, create);
 
 		/* Try again with create = false if flag was set to 0
 		 * and create failed because attribute already exists */
 		if (FSAL_IS_ERROR(fsal_status)
 		    && fsal_status.major == ERR_FSAL_EXIST && (*flag == 0)) {
-			fsal_status =
-			    pfid->pentry->obj_handle->obj_ops.
-			    setextattr_value(pfid->pentry->obj_handle,
-					     name,
-					     pfid->specdata.xattr.xattr_content,
-					     *size, false);
+			fsal_status = pfid->pentry->obj_ops->setextattr_value(
+						pfid->pentry, name,
+						pfid->xattr->xattr_content,
+						*size, false);
 		}
 
-		if (FSAL_IS_ERROR(fsal_status))
+		if (FSAL_IS_ERROR(fsal_status)) {
+			gsh_free(pfid->xattr);
+			pfid->xattr = NULL;
 			return _9p_rerror(req9p, msgtag,
-					  _9p_tools_errno
-					  (cache_inode_error_convert
-					   (fsal_status)), plenout, preply);
-
-		fsal_status =
-		    pfid->pentry->obj_handle->obj_ops.getextattr_id_by_name(
-			pfid->pentry->obj_handle,
-			name,
-			&pfid->specdata.xattr.xattr_id);
-
-		if (FSAL_IS_ERROR(fsal_status))
-			return _9p_rerror(req9p, msgtag,
-					  _9p_tools_errno
-					  (cache_inode_error_convert
-					   (fsal_status)), plenout, preply);
+					  _9p_tools_errno(fsal_status), plenout,
+					  preply);
+		}
 	}
 
-	/* Remember the size of the xattr to be written,
-	 * in order to check at TCLUNK */
-	pfid->specdata.xattr.xattr_size = *size;
-	pfid->specdata.xattr.xattr_offset = 0LL;
-
+skip_create:
 	/* Build the reply */
 	_9p_setinitptr(cursor, preply, _9P_RXATTRCREATE);
 	_9p_setptr(cursor, msgtag, u16);

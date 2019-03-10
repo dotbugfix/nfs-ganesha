@@ -137,12 +137,14 @@ int display_ip_name_val(struct gsh_buffdesc *pbuff, char *str)
  *
  * Adds an entry in the duplicate requests cache.
  *
- * @param ipaddr           [IN]    the ipaddr to be used as key
- * @param hostname         [OUT]    the hostname added (found by using getnameinfo)
+ * @param ipaddr[IN]       the ipaddr to be used as key
+ * @param hostname[OUT]    the hostname added (found by using getnameinfo)
  *
- * @return IP_NAME_SUCCESS if successfull\n.
- * @return IP_NAME_INSERT_MALLOC_ERROR if an error occured during the insertion process \n
- * @return IP_NAME_NETDB_ERROR if an error occured during the netdb query (via gethostbyaddr).
+ * @return IP_NAME_SUCCESS if successful
+ * @return IP_NAME_INSERT_MALLOC_ERROR if an error occurred during the insertion
+ *                                     process
+ * @return IP_NAME_NETDB_ERROR if an error occurred during the netdb query (via
+ *                             gethostbyaddr).
  *
  */
 
@@ -158,21 +160,14 @@ int nfs_ip_name_add(sockaddr_t *ipaddr, char *hostname, size_t size)
 
 	nfs_ip_name = gsh_malloc(sizeof(nfs_ip_name_t));
 
-	if (nfs_ip_name == NULL)
-		return IP_NAME_INSERT_MALLOC_ERROR;
-
 	pipaddr = gsh_malloc(sizeof(sockaddr_t));
-	if (pipaddr == NULL) {
-		gsh_free(nfs_ip_name);
-		return IP_NAME_INSERT_MALLOC_ERROR;
-	}
 
 	/* I have to keep an integer as key, I wil use the pointer buffkey->addr
 	 * for this, this also means that buffkey->len will be 0
 	 */
 	memcpy(pipaddr, ipaddr, sizeof(sockaddr_t));
 
-	buffkey.addr = (caddr_t) pipaddr;
+	buffkey.addr = pipaddr;
 	buffkey.len = sizeof(sockaddr_t);
 
 	gettimeofday(&tv0, NULL);
@@ -209,7 +204,7 @@ int nfs_ip_name_add(sockaddr_t *ipaddr, char *hostname, size_t size)
 	 */
 	nfs_ip_name->timestamp = time(NULL);
 
-	buffdata.addr = (caddr_t) nfs_ip_name;
+	buffdata.addr = nfs_ip_name;
 	buffdata.len = sizeof(nfs_ip_name_t);
 
 	if (HashTable_Set(ht_ip_name, &buffkey, &buffdata) != HASHTABLE_SUCCESS)
@@ -242,7 +237,7 @@ int nfs_ip_name_get(sockaddr_t *ipaddr, char *hostname, size_t size)
 
 	sprint_sockip(ipaddr, ipstring, sizeof(ipstring));
 
-	buffkey.addr = (caddr_t) ipaddr;
+	buffkey.addr = ipaddr;
 	buffkey.len = sizeof(sockaddr_t);
 
 	if (HashTable_Get(ht_ip_name,
@@ -281,7 +276,7 @@ int nfs_ip_name_remove(sockaddr_t *ipaddr)
 
 	sprint_sockip(ipaddr, ipstring, sizeof(ipstring));
 
-	buffkey.addr = (caddr_t) ipaddr;
+	buffkey.addr = ipaddr;
 	buffkey.len = sizeof(sockaddr_t);
 
 	if (HashTable_Del(ht_ip_name, &buffkey, NULL, &old_value) ==

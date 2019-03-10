@@ -35,10 +35,9 @@
 #include <assert.h>
 #include "gsh_list.h"
 
-#include <sys/epoll.h>
-#include <sys/timerfd.h>
 #include <errno.h>
 #include <dbus/dbus.h>
+#include <ctype.h>
 
 #include "fsal.h"
 #include "nfs_core.h"
@@ -47,6 +46,7 @@
 #include "gsh_dbus.h"
 #include <os/memstream.h>
 #include "dbus_priv.h"
+#include "nfs_init.h"
 
 /**
  *
@@ -68,6 +68,7 @@
 #define GSH_DBUS_NONE      0x0000
 #define GSH_DBUS_SHUTDOWN  0x0001
 #define GSH_DBUS_SLEEPING  0x0002
+static const char dbus_name[] = "org.ganesha.nfsd";
 
 /*
  * List and mutex used by the dbus broadcast service
@@ -103,6 +104,54 @@ static inline int dbus_callout_cmpf(const struct avltree_node *lhs,
 	rk = avltree_container_of(rhs, struct ganesha_dbus_handler, node_k);
 
 	return strcmp(lk->name, rk->name);
+}
+
+static inline bool is_valid_dbus_prefix(const char *prefix)
+{
+	if (prefix == NULL || *prefix == '\0')
+		return false;
+
+	if (!isalpha(*prefix) && *prefix != '_')
+		return false;
+
+	prefix++;
+	while (*prefix != '\0') {
+		if (!isalnum(*prefix) && *prefix != '_')
+			return false;
+		prefix++;
+	}
+
+	return true;
+}
+
+static inline void dbus_name_with_prefix(char *prefixed_dbus_name,
+			const char *default_name, const char *prefix)
+{
+	int prefix_len, total_len;
+
+	if (!is_valid_dbus_prefix(prefix)) {
+		if (prefix != NULL && prefix[0] != '\0') {
+			LogEvent(COMPONENT_DBUS,
+				"Dbus name prefix is invalid. Ignoring the prefix.");
+		}
+		strcpy(prefixed_dbus_name, default_name);
+		return;
+	}
+
+	prefix_len = strlen(prefix);
+
+	/* Additional length for separator (.) and null character */
+	total_len = strlen(default_name) + prefix_len + 2;
+	if (total_len > NAME_MAX) {
+		LogEvent(COMPONENT_DBUS,
+			"Dbus name prefix too long. Ignoring the prefix.");
+		strcpy(prefixed_dbus_name, default_name);
+		return;
+	}
+
+	strcpy(prefixed_dbus_name, prefix);
+	prefixed_dbus_name[prefix_len] = '.';
+	strcpy(prefixed_dbus_name + prefix_len + 1, default_name);
 }
 
 /*
@@ -175,12 +224,6 @@ struct dbus_bcast_item *add_dbus_broadcast(
 
 	new_bcast = (struct dbus_bcast_item *)
 		gsh_malloc(sizeof(struct dbus_bcast_item));
-	if (!new_bcast) {
-		LogCrit(COMPONENT_DBUS,
-			"Failed to allocate broadcast entry: %s",
-			strerror(errno));
-		goto out;
-	}
 
 	now(&new_bcast->next_bcast_time);
 	new_bcast->bcast_interval = bcast_interval;
@@ -193,7 +236,7 @@ struct dbus_bcast_item *add_dbus_broadcast(
 			    &(new_bcast->dbus_bcast_q),
 			    &dbus_bcast_item_compare);
 	PTHREAD_MUTEX_unlock(&dbus_bcast_lock);
-out:
+
 	return new_bcast;
 }
 
@@ -211,8 +254,8 @@ void init_dbus_broadcast(void)
 
 void gsh_dbus_pkginit(void)
 {
-	char regbuf[128];
 	int code = 0;
+	char prefixed_dbus_name[NAME_MAX];
 
 	LogDebug(COMPONENT_DBUS, "init");
 
@@ -229,14 +272,15 @@ void gsh_dbus_pkginit(void)
 		goto out;
 	}
 
-	snprintf(regbuf, 128, "org.ganesha.nfsd");
+	dbus_name_with_prefix(prefixed_dbus_name, dbus_name,
+				nfs_param.core_param.dbus_name_prefix);
 	code =
-	    dbus_bus_request_name(thread_state.dbus_conn, regbuf,
+	    dbus_bus_request_name(thread_state.dbus_conn, prefixed_dbus_name,
 				  DBUS_NAME_FLAG_REPLACE_EXISTING,
 				  &thread_state.dbus_err);
 	if (dbus_error_is_set(&thread_state.dbus_err)) {
 		LogCrit(COMPONENT_DBUS, "server bus reg failed (%s, %s)",
-			regbuf, thread_state.dbus_err.message);
+			prefixed_dbus_name, thread_state.dbus_err.message);
 		dbus_error_free(&thread_state.dbus_err);
 		if (!code)
 			code = EINVAL;
@@ -245,7 +289,7 @@ void gsh_dbus_pkginit(void)
 	if (code != DBUS_REQUEST_NAME_REPLY_PRIMARY_OWNER) {
 		LogCrit(COMPONENT_DBUS,
 			"server failed becoming primary bus owner (%s, %d)",
-			regbuf, code);
+			prefixed_dbus_name, code);
 		goto out;
 	}
 
@@ -585,6 +629,7 @@ int32_t gsh_dbus_register_path(const char *name,
 	if (!thread_state.dbus_conn) {
 		LogCrit(COMPONENT_DBUS,
 			"dbus_connection_register_object_path called with no DBUS connection");
+		gsh_free(handler->name);
 		gsh_free(handler);
 		goto out;
 	}
@@ -597,6 +642,7 @@ int32_t gsh_dbus_register_path(const char *name,
 	if (!code) {
 		LogFatal(COMPONENT_DBUS,
 			 "dbus_connection_register_object_path failed");
+		gsh_free(handler->name);
 		gsh_free(handler);
 		goto out;
 	}
@@ -615,53 +661,61 @@ int32_t gsh_dbus_register_path(const char *name,
 
 void gsh_dbus_pkgshutdown(void)
 {
-	struct avltree_node *node, *onode;
+	struct avltree_node *node, *next_node;
 	struct ganesha_dbus_handler *handler;
+	int code = 0;
+	char prefixed_dbus_name[NAME_MAX];
 
 	LogDebug(COMPONENT_DBUS, "shutdown");
 
+	/* Shutdown gsh_dbus_thread */
+	thread_state.flags |= GSH_DBUS_SHUTDOWN;
+	pthread_join(gsh_dbus_thrid, NULL);
+
 	/* remove and free handlers */
-	onode = NULL;
 	node = avltree_first(&thread_state.callouts);
-	do {
-		if (onode) {
-			handler =
-			    avltree_container_of(onode,
-						 struct ganesha_dbus_handler,
-						 node_k);
-			dbus_bus_release_name(thread_state.dbus_conn,
-					      handler->name,
-					      &thread_state.dbus_err);
-			if (dbus_error_is_set(&thread_state.dbus_err)) {
-				LogCrit(COMPONENT_DBUS,
-					"err releasing name (%s, %s)",
-					handler->name,
-					thread_state.dbus_err.message);
-				dbus_error_free(&thread_state.dbus_err);
-			}
-			gsh_free(handler->name);
-			gsh_free(handler);
-		}
-	} while ((onode = node) && (node = avltree_next(node)));
-	if (onode) {
-		handler =
-		    avltree_container_of(onode, struct ganesha_dbus_handler,
+	while (node) {
+		next_node = avltree_next(node);
+		handler = avltree_container_of(node,
+					 struct ganesha_dbus_handler,
 					 node_k);
-		dbus_bus_release_name(thread_state.dbus_conn, handler->name,
+		/* Unregister handler */
+		code = dbus_connection_unregister_object_path(
+						thread_state.dbus_conn,
+						handler->name);
+		if (!code) {
+			LogCrit(COMPONENT_DBUS,
+				"dbus_connection_unregister_object_path called with no DBUS connection");
+		}
+		avltree_remove(&handler->node_k, &thread_state.callouts);
+		gsh_free(handler->name);
+		gsh_free(handler);
+		node = next_node;
+	}
+
+	avltree_init(&thread_state.callouts, dbus_callout_cmpf, 0);
+
+	/* Unassign the name from dbus connection */
+	if (thread_state.dbus_conn) {
+		dbus_name_with_prefix(prefixed_dbus_name, dbus_name,
+					nfs_param.core_param.dbus_name_prefix);
+		dbus_bus_release_name(thread_state.dbus_conn,
+				      prefixed_dbus_name,
 				      &thread_state.dbus_err);
 		if (dbus_error_is_set(&thread_state.dbus_err)) {
 			LogCrit(COMPONENT_DBUS, "err releasing name (%s, %s)",
-				handler->name, thread_state.dbus_err.message);
+				prefixed_dbus_name,
+				thread_state.dbus_err.message);
 			dbus_error_free(&thread_state.dbus_err);
 		}
-		gsh_free(handler->name);
-		gsh_free(handler);
-	}
-	avltree_init(&thread_state.callouts, dbus_callout_cmpf, 0);
 
-	/* shutdown bus */
-	if (thread_state.dbus_conn)
-		dbus_connection_close(thread_state.dbus_conn);
+		/*
+		 * Shutdown bus: As per D-Bus documentation, a shared
+		 * connection created with dbus_connection_open() or
+		 * dbus_bus_get() should not be closed but instead be unref'ed
+		 */
+		dbus_connection_unref(thread_state.dbus_conn);
+	}
 }
 
 void *gsh_dbus_thread(void *arg)
@@ -692,9 +746,8 @@ void *gsh_dbus_thread(void *arg)
 							struct dbus_bcast_item,
 							dbus_bcast_q);
 			now(&current_time);
-			time_expired = gsh_time_cmp(&current_time,
-						    &bcast_item->
-						    next_bcast_time);
+			time_expired = gsh_time_cmp(
+				&current_time, &bcast_item->next_bcast_time);
 
 			/*
 			 * list is sorted by soonest to latest
@@ -731,8 +784,7 @@ void *gsh_dbus_thread(void *arg)
 			if (bcast_item->count > 0 ||
 			    bcast_item->count == BCAST_FOREVER) {
 				glist_insert_sorted(&dbus_broadcast_list,
-						    &(bcast_item->
-						      dbus_bcast_q),
+						    &bcast_item->dbus_bcast_q,
 						    &dbus_bcast_item_compare);
 			}
 		}
@@ -749,7 +801,7 @@ void *gsh_dbus_thread(void *arg)
 	}			/* 1 */
 
  out:
-	LogCrit(COMPONENT_DBUS, "shutdown");
+	LogEvent(COMPONENT_DBUS, "shutdown");
 
 	return NULL;
 }
@@ -823,14 +875,14 @@ bool arg_9p_op(DBusMessageIter *args, u8 *opcode, char **errormsg)
 	if (args == NULL) {
 		success = false;
 		*errormsg = "message is missing argument";
-	} else if (DBUS_TYPE_STRING != dbus_message_iter_get_arg_type(args)) {
+	} else if (dbus_message_iter_get_arg_type(args) != DBUS_TYPE_STRING) {
 		success = false;
 		*errormsg = "arg not a string";
 	} else {
 		dbus_message_iter_get_basic(args, &opname);
 		for (opc = _9P_TSTATFS; opc <= _9P_TWSTAT; opc++) {
 			if (_9pfuncdesc[opc].funcname != NULL &&
-			    !strncmp(opname, _9pfuncdesc[opc].funcname, 16))
+			    !strcmp(opname, _9pfuncdesc[opc].funcname))
 				break;
 		}
 		if (opc > _9P_TWSTAT) {

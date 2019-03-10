@@ -70,6 +70,9 @@ int nfs4_op_free_stateid(struct nfs_argop4 *op, compound_data_t *data,
 	FREE_STATEID4res * const res_FREE_STATEID4 =
 	    &resp->nfs_resop4_u.opfree_stateid;
 	state_t *state;
+	struct gsh_export *save_exp;
+	struct gsh_export *export;
+	struct fsal_obj_handle *obj;
 
 	resp->resop = NFS4_OP_FREE_STATEID;
 	res_FREE_STATEID4->fsr_status = NFS4_OK;
@@ -82,7 +85,7 @@ int nfs4_op_free_stateid(struct nfs_argop4 *op, compound_data_t *data,
 			       NULL,
 			       &state,
 			       data,
-			       STATEID_SPECIAL_FOR_FREE,
+			       STATEID_SPECIAL_CURRENT,
 			       0,
 			       false,
 			       "FREE_STATEID");
@@ -90,8 +93,41 @@ int nfs4_op_free_stateid(struct nfs_argop4 *op, compound_data_t *data,
 	if (res_FREE_STATEID4->fsr_status != NFS4_OK)
 		return res_FREE_STATEID4->fsr_status;
 
-	state_del(state);
+	if (!get_state_obj_export_owner_refs(state, &obj, &export, NULL)) {
+		/* If this happens, something is going stale, just return
+		 * NFS4ERR_BAD_STATEID, whatever is going stale will become
+		 * more apparent to the client soon...
+		 */
+		res_FREE_STATEID4->fsr_status = NFS4ERR_BAD_STATEID;
+		return res_FREE_STATEID4->fsr_status;
+	}
+
+	save_exp = op_ctx->ctx_export;
+	op_ctx->ctx_export = export;
+	op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
+
+	PTHREAD_RWLOCK_wrlock(&obj->state_hdl->state_lock);
+	if (state->state_type == STATE_TYPE_LOCK &&
+	    glist_empty(&state->state_data.lock.state_locklist)) {
+		/* At the moment, only return success for a lock stateid with
+		 * no locks.
+		 */
+		/** @todo: Do we also have to handle other kinds of stateids?
+		 */
+		res_FREE_STATEID4->fsr_status = NFS4_OK;
+		state_del_locked(state);
+	} else {
+		res_FREE_STATEID4->fsr_status = NFS4ERR_LOCKS_HELD;
+	}
+	PTHREAD_RWLOCK_unlock(&obj->state_hdl->state_lock);
+
 	dec_state_t_ref(state);
+
+	op_ctx->ctx_export = save_exp;
+	op_ctx->fsal_export = save_exp != NULL ? save_exp->fsal_export : NULL;
+
+	obj->obj_ops->put_ref(obj);
+	put_gsh_export(export);
 
 	return res_FREE_STATEID4->fsr_status;
 

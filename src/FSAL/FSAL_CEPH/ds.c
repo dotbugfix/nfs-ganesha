@@ -110,8 +110,8 @@ static nfsstat4 ds_read(struct fsal_ds_handle *const ds_pub,
 			bool * const end_of_file)
 {
 	/* The private 'full' export */
-	struct export *export =
-	    container_of(req_ctx->fsal_export, struct export, export);
+	struct ceph_export *export =
+		container_of(req_ctx->fsal_export, struct ceph_export, export);
 	/* The private 'full' DS handle */
 	struct ds *ds = container_of(ds_pub, struct ds, ds);
 	/* The OSD number for this machine */
@@ -196,8 +196,8 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
 			 stable_how4 * const stability_got)
 {
 	/* The private 'full' export */
-	struct export *export =
-	    container_of(req_ctx->fsal_export, struct export, export);
+	struct ceph_export *export =
+		container_of(req_ctx->fsal_export, struct ceph_export, export);
 	/* The private 'full' DS handle */
 	struct ds *ds = container_of(ds_pub, struct ds, ds);
 	/* The OSD number for this host */
@@ -251,8 +251,7 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
 				export->cmount,
 				&ds->wire.wire.vi,
 				ds->wire.wire.parent_ino,
-				ds->wire.wire.
-				parent_hash);
+				ds->wire.wire.parent_hash);
 			if (ceph_status != 0) {
 				LogMajor(COMPONENT_PNFS,
 					 "Filehandle connection failed with: %d\n",
@@ -261,9 +260,9 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
 			}
 			ds->connected = true;
 		}
-		ceph_status = ceph_ll_open(
+		ceph_status = fsal_ceph_ll_open(
 			export->cmount, ds->wire.wire.vi,
-			O_WRONLY, &descriptor, 0, 0);
+			O_WRONLY, &descriptor, op_ctx->creds);
 		if (ceph_status != 0) {
 			LogMajor(COMPONENT_FSAL,
 				 "Open failed with: %d", ceph_status);
@@ -345,8 +344,8 @@ static nfsstat4 ds_commit(struct fsal_ds_handle *const ds_pub,
 {
 #ifdef COMMIT_FIX
 	/* The private 'full' export */
-	struct export *export =
-	    container_of(req_ctx->fsal_export, struct export, export);
+	struct ceph_export *export =
+		container_of(req_ctx->fsal_export, struct ceph_export, export);
 	/* The private 'full' DS handle */
 	struct ds *ds = container_of(ds_pub, struct ds, ds);
 	/* Error return from Ceph */
@@ -409,9 +408,7 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
 	if (dsw->layout.fl_stripe_unit == 0)
 		return NFS4ERR_BADHANDLE;
 
-	ds = gsh_calloc(sizeof(struct ds), 1);
-	if (ds == NULL)
-		return NFS4ERR_SERVERFAULT;
+	ds = gsh_calloc(1, sizeof(struct ds));
 
 	*handle = &ds->ds;
 	fsal_ds_handle_init(*handle, pds);

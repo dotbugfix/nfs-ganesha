@@ -29,6 +29,7 @@
 #include "log.h"
 #include "fsal.h"
 #include "nfs_proto_functions.h"
+#include "nfs_file_handle.h"
 #include "sal_functions.h"
 #include "nlm_util.h"
 #include "nlm_async.h"
@@ -44,15 +45,15 @@
 int nlm4_Share(nfs_arg_t *args, struct svc_req *req, nfs_res_t *res)
 {
 	nlm4_shareargs *arg = &args->arg_nlm4_share;
-	cache_entry_t *entry;
+	struct fsal_obj_handle *obj;
 	state_status_t state_status = STATE_SUCCESS;
-	char buffer[MAXNETOBJ_SZ * 2];
+	char buffer[MAXNETOBJ_SZ * 2] = "\0";
 	state_nsm_client_t *nsm_client;
 	state_nlm_client_t *nlm_client;
 	state_owner_t *nlm_owner;
 	state_t *nlm_state;
 	int rc;
-	int grace = nfs_in_grace();
+	bool grace = nfs_in_grace();
 	/* Indicate if we let FSAL to handle requests during grace. */
 	bool_t fsal_grace = false;
 
@@ -60,9 +61,9 @@ int nlm4_Share(nfs_arg_t *args, struct svc_req *req, nfs_res_t *res)
 	 * responding to an NLM_*_MSG call, so we check here if the export is
 	 * NULL and if so, handle the response.
 	 */
-	if (op_ctx->export == NULL) {
+	if (op_ctx->ctx_export == NULL) {
 		res->res_nlm4share.stat = NLM4_STALE_FH;
-		LogInfo(COMPONENT_NLM, "INVALID HANDLE: nlm4_Share");
+		LogInfo(COMPONENT_NLM, "INVALID HANDLE: NLM4_SHARE");
 		return NFS_REQ_OK;
 	}
 
@@ -70,48 +71,49 @@ int nlm4_Share(nfs_arg_t *args, struct svc_req *req, nfs_res_t *res)
 
 	netobj_to_string(&arg->cookie, buffer, 1024);
 
-	LogDebug(COMPONENT_NLM,
-		 "REQUEST PROCESSING: Calling nlm4_Share cookie=%s reclaim=%s",
-		 buffer,
-		 arg->reclaim ? "yes" : "no");
+	if (isDebug(COMPONENT_NLM)) {
+		char str[LEN_FH_STR];
+		char oh[MAXNETOBJ_SZ * 2] = "\0";
 
-	if (!copy_netobj(&res->res_nlm4share.cookie, &arg->cookie)) {
-		res->res_nlm4share.stat = NLM4_FAILED;
+		sprint_fhandle3(str, (struct nfs_fh3 *)&arg->share.fh);
+		netobj_to_string(&arg->share.oh, oh, 1024);
 
 		LogDebug(COMPONENT_NLM,
-			 "REQUEST RESULT: nlm4_Share %s",
-			 lock_result_str(res->res_nlm4share.stat));
-
-		return NFS_REQ_OK;
+			 "REQUEST PROCESSING: Calling NLM4_SHARE handle: %s, cookie=%s, reclaim=%s, owner=%s, access=%d, deny=%d",
+			 str, buffer, arg->reclaim ? "yes" : "no", oh,
+			 arg->share.access,
+			 arg->share.mode);
 	}
+
+	copy_netobj(&res->res_nlm4share.cookie, &arg->cookie);
 
 	/* Allow only reclaim share request during recovery and visa versa.
 	 * Note: NLM_SHARE is indicated to be non-monitored, however, it does
 	 * have a reclaim flag, so we will honor the reclaim flag if used.
 	 */
 	if (grace) {
-		if (op_ctx->fsal_export->exp_ops.
-			fs_supports(op_ctx->fsal_export, fso_grace_method))
+		if (op_ctx->fsal_export->exp_ops.fs_supports(
+					op_ctx->fsal_export, fso_grace_method))
 			fsal_grace = true;
 		if (!fsal_grace && !arg->reclaim) {
 			res->res_nlm4share.stat = NLM4_DENIED_GRACE_PERIOD;
 			LogDebug(COMPONENT_NLM,
-				 "REQUEST RESULT: nlm4_Share %s",
+				 "REQUEST RESULT: NLM4_SHARE %s",
 				 lock_result_str(res->res_nlm4share.stat));
 			return NFS_REQ_OK;
 		}
 	} else if (arg->reclaim) {
-			res->res_nlm4share.stat = NLM4_DENIED_GRACE_PERIOD;
-			LogDebug(COMPONENT_NLM,
-				 "REQUEST RESULT: nlm4_Share %s",
-				 lock_result_str(res->res_nlm4share.stat));
-			return NFS_REQ_OK;
+		res->res_nlm4share.stat = NLM4_DENIED_GRACE_PERIOD;
+		LogDebug(COMPONENT_NLM,
+			 "REQUEST RESULT: NLM4_SHARE %s",
+			 lock_result_str(res->res_nlm4share.stat));
+		return NFS_REQ_OK;
 	}
 
 	rc = nlm_process_share_parms(req,
 				     &arg->share,
 				     op_ctx->fsal_export,
-				     &entry,
+				     &obj,
 				     CARE_NO_MONITOR,
 				     &nsm_client,
 				     &nlm_client,
@@ -122,17 +124,18 @@ int nlm4_Share(nfs_arg_t *args, struct svc_req *req, nfs_res_t *res)
 		/* Present the error back to the client */
 		res->res_nlm4share.stat = (nlm4_stats) rc;
 		LogDebug(COMPONENT_NLM,
-			 "REQUEST RESULT: nlm4_Share %s",
+			 "REQUEST RESULT: NLM4_SHARE %s",
 			 lock_result_str(res->res_nlm4share.stat));
 		return NFS_REQ_OK;
 	}
 
-	state_status = state_nlm_share(entry,
+	state_status = state_nlm_share(obj,
 				       arg->share.access,
 				       arg->share.mode,
 				       nlm_owner,
 				       nlm_state,
-				       grace);
+				       grace,
+				       false);
 
 	if (state_status != STATE_SUCCESS) {
 		res->res_nlm4share.stat =
@@ -145,10 +148,10 @@ int nlm4_Share(nfs_arg_t *args, struct svc_req *req, nfs_res_t *res)
 	dec_nsm_client_ref(nsm_client);
 	dec_nlm_client_ref(nlm_client);
 	dec_state_owner_ref(nlm_owner);
-	cache_inode_put(entry);
+	obj->obj_ops->put_ref(obj);
 	dec_nlm_state_ref(nlm_state);
 
-	LogDebug(COMPONENT_NLM, "REQUEST RESULT: nlm4_Share %s",
+	LogDebug(COMPONENT_NLM, "REQUEST RESULT: NLM4_SHARE %s",
 		 lock_result_str(res->res_nlm4share.stat));
 
 	return NFS_REQ_OK;

@@ -187,19 +187,18 @@ typedef enum hash_set_how {
 } hash_set_how_t;
 
 /* How many character used to display a key or value */
-static const size_t HASHTABLE_DISPLAY_STRLEN = 8192;
+#define HASHTABLE_DISPLAY_STRLEN 8192
 
 /* Possible errors */
 typedef enum hash_error {
-	HASHTABLE_SUCCESS = 0,
-	HASHTABLE_UNKNOWN_HASH_TYPE = 1,
-	HASHTABLE_INSERT_MALLOC_ERROR = 2,
-	HASHTABLE_ERROR_NO_SUCH_KEY = 3,
-	HASHTABLE_ERROR_KEY_ALREADY_EXISTS = 4,
-	HASHTABLE_ERROR_INVALID_ARGUMENT = 5,
-	HASHTABLE_ERROR_DELALL_FAIL = 6,
-	HASHTABLE_NOT_DELETED = 7,
-	HASHTABLE_OVERWRITTEN = 8
+	HASHTABLE_SUCCESS,
+	HASHTABLE_UNKNOWN_HASH_TYPE,
+	HASHTABLE_ERROR_NO_SUCH_KEY,
+	HASHTABLE_ERROR_KEY_ALREADY_EXISTS,
+	HASHTABLE_ERROR_INVALID_ARGUMENT,
+	HASHTABLE_ERROR_DELALL_FAIL,
+	HASHTABLE_NOT_DELETED,
+	HASHTABLE_OVERWRITTEN,
 } hash_error_t;
 
 const char *hash_table_err_to_str(hash_error_t err);
@@ -214,6 +213,9 @@ hash_error_t hashtable_getlatch(struct hash_table *,
 				const struct gsh_buffdesc *,
 				struct gsh_buffdesc *, bool,
 				struct hash_latch *);
+hash_error_t hashtable_acquire_latch(struct hash_table *ht,
+				     const struct gsh_buffdesc *key,
+				     struct hash_latch *latch);
 void hashtable_releaselatched(struct hash_table *, struct hash_latch *);
 hash_error_t hashtable_setlatched(struct hash_table *, struct gsh_buffdesc *,
 				  struct gsh_buffdesc *, struct hash_latch *,
@@ -342,6 +344,9 @@ hash_error_t hashtable_getref(struct hash_table *, struct gsh_buffdesc *,
 			      struct gsh_buffdesc *,
 			      void (*)(struct gsh_buffdesc *));
 
+typedef void (*ht_for_each_cb_t)(struct rbt_node *pn, void *arg);
+void hashtable_for_each(struct hash_table *ht, ht_for_each_cb_t callback,
+				void *arg);
 /** @} */
 
 #endif /* HASHTABLE_H */

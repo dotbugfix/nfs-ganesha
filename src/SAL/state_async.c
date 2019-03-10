@@ -47,8 +47,11 @@
 #include "fsal.h"
 #include "sal_functions.h"
 #include "fridgethr.h"
+#include "gsh_config.h"
+#include "nfs_core.h"
 
 struct fridgethr *state_async_fridge;
+struct fridgethr *state_poll_fridge;
 
 /**
  * @brief Process a blocked lock request
@@ -62,8 +65,25 @@ struct fridgethr *state_async_fridge;
 static void state_blocked_lock_caller(struct fridgethr_context *ctx)
 {
 	state_block_data_t *block = ctx->arg;
+	struct gsh_export *export;
+	bool set_op_ctx = false;
+	struct root_op_context root_ctx;
+
+	export = block->sbd_lock_entry->sle_export;
+	if (export_ready(export)) {
+		get_gsh_export_ref(export);
+		/* Initialize a root context, need to get a valid export. */
+		init_root_op_context(&root_ctx, export,
+				 export->fsal_export, 0, 0, UNKNOWN_REQUEST);
+		set_op_ctx = true;
+	}
 
 	process_blocked_lock_upcall(block);
+
+	if (set_op_ctx) {
+		put_gsh_export(export);
+		release_root_op_context();
+	}
 }
 
 /**
@@ -137,13 +157,40 @@ state_status_t state_async_init(void)
 	memset(&frp, 0, sizeof(struct fridgethr_params));
 	frp.thr_max = 1;
 	frp.deferment = fridgethr_defer_queue;
+
 	rc = fridgethr_init(&state_async_fridge, "State_Async", &frp);
+
 	if (rc != 0) {
 		LogMajor(COMPONENT_STATE,
 			 "Unable to initialize state async thread fridge: %d",
 			 rc);
 		return STATE_INIT_ENTRY_FAILED;
 	}
+
+	memset(&frp, 0, sizeof(struct fridgethr_params));
+	frp.thr_max = 1;
+	frp.thr_min = 1;
+	frp.thread_delay = nfs_param.core_param.blocked_lock_poller_interval;
+	frp.flavor = fridgethr_flavor_looper;
+
+	rc = fridgethr_init(&state_poll_fridge, "state_poll", &frp);
+
+	if (rc != 0) {
+		LogMajor(COMPONENT_STATE,
+			 "Unable to initialize state blocked lock polling thread fridge: %d",
+			 rc);
+		return STATE_INIT_ENTRY_FAILED;
+	}
+
+	rc = fridgethr_submit(state_poll_fridge, blocked_lock_polling, NULL);
+
+	if (rc != 0) {
+		LogMajor(COMPONENT_STATE,
+			 "Unable to start blocked lock polling thread, error code %d.",
+			 rc);
+		return STATE_INIT_ENTRY_FAILED;
+	}
+
 	return STATE_SUCCESS;
 }
 
@@ -154,19 +201,36 @@ state_status_t state_async_init(void)
  */
 state_status_t state_async_shutdown(void)
 {
-	int rc = fridgethr_sync_command(state_async_fridge,
-					fridgethr_comm_stop,
-					120);
-	if (rc == ETIMEDOUT) {
+	int rc1, rc2;
+
+	rc1 = fridgethr_sync_command(state_async_fridge,
+				     fridgethr_comm_stop,
+				     120);
+
+	if (rc1 == ETIMEDOUT) {
 		LogMajor(COMPONENT_STATE,
 			 "Shutdown timed out, cancelling threads.");
 		fridgethr_cancel(state_async_fridge);
-	} else if (rc != 0) {
+	} else if (rc1 != 0) {
 		LogMajor(COMPONENT_STATE,
-			 "Failed shutting down state async thread: %d", rc);
+			 "Failed shutting down state async thread: %d", rc1);
 	}
 
-	return rc == 0 ? STATE_SUCCESS : STATE_SIGNAL_ERROR;
+	rc2 = fridgethr_sync_command(state_poll_fridge,
+				     fridgethr_comm_stop,
+				     120);
+
+	if (rc2 == ETIMEDOUT) {
+		LogMajor(COMPONENT_STATE,
+			 "Shutdown timed out, cancelling threads.");
+		fridgethr_cancel(state_poll_fridge);
+	} else if (rc2 != 0) {
+		LogMajor(COMPONENT_STATE,
+			 "Failed shutting down state blocked lock polling thread: %d",
+			 rc2);
+	}
+
+	return ((rc1 == 0) && (rc2 == 0)) ? STATE_SUCCESS : STATE_SIGNAL_ERROR;
 }
 
 /** @} */

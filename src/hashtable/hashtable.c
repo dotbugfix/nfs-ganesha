@@ -104,8 +104,6 @@ hash_table_err_to_str(hash_error_t err)
 		return "HASHTABLE_SUCCESS";
 	case HASHTABLE_UNKNOWN_HASH_TYPE:
 		return "HASHTABLE_UNKNOWN_HASH_TYPE";
-	case HASHTABLE_INSERT_MALLOC_ERROR:
-		return "HASHTABLE_INSERT_MALLOC_ERROR";
 	case HASHTABLE_ERROR_NO_SUCH_KEY:
 		return "HASHTABLE_ERROR_NO_SUCH_KEY";
 	case HASHTABLE_ERROR_KEY_ALREADY_EXISTS:
@@ -171,9 +169,9 @@ key_locate(struct hash_table *ht, const struct gsh_buffdesc *key,
 			     cache_offsetof(ht, rbthash));
 		if (cursor) {
 			data = RBT_OPAQ(cursor);
-			if (ht->parameter.
-			    compare_key((struct gsh_buffdesc *)key,
-					&(data->key)) == 0) {
+			if (ht->parameter.compare_key(
+						(struct gsh_buffdesc *)key,
+						&(data->key)) == 0) {
 				goto out;
 			}
 		}
@@ -196,13 +194,12 @@ key_locate(struct hash_table *ht, const struct gsh_buffdesc *key,
 
 	while ((cursor != NULL) && (RBT_VALUE(cursor) == rbthash)) {
 		data = RBT_OPAQ(cursor);
-		if (ht->parameter.
-		    compare_key((struct gsh_buffdesc *)key,
-				&(data->key)) == 0) {
+		if (ht->parameter.compare_key((struct gsh_buffdesc *)key,
+					      &(data->key)) == 0) {
 			if (partition->cache) {
 				void **cache_slot = (void **)
-				    &(partition->
-				      cache[cache_offsetof(ht, rbthash)]);
+				    &partition->cache[cache_offsetof(ht,
+								     rbthash)];
 				atomic_store_voidptr(cache_slot, cursor);
 			}
 			found = true;
@@ -318,8 +315,6 @@ hashtable_init(struct hash_param *hparam)
 	ht = gsh_calloc(1, sizeof(struct hash_table) +
 			(sizeof(struct hash_partition) *
 			 hparam->index_size));
-	if (ht == NULL)
-		goto deconstruct;
 
 	/* Fixup entry size */
 	if (hparam->flags & HT_FLAG_CACHE) {
@@ -341,27 +336,14 @@ hashtable_init(struct hash_param *hparam)
 		}
 
 		/* Allocate a cache if requested */
-		if (hparam->flags & HT_FLAG_CACHE) {
+		if (hparam->flags & HT_FLAG_CACHE)
 			partition->cache = gsh_calloc(1, cache_page_size(ht));
-			if (!(partition->cache)) {
-				PTHREAD_RWLOCK_destroy(&partition->lock);
-				goto deconstruct;
-			}
-		}
+
 		completed++;
 	}
 
-	ht->node_pool =
-	    pool_init(NULL, sizeof(rbt_node_t), pool_basic_substrate, NULL,
-		      NULL, NULL);
-	if (!(ht->node_pool))
-		goto deconstruct;
-
-	ht->data_pool =
-	    pool_init(NULL, sizeof(struct hash_data), pool_basic_substrate,
-		      NULL, NULL, NULL);
-	if (!(ht->data_pool))
-		goto deconstruct;
+	ht->node_pool = pool_basic_init(NULL, sizeof(rbt_node_t));
+	ht->data_pool = pool_basic_init(NULL, sizeof(struct hash_data));
 
 	pthread_rwlockattr_destroy(&rwlockattr);
 	return ht;
@@ -424,6 +406,43 @@ hashtable_destroy(struct hash_table *ht,
 
  out:
 	return hrc;
+}
+
+/**
+ * @brief acquire the partition lock for the given key
+ *
+ * This function acquires the partition write mode lock corresponding to
+ * the given key.
+ *
+ * @brief[in]  ht        The hash table to search
+ * @brief[in]  key       The key for which to acquire the partition lock
+ * @brief[out] latch     Opaque structure holding partition information
+ *
+ * @retval HASHTABLE_SUCCESS, the partition lock is acquired.
+ * @retval Others, failure, the partition lock is not acquired
+ *
+ * NOTES: fast path if the caller just needs to lock the partition and
+ * doesn't need to look for the entry. The lock needs to be released
+ * with hashtable_releaselatched()
+ */
+hash_error_t
+hashtable_acquire_latch(struct hash_table *ht,
+			const struct gsh_buffdesc *key,
+			struct hash_latch *latch)
+{
+	uint32_t index;
+	uint64_t rbt_hash;
+	hash_error_t rc = HASHTABLE_SUCCESS;
+
+	memset(latch, 0, sizeof(struct hash_latch));
+	rc = compute(ht, key, &index, &rbt_hash);
+	if (rc != HASHTABLE_SUCCESS)
+		return rc;
+
+	latch->index = index;
+	PTHREAD_RWLOCK_wrlock(&(ht->partitions[index].lock));
+
+	return HASHTABLE_SUCCESS;
 }
 
 /**
@@ -663,18 +682,9 @@ hashtable_setlatched(struct hash_table *ht,
 
 	RBT_FIND(&ht->partitions[latch->index].rbt, locator, latch->rbt_hash);
 
-	mutator = pool_alloc(ht->node_pool, NULL);
-	if (mutator == NULL) {
-		rc = HASHTABLE_INSERT_MALLOC_ERROR;
-		goto out;
-	}
+	mutator = pool_alloc(ht->node_pool);
 
-	descriptors = pool_alloc(ht->data_pool, NULL);
-	if (descriptors == NULL) {
-		pool_free(ht->node_pool, mutator);
-		rc = HASHTABLE_INSERT_MALLOC_ERROR;
-		goto out;
-	}
+	descriptors = pool_alloc(ht->data_pool);
 
 	RBT_OPAQ(mutator) = descriptors;
 	RBT_VALUE(mutator) = latch->rbt_hash;
@@ -709,7 +719,7 @@ hashtable_setlatched(struct hash_table *ht,
  * This function removes a value from the a hash store, the value
  * already having been looked up with GetLatched. In all cases, the
  * lock is retained. hashtable_getlatch must have been called with
- * may_read true.
+ * may_write true.
  *
  * @param[in,out] ht      The hash store to be modified
  * @param[in]     key     A buffer descriptore locating the key to remove
@@ -729,12 +739,9 @@ void hashtable_deletelatched(struct hash_table *ht,
 			     struct gsh_buffdesc *stored_val)
 {
 	/* The pair of buffer descriptors comprising the stored entry */
-	struct hash_data *data = NULL;
+	struct hash_data *data;
 	/* Its partition */
 	struct hash_partition *partition = &ht->partitions[latch->index];
-
-	if (!latch->locator)
-		return;
 
 	data = RBT_OPAQ(latch->locator);
 
@@ -777,8 +784,7 @@ void hashtable_deletelatched(struct hash_table *ht,
 			struct hash_data *data1 = RBT_OPAQ(cnode);
 			struct hash_data *data2 = RBT_OPAQ(latch->locator);
 
-			if (ht->parameter.
-			    compare_key(&(data1->key), &(data2->key))
+			if (ht->parameter.compare_key(&data1->key, &data2->key)
 			    == 0) {
 				LogFullDebug(COMPONENT_HASHTABLE_CACHE,
 					     "hash clear index %d slot %" PRIu64
@@ -798,6 +804,12 @@ void hashtable_deletelatched(struct hash_table *ht,
 	pool_free(ht->data_pool, data);
 	pool_free(ht->node_pool, latch->locator);
 	--ht->partitions[latch->index].count;
+
+	/* Some callers re-use the latch to insert a record after this call,
+	 * so reset latch locator to avoid hashtable_setlatched() using the
+	 * invalid latch->locator
+	 */
+	latch->locator = NULL;
 }
 
 /**
@@ -857,8 +869,8 @@ hashtable_delall(struct hash_table *ht,
 			rc = free_func(key, val);
 
 			if (rc == 0) {
-				PTHREAD_RWLOCK_unlock(&ht->partitions[index].
-						      lock);
+				PTHREAD_RWLOCK_unlock(
+						&ht->partitions[index].lock);
 				return HASHTABLE_ERROR_DELALL_FAIL;
 			}
 		}
@@ -1028,6 +1040,7 @@ hashtable_getref(hash_table_t *ht, struct gsh_buffdesc *key,
 	case HASHTABLE_SUCCESS:
 		if (get_ref != NULL)
 			get_ref(val);
+		/* FALLTHROUGH */
 	case HASHTABLE_ERROR_NO_SUCH_KEY:
 		hashtable_releaselatched(ht, &latch);
 		break;
@@ -1039,4 +1052,21 @@ hashtable_getref(hash_table_t *ht, struct gsh_buffdesc *key,
 	return rc;
 }
 
+void hashtable_for_each(hash_table_t *ht, ht_for_each_cb_t callback, void *arg)
+{
+	uint32_t i;
+	struct rbt_head *head_rbt;
+	struct rbt_node *pn;
+
+	/* For each bucket of the requested hashtable */
+	for (i = 0; i < ht->parameter.index_size; i++) {
+		head_rbt = &ht->partitions[i].rbt;
+		PTHREAD_RWLOCK_rdlock(&ht->partitions[i].lock);
+		RBT_LOOP(head_rbt, pn) {
+			callback(pn, arg);
+			RBT_INCREMENT(pn);
+		}
+		PTHREAD_RWLOCK_unlock(&ht->partitions[i].lock);
+	}
+}
 /** @} */

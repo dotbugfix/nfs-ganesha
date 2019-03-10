@@ -47,7 +47,6 @@
 #include "nfs4.h"
 #include "mount.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_file_handle.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
@@ -59,6 +58,7 @@
  */
 
 static struct config_item_list protocols[] = {
+	CONFIG_LIST_TOK("none", CORE_OPTION_NONE),
 	CONFIG_LIST_TOK("3", CORE_OPTION_NFSV3),
 	CONFIG_LIST_TOK("v3", CORE_OPTION_NFSV3),
 	CONFIG_LIST_TOK("nfs3", CORE_OPTION_NFSV3),
@@ -67,6 +67,9 @@ static struct config_item_list protocols[] = {
 	CONFIG_LIST_TOK("v4", CORE_OPTION_NFSV4),
 	CONFIG_LIST_TOK("nfs4", CORE_OPTION_NFSV4),
 	CONFIG_LIST_TOK("nfsv4", CORE_OPTION_NFSV4),
+	CONFIG_LIST_TOK("nfsvsock", CORE_OPTION_NFS_VSOCK),
+	CONFIG_LIST_TOK("nfsrdma", CORE_OPTION_NFS_RDMA),
+	CONFIG_LIST_TOK("rpcrdma", CORE_OPTION_NFS_RDMA),
 	CONFIG_LIST_TOK("9p", CORE_OPTION_9P),
 	CONFIG_LIST_EOL
 };
@@ -98,10 +101,6 @@ static struct config_item core_params[] = {
 		       nfs_core_param, drop_inval_errors),
 	CONF_ITEM_BOOL("Drop_Delay_Errors", false,
 		       nfs_core_param, drop_delay_errors),
-	CONF_ITEM_UI32("Dispatch_Max_Reqs", 1, 10000, 5000,
-		       nfs_core_param, dispatch_max_reqs),
-	CONF_ITEM_UI32("Dispatch_Max_Reqs_Xprt", 1, 2048, 512,
-		       nfs_core_param, dispatch_max_reqs_xprt),
 	CONF_ITEM_BOOL("DRC_Disabled", false,
 		       nfs_core_param, drc.disabled),
 	CONF_ITEM_UI32("DRC_TCP_Npart", 1, 20, DRC_TCP_NPART,
@@ -128,8 +127,6 @@ static struct config_item core_params[] = {
 		       nfs_core_param, drc.udp.hiwat),
 	CONF_ITEM_BOOL("DRC_UDP_Checksum", DRC_UDP_CHECKSUM,
 		       nfs_core_param, drc.udp.checksum),
-	CONF_ITEM_UI32("RPC_Debug_Flags", 0, UINT32_MAX, TIRPC_DEBUG_FLAGS,
-		       nfs_core_param, rpc.debug_flags),
 	CONF_ITEM_UI32("RPC_Max_Connections", 1, 10000, 1024,
 		       nfs_core_param, rpc.max_connections),
 	CONF_ITEM_UI32("RPC_Idle_Timeout_S", 0, 60*60, 300,
@@ -142,10 +139,14 @@ static struct config_item core_params[] = {
 		       nfs_core_param, rpc.max_recv_buffer_size),
 	CONF_ITEM_UI32("RPC_Ioq_ThrdMax", 1, 1024*128, 200,
 		       nfs_core_param, rpc.ioq_thrd_max),
-	CONF_ITEM_I64("Decoder_Fridge_Expiration_Delay", 0, 7200, 600,
-		      nfs_core_param, decoder_fridge_expiration_delay),
-	CONF_ITEM_I64("Decoder_Fridge_Block_Timeout", 0, 7200, 600,
-		      nfs_core_param, decoder_fridge_block_timeout),
+	CONF_ITEM_UI32("RPC_GSS_Npart", 1, 1021, 13,
+		       nfs_core_param, rpc.gss.ctx_hash_partitions),
+	CONF_ITEM_UI32("RPC_GSS_Max_Ctx", 1, 1024*1024, 16384,
+		       nfs_core_param, rpc.gss.max_ctx),
+	CONF_ITEM_UI32("RPC_GSS_Max_GC", 1, 1024*1024, 200,
+		       nfs_core_param, rpc.gss.max_gc),
+	CONF_ITEM_I64("Blocked_Lock_Poller_Interval", 0, 180, 10,
+		      nfs_core_param, blocked_lock_poller_interval),
 	CONF_ITEM_LIST("NFS_Protocols", CORE_OPTION_ALL_VERS, protocols,
 		       nfs_core_param, core_options),
 	CONF_ITEM_LIST("Protocols", CORE_OPTION_ALL_VERS, protocols,
@@ -158,8 +159,20 @@ static struct config_item core_params[] = {
 		       nfs_core_param, enable_NLM),
 	CONF_ITEM_BOOL("Enable_RQUOTA", true,
 		       nfs_core_param, enable_RQUOTA),
+	CONF_ITEM_BOOL("Enable_TCP_keepalive", true,
+		       nfs_core_param, enable_tcp_keepalive),
+	CONF_ITEM_UI32("TCP_KEEPCNT", 0, 255, 0,
+		       nfs_core_param, tcp_keepcnt),
+	CONF_ITEM_UI32("TCP_KEEPIDLE", 0, 65535, 0,
+		       nfs_core_param, tcp_keepidle),
+	CONF_ITEM_UI32("TCP_KEEPINTVL", 0, 65535, 0,
+		       nfs_core_param, tcp_keepintvl),
+	CONF_ITEM_BOOL("Enable_NFS_Stats", true,
+		       nfs_core_param, enable_NFSSTATS),
 	CONF_ITEM_BOOL("Enable_Fast_Stats", false,
 		       nfs_core_param, enable_FASTSTATS),
+	CONF_ITEM_BOOL("Enable_FSAL_Stats", false,
+		       nfs_core_param, enable_FSALSTATS),
 	CONF_ITEM_BOOL("Short_File_Handle", false,
 		       nfs_core_param, short_file_handle),
 	CONF_ITEM_I64("Manage_Gids_Expiration", 0, 7*24*60*60, 30*60,
@@ -168,6 +181,12 @@ static struct config_item core_params[] = {
 		       nfs_core_param, ganesha_modules_loc),
 	CONF_ITEM_UI32("heartbeat_freq", 0, 5000, 1000,
 		       nfs_core_param, heartbeat_freq),
+	CONF_ITEM_BOOL("fsid_device", false,
+		       nfs_core_param, fsid_device),
+	CONF_ITEM_BOOL("mount_path_pseudo", false,
+		       nfs_core_param, mount_path_pseudo),
+	CONF_ITEM_STR("Dbus_Name_Prefix", 1, 255, NULL,
+		       nfs_core_param, dbus_name_prefix),
 	CONFIG_EOL
 };
 
@@ -219,6 +238,12 @@ struct config_block krb5_param = {
  * @brief NFSv4 specific parameters
  */
 
+static struct config_item_list minor_versions[] = {
+	CONFIG_LIST_TOK("0", NFSV4_MINOR_VERSION_ZERO),
+	CONFIG_LIST_TOK("1", NFSV4_MINOR_VERSION_ONE),
+	CONFIG_LIST_TOK("2", NFSV4_MINOR_VERSION_TWO),
+	CONFIG_LIST_EOL
+};
 static struct config_item version4_params[] = {
 	CONF_ITEM_BOOL("Graceless", false,
 		       nfs_version4_parameter, graceless),
@@ -228,12 +253,14 @@ static struct config_item version4_params[] = {
 		       nfs_version4_parameter, grace_period),
 	CONF_ITEM_STR("DomainName", 1, MAXPATHLEN, DOMAINNAME_DEFAULT,
 		      nfs_version4_parameter, domainname),
-	CONF_ITEM_PATH("IdmapConf", 1, MAXPATHLEN, "/etc/idmapd.conf",
+	CONF_ITEM_PATH("IdmapConf", 1, MAXPATHLEN, IDMAPCONF_DEFAULT,
 		       nfs_version4_parameter, idmapconf),
 	CONF_ITEM_BOOL("UseGetpwnam", GETPWNAMDEF,
 		       nfs_version4_parameter, use_getpwnam),
 	CONF_ITEM_BOOL("Allow_Numeric_Owners", true,
 		       nfs_version4_parameter, allow_numeric_owners),
+	CONF_ITEM_BOOL("Only_Numeric_Owners", false,
+		       nfs_version4_parameter, only_numeric_owners),
 	CONF_ITEM_BOOL("Delegations", false,
 		       nfs_version4_parameter, allow_delegations),
 	CONF_ITEM_UI32("Deleg_Recall_Retry_Delay", 0, 10,
@@ -243,6 +270,13 @@ static struct config_item version4_params[] = {
 		       nfs_version4_parameter, pnfs_mds),
 	CONF_ITEM_BOOL("PNFS_DS", true,
 		       nfs_version4_parameter, pnfs_ds),
+	CONF_ITEM_STR("RecoveryBackend", 1, MAXPATHLEN,
+		      RECOVERY_BACKEND_DEFAULT,
+		      nfs_version4_parameter, recovery_backend),
+	CONF_ITEM_LIST("minor_versions", NFSV4_MINOR_VERSION_ALL,
+		       minor_versions, nfs_version4_parameter, minor_versions),
+	CONF_ITEM_UI32("slot_table_size", 1, 1024, NFS41_NB_SLOTS_DEF,
+		       nfs_version4_parameter, nb_slots),
 	CONFIG_EOL
 };
 

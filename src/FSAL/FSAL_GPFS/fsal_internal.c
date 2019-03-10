@@ -1,4 +1,9 @@
 /*
+ * @file  fsal_internal.c
+ * @date  $Date: 2006/01/17 14:20:07 $
+ * @brief Defines the datas that are to be accessed as extern by the fsal
+ *        modules
+ *
  * vim:noexpandtab:shiftwidth=8:tabstop=8:
  *
  * Copyright CEA/DAM/DIF  (2008)
@@ -23,14 +28,6 @@
  * -------------
  */
 
-/**
- *
- * \file    fsal_internal.c
- * \date    $Date: 2006/01/17 14:20:07 $
- * \brief   Defines the datas that are to be
- *          accessed as extern by the fsal modules
- *
- */
 #include "config.h"
 
 #include <sys/ioctl.h>
@@ -47,14 +44,15 @@
 
 #include "include/gpfs.h"
 
-/* credential lifetime (1h) */
-uint32_t CredentialLifetime = 3600;
-
-/* static filesystem info.
- * The access is thread-safe because
- * it is read-only, except during initialization.
- */
-struct fsal_staticfsinfo_t global_fs_info;
+#define FSAL_INTERNAL_ERROR(__error, __msg)				      \
+({									      \
+	if ((__error) == EUNATCH)					      \
+		LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");	      \
+									      \
+	LogFullDebug(COMPONENT_FSAL, "%s returned errno=%d", __msg, __error); \
+									      \
+	fsalstat(posix2fsal_error(__error), __error);			      \
+})
 
 /*********************************************************************
  *
@@ -63,660 +61,470 @@ struct fsal_staticfsinfo_t global_fs_info;
  ********************************************************************/
 
 /**
- * fsal_internal_handle2fd:
- * Open a file by handle within an export.
+ *  @brief Close by fd
  *
- * \param p_context (input):
- *        Pointer to current context.  Used to get export root fd.
- * \param phandle (input):
- *        Opaque filehandle
- * \param pfd (output):
- *        File descriptor openned by the function
- * \param oflags (input):
- *        Flags to open the file with
+ *  @param fd Open file descriptor
  *
- * \return status of operation
+ *  @return status of operation
  */
-
-fsal_status_t fsal_internal_handle2fd(int dirfd,
-				      struct gpfs_file_handle *phandle,
-				      int *pfd, int oflags, bool reopen)
-{
-	fsal_status_t status;
-
-	if (!phandle || !pfd)
-		return fsalstat(ERR_FSAL_FAULT, 0);
-
-	status = fsal_internal_handle2fd_at(dirfd, phandle, pfd, oflags,
-					    reopen);
-
-	if (FSAL_IS_ERROR(status))
-		return status;
-
-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-
-/**
- * fsal_internal_close:
- * Close by fd
- *
- * \param fd (input):
- *        Open file descriptor
- *
- * \return status of operation
- */
-
 fsal_status_t fsal_internal_close(int fd, void *owner, int cflags)
 {
-	int rc = 0;
 	struct close_file_arg carg;
-	int errsv = 0;
+
+	/* fd should not be less than 3 */
+	assert(fd >= 3);
 
 	carg.mountdirfd = fd;
 	carg.close_fd = fd;
 	carg.close_flags = cflags;
 	carg.close_owner = owner;
 
-	rc = gpfs_ganesha(OPENHANDLE_CLOSE_FILE, &carg);
-	errsv = errno;
-
-	LogFullDebug(COMPONENT_FSAL, "OPENHANDLE_CLOSE_FILE returned: rc %d",
-		     rc);
-
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	if (unlikely(gpfs_ganesha(OPENHANDLE_CLOSE_FILE, &carg) < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_CLOSE_FILE");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
- * fsal_internal_handle2fd_at:
- * Open a file by handle from in an open directory
+ *  @brief Open a file by handle from in an open directory
  *
- * \param dirfd (input):
- *        Open file descriptor of parent directory
- * \param phandle (input):
- *        Opaque filehandle
- * \param pfd (output):
- *        File descriptor openned by the function
- * \param oflags (input):
- *        Flags to open the file with
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param gpfs_fh Opaque filehandle
+ *  @param fd File descriptor openned by the function
+ *  @param oflags Flags to open the file with
  *
- * \return status of operation
+ *  @return status of operation
  */
-
-fsal_status_t fsal_internal_handle2fd_at(int dirfd,
-					 struct gpfs_file_handle *phandle,
-					 int *pfd, int oflags, bool reopen)
+fsal_status_t
+fsal_internal_handle2fd(int dirfd, struct gpfs_file_handle *gpfs_fh,
+			int *fd, int oflags)
 {
-	int rc = 0;
-	int errsv = 0;
-	union {
-		struct open_arg oarg;
-		struct open_share_arg sarg;
-	} u;
+	struct open_arg oarg = {0};
+	int rc;
 
-	if (!phandle || !pfd)
-		return fsalstat(ERR_FSAL_FAULT, 0);
+	if (op_ctx && op_ctx->client && op_ctx->client->hostaddr_str)
+		oarg.cli_ip = op_ctx->client->hostaddr_str;
 
-	if (reopen) {
-		u.sarg.mountdirfd = dirfd;
-		u.sarg.handle = phandle;
-		u.sarg.flags = oflags;
-		u.sarg.openfd = *pfd;
-		/* share_access and share_deny are unused by REOPEN */
-		u.sarg.share_access = 0;
-		u.sarg.share_deny = 0;
-		rc = gpfs_ganesha(OPENHANDLE_REOPEN_BY_FD, &u.sarg);
-		errsv = errno;
-		LogFullDebug(COMPONENT_FSAL,
-			     "OPENHANDLE_REOPEN_BY_FD returned: rc %d", rc);
-	} else {
-		u.oarg.mountdirfd = dirfd;
-		u.oarg.handle = phandle;
-		u.oarg.flags = oflags;
+	oarg.mountdirfd = dirfd;
+	oarg.handle = gpfs_fh;
+	oarg.flags = oflags;
 
-		rc = gpfs_ganesha(OPENHANDLE_OPEN_BY_HANDLE, &u.oarg);
-		errsv = errno;
-		LogFullDebug(COMPONENT_FSAL,
-			     "OPENHANDLE_OPEN_BY_HANDLE returned: rc %d", rc);
-	}
+	rc = gpfs_ganesha(OPENHANDLE_OPEN_BY_HANDLE, &oarg);
+	if (unlikely(rc < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_OPEN_BY_HANDLE");
 
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	*fd = rc;
 
-	/* gpfs_open returns fd number for OPENHANDLE_OPEN_BY_HANDLE,
-	 * but only returns 0 for success for OPENHANDLE_REOPEN_BY_FD
-	 * operation. We already have correct (*pfd) in reopen case!
-	 */
-	if (!reopen)
-		*pfd = rc;
+	/* Make sure the fd is not less than 3 */
+	assert(*fd >= 3);
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
- * fsal_internal_get_handle:
- * Create a handle from a file path
+ *  @brief Create a handle from a directory pointer and filename
  *
- * \param pcontext (input):
- *        A context pointer for the root of the current export
- * \param p_fsalpath (input):
- *        Full path to the file
- * \param p_handle (output):
- *        The handle that is found and returned
+ *  @param dfd Open directory handle
+ *  @param fs_name Name of the file
+ *  @param gpfs_fh The handle that is found and returned
  *
- * \return status of operation
+ *  @return status of operation
  */
-fsal_status_t fsal_internal_get_handle(const char *p_fsalpath,	/* IN */
-				       struct gpfs_file_handle *p_handle)
-{				/* OUT */
-	int rc;
+fsal_status_t
+fsal_internal_get_handle_at(int dfd, const char *fs_name,
+			    struct gpfs_file_handle *gpfs_fh,
+			    int expfd)
+{
 	struct name_handle_arg harg;
-	int errsv = 0;
 
-	if (!p_handle || !p_fsalpath)
+	if (!gpfs_fh)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
-	harg.handle = p_handle;
-	harg.handle->handle_size = gpfs_max_fh_size;
-	harg.handle->handle_key_size = OPENHANDLE_KEY_LEN;
-	harg.handle->handle_version = OPENHANDLE_VERSION;
-	harg.name = p_fsalpath;
-	harg.dfd = AT_FDCWD;
-	harg.flag = 0;
-
-	LogFullDebug(COMPONENT_FSAL, "Lookup handle for %s", p_fsalpath);
-
-	rc = gpfs_ganesha(OPENHANDLE_NAME_TO_HANDLE, &harg);
-	errsv = errno;
-
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
-
-	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-}
-
-/**
- * fsal_internal_get_handle_at:
- * Create a handle from a directory pointer and filename
- *
- * \param dfd (input):
- *        Open directory handle
- * \param p_fsalname (input):
- *        Name of the file
- * \param p_handle (output):
- *        The handle that is found and returned
- *
- * \return status of operation
- */
-
-fsal_status_t fsal_internal_get_handle_at(int dfd, const char *p_fsalname,
-					  struct gpfs_file_handle *p_handle)
-{				/* OUT */
-	int rc;
-	struct name_handle_arg harg;
-	int errsv = 0;
-
-	if (!p_handle)
-		return fsalstat(ERR_FSAL_FAULT, 0);
-
-	harg.handle = p_handle;
-	harg.handle->handle_size = gpfs_max_fh_size;
+	harg.handle = gpfs_fh;
+	harg.handle->handle_size = GPFS_MAX_FH_SIZE;
 	harg.handle->handle_version = OPENHANDLE_VERSION;
 	harg.handle->handle_key_size = OPENHANDLE_KEY_LEN;
-	harg.name = p_fsalname;
+	harg.name = fs_name;
 	harg.dfd = dfd;
+	harg.expfd = expfd;
 	harg.flag = 0;
 
-	LogFullDebug(COMPONENT_FSAL, "Lookup handle at for %d %s", dfd,
-		     p_fsalname);
+	LogFullDebug(COMPONENT_FSAL, "Lookup handle at %d for %s", dfd,
+		     fs_name);
 
-	rc = gpfs_ganesha(OPENHANDLE_NAME_TO_HANDLE, &harg);
-	errsv = errno;
-
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	if (unlikely(gpfs_ganesha(OPENHANDLE_NAME_TO_HANDLE, &harg) < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_NAME_TO_HANDLE");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
- * fsal_internal_get_handle:
- * Create a handle from a directory handle and filename
+ *  @brief Create a handle from a directory handle and filename
  *
- * \param pcontext (input):
- *        A context pointer for the root of the current export
- * \param p_dir_handle (input):
- *        The handle for the parent directory
- * \param p_fsalname (input):
- *        Name of the file
- * \param p_handle (output):
- *        The handle that is found and returned
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param gpfs_fh The handle for the parent directory
+ *  @param fs_name Name of the file
+ *  @param gpfs_fh_out The handle that is found and returned
  *
- * \return status of operation
+ *  @return status of operation
  */
-fsal_status_t fsal_internal_get_fh(int dirfd,	/* IN  */
-				   struct gpfs_file_handle *p_dir_fh, /* IN  */
-				   const char *p_fsalname,	/* IN  */
-				   struct gpfs_file_handle *p_out_fh)
-{				/* OUT */
-	int rc;
+fsal_status_t
+fsal_internal_get_fh(int dirfd, struct gpfs_file_handle *gpfs_fh,
+		     const char *fs_name, struct gpfs_file_handle *gpfs_fh_out)
+{
 	struct get_handle_arg harg;
-	int errsv = 0;
 
-	if (!p_out_fh || !p_dir_fh || !p_fsalname)
+	if (!gpfs_fh_out || !gpfs_fh || !fs_name)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 	harg.mountdirfd = dirfd;
-	harg.dir_fh = p_dir_fh;
-	harg.out_fh = p_out_fh;
-	harg.out_fh->handle_size = gpfs_max_fh_size;
+	harg.dir_fh = gpfs_fh;
+	harg.out_fh = gpfs_fh_out;
+	harg.out_fh->handle_size = GPFS_MAX_FH_SIZE;
 	harg.out_fh->handle_version = OPENHANDLE_VERSION;
 	harg.out_fh->handle_key_size = OPENHANDLE_KEY_LEN;
-	harg.len = strlen(p_fsalname);
-	harg.name = p_fsalname;
+	harg.len = strlen(fs_name);
+	harg.name = fs_name;
 
-	LogFullDebug(COMPONENT_FSAL, "Lookup handle for %s", p_fsalname);
+	LogFullDebug(COMPONENT_FSAL, "Lookup handle for %s", fs_name);
 
-	rc = gpfs_ganesha(OPENHANDLE_GET_HANDLE, &harg);
-	errsv = errno;
-
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	if (unlikely(gpfs_ganesha(OPENHANDLE_GET_HANDLE, &harg) < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_GET_HANDLE");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
- * fsal_internal_fd2handle:
- * convert an fd to a handle
+ *  @brief convert an fd to a handle
  *
- * \param fd (input):
- *        Open file descriptor for target file
- * \param p_handle (output):
- *        The handle that is found and returned
+ *  @param fd Open file descriptor for target file
+ *  @param gpfs_fh The handle that is found and returned
  *
- * \return status of operation
+ *  @return status of operation
  */
-fsal_status_t fsal_internal_fd2handle(int fd,
-				      struct gpfs_file_handle *p_handle)
+fsal_status_t
+fsal_internal_fd2handle(int fd, struct gpfs_file_handle *gpfs_fh)
 {
-	int rc;
-	struct name_handle_arg harg;
-	int errsv = 0;
+	struct name_handle_arg harg = {0};
 
-	if (!p_handle)
+	if (!gpfs_fh)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
-	harg.handle = p_handle;
-	harg.handle->handle_size = gpfs_max_fh_size;
+	harg.handle = gpfs_fh;
+	harg.handle->handle_size = GPFS_MAX_FH_SIZE;
 	harg.handle->handle_key_size = OPENHANDLE_KEY_LEN;
 	harg.handle->handle_version = OPENHANDLE_VERSION;
-	harg.name = NULL;
 	harg.dfd = fd;
-	harg.flag = 0;
 
 	LogFullDebug(COMPONENT_FSAL, "Lookup handle by fd for %d", fd);
 
-	rc = gpfs_ganesha(OPENHANDLE_NAME_TO_HANDLE, &harg);
-	errsv = errno;
-
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	if (unlikely(gpfs_ganesha(OPENHANDLE_NAME_TO_HANDLE, &harg) < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_NAME_TO_HANDLE");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
- * fsal_internal_link_fh:
- * Create a link based on a file fh, dir fh, and new name
+ *  @brief Create a link based on a file fh, dir fh, and new name
  *
- * \param p_context (input):
- *        Pointer to current context.  Used to get export root fd.
- * \param p_target_handle (input):
- *          file handle of target file
- * \param p_dir_handle (input):
- *          file handle of source directory
- * \param name (input):
- *          name for the new file
+ *  @param dir_fd Open file descriptor of parent directory
+ *  @param gpfs_fh_tgt file handle of target file
+ *  @param gpfs_fh file handle of source directory
+ *  @param link_name name for the new file
  *
- * \return status of operation
+ *  @return status of operation
  */
-fsal_status_t fsal_internal_link_fh(int dirfd,
-				    struct gpfs_file_handle *p_target_handle,
-				    struct gpfs_file_handle *p_dir_handle,
-				    const char *p_link_name)
+fsal_status_t
+fsal_internal_link_fh(int dirfd, struct gpfs_file_handle *gpfs_fh_tgt,
+		      struct gpfs_file_handle *gpfs_fh, const char *link_name)
 {
-	int rc;
 	struct link_fh_arg linkarg;
-	int errsv = 0;
 
-	if (!p_link_name)
+	if (!link_name)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 	linkarg.mountdirfd = dirfd;
-	linkarg.len = strlen(p_link_name);
-	linkarg.name = p_link_name;
-	linkarg.dir_fh = p_dir_handle;
-	linkarg.dst_fh = p_target_handle;
+	linkarg.len = strlen(link_name);
+	linkarg.name = link_name;
+	linkarg.dir_fh = gpfs_fh;
+	linkarg.dst_fh = gpfs_fh_tgt;
 
-	rc = gpfs_ganesha(OPENHANDLE_LINK_BY_FH, &linkarg);
-	errsv = errno;
-
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	if (unlikely(gpfs_ganesha(OPENHANDLE_LINK_BY_FH, &linkarg) < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_LINK_BY_FH");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 
 }
 
 /**
- * fsal_internal_stat_name:
- * Stat a file by name
+ *  @brief Stat a file by name
  *
- * \param p_context (input):
- *        Pointer to current context.  Used to get export root fd.
- * \param p_dir_handle (input):
- *          file handle of directory
- * \param name (input):
- *          name to stat
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param gpfs_fh file handle of directory
+ *  @param stat_name name to stat
+ *  @param buf buffer reference to buffer
  *
- * \return status of operation
+ *  @return status of operation
  */
-fsal_status_t fsal_internal_stat_name(int dirfd,
-				      struct gpfs_file_handle *p_dir_handle,
-				      const char *p_stat_name,
-				      struct stat *buf)
+fsal_status_t
+fsal_internal_stat_name(int dirfd, struct gpfs_file_handle *gpfs_fh,
+			const char *stat_name, struct stat *buf)
 {
-	int rc;
 	struct stat_name_arg statarg;
-	int errsv = 0;
 
-	if (!p_stat_name)
+	if (!stat_name)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 	statarg.mountdirfd = dirfd;
-	statarg.len = strlen(p_stat_name);
-	statarg.name = p_stat_name;
-	statarg.handle = p_dir_handle;
+	statarg.len = strlen(stat_name);
+	statarg.name = stat_name;
+	statarg.handle = gpfs_fh;
 	statarg.buf = buf;
 
-	rc = gpfs_ganesha(OPENHANDLE_STAT_BY_NAME, &statarg);
-	errsv = errno;
-
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	if (unlikely(gpfs_ganesha(OPENHANDLE_STAT_BY_NAME, &statarg) < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_STAT_BY_NAME");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-
 }
 
 /**
- * fsal_internal_unlink:
- * Unlink a file/directory by name
+ *  @brief Unlink a file/directory by name
  *
- * \param p_context (input):
- *        Pointer to current context.  Used to get export root fd.
- * \param p_dir_handle (input):
- *          file handle of directory
- * \param name (input):
- *          name to unlink
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param gpfs_fh file handle of directory
+ *  @param stat_name name to unlink
+ *  @param buf reference to buffer
  *
- * \return status of operation
+ *  @return status of operation
  */
-fsal_status_t fsal_internal_unlink(int dirfd,
-				   struct gpfs_file_handle *p_dir_handle,
-				   const char *p_stat_name, struct stat *buf)
+fsal_status_t
+fsal_internal_unlink(int dirfd, struct gpfs_file_handle *gpfs_fh,
+		     const char *stat_name, struct stat *buf)
 {
-	int rc;
 	struct stat_name_arg statarg;
-	int errsv = 0;
+	int rc, errsv;
 
-	if (!p_stat_name)
+	if (!stat_name)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 	statarg.mountdirfd = dirfd;
-	statarg.len = strlen(p_stat_name);
-	statarg.name = p_stat_name;
-	statarg.handle = p_dir_handle;
+	statarg.len = strlen(stat_name);
+	statarg.name = stat_name;
+	statarg.handle = gpfs_fh;
 	statarg.buf = buf;
+
+	fsal_set_credentials(op_ctx->creds);
 
 	rc = gpfs_ganesha(OPENHANDLE_UNLINK_BY_NAME, &statarg);
 	errsv = errno;
 
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	fsal_restore_ganesha_credentials();
+
+	if (unlikely(rc < 0))
+		return FSAL_INTERNAL_ERROR(errsv, "OPENHANDLE_UNLINK_BY_NAME");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-
 }
 
 /**
- * fsal_internal_create:
- * Create a file/directory by name
+ *  @brief Create a file/directory by name
  *
- * \param p_context (input):
- *        Pointer to current context.  Used to get export root fd.
- * \param p_dir_handle (input):
- *          file handle of directory
- * \param name (input):
- *          name to create
- * \param mode & dev (input):
- *          file type and dev for mknode
- * \param fh & stat (outut):
- *          file handle of new file and attributes
+ *  @param dir_hdl file handle of directory
+ *  @param stat_name name to create
+ *  @param mode file type for mknode
+ *  @param dev file dev for mknode
+ *  @param fh file handle of new file
+ *  @param buf file attributes of new file
  *
- * \return status of operation
+ *  @return status of operation
  */
-fsal_status_t fsal_internal_create(struct fsal_obj_handle *dir_hdl,
-				   const char *p_stat_name, mode_t mode,
-				   dev_t dev,
-				   struct gpfs_file_handle *p_new_handle,
-				   struct stat *buf)
+fsal_status_t
+fsal_internal_create(struct fsal_obj_handle *dir_hdl, const char *stat_name,
+		     mode_t mode, int posix_flags, struct gpfs_file_handle *fh,
+		     struct stat *buf)
 {
-	int rc;
-	struct create_name_arg crarg;
-	struct gpfs_filesystem *gpfs_fs;
-	struct gpfs_fsal_obj_handle *gpfs_hdl;
-	int errsv = 0;
+	struct create_name_arg crarg = {0};
+	struct gpfs_fsal_export *exp = container_of(op_ctx->fsal_export,
+					struct gpfs_fsal_export, export);
+	int export_fd = exp->export_fd;
 
-	if (!p_stat_name)
+	if (!stat_name)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
-	gpfs_hdl =
-	    container_of(dir_hdl, struct gpfs_fsal_obj_handle, obj_handle);
-	gpfs_fs = dir_hdl->fs->private;
-
-	crarg.mountdirfd = gpfs_fs->root_fd;
+	crarg.mountdirfd = export_fd;
 	crarg.mode = mode;
-	crarg.dev = dev;
-	crarg.len = strlen(p_stat_name);
-	crarg.name = p_stat_name;
-	crarg.dir_fh = gpfs_hdl->handle;
-	crarg.new_fh = p_new_handle;
-	crarg.new_fh->handle_size = gpfs_max_fh_size;
+	crarg.dev = posix_flags;
+	crarg.len = strlen(stat_name);
+	crarg.name = stat_name;
+	crarg.new_fh = fh;
+	crarg.new_fh->handle_size = GPFS_MAX_FH_SIZE;
 	crarg.new_fh->handle_key_size = OPENHANDLE_KEY_LEN;
 	crarg.new_fh->handle_version = OPENHANDLE_VERSION;
 	crarg.buf = buf;
+	crarg.dir_fh = container_of(dir_hdl, struct gpfs_fsal_obj_handle,
+				    obj_handle)->handle;
 
-	rc = gpfs_ganesha(OPENHANDLE_CREATE_BY_NAME, &crarg);
-	errsv = errno;
+	if (unlikely(gpfs_ganesha(OPENHANDLE_CREATE_BY_NAME, &crarg) < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_CREATE_BY_NAME");
 
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	return fsalstat(ERR_FSAL_NO_ERROR, 0);
+}
+
+fsal_status_t
+fsal_internal_mknode(struct fsal_obj_handle *dir_hdl, const char *stat_name,
+		     mode_t mode, dev_t dev, struct gpfs_file_handle *fh,
+		     struct stat *buf)
+{
+	struct create_name_arg crarg = {0};
+	struct gpfs_fsal_export *exp = container_of(op_ctx->fsal_export,
+					struct gpfs_fsal_export, export);
+	int export_fd = exp->export_fd;
+
+	if (!stat_name)
+		return fsalstat(ERR_FSAL_FAULT, 0);
+
+	crarg.mountdirfd = export_fd;
+	crarg.mode = mode;
+	crarg.dev = dev;
+	crarg.len = strlen(stat_name);
+	crarg.name = stat_name;
+	crarg.new_fh = fh;
+	crarg.new_fh->handle_size = GPFS_MAX_FH_SIZE;
+	crarg.new_fh->handle_key_size = OPENHANDLE_KEY_LEN;
+	crarg.new_fh->handle_version = OPENHANDLE_VERSION;
+	crarg.buf = buf;
+	crarg.dir_fh = container_of(dir_hdl, struct gpfs_fsal_obj_handle,
+				    obj_handle)->handle;
+
+	if (unlikely(gpfs_ganesha(OPENHANDLE_MKNODE_BY_NAME, &crarg) < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_MKNODE_BY_NAME");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
- * fsal_internal_rename_fh:
- * Rename old file name to new name
+ *  @brief Rename old file name to new name
  *
- * \param p_context (input):
- *        Pointer to current context.  Used to get export root fd.
- * \param p_old_handle (input):
- *          file handle of old file
- * \param p_new_handle (input):
- *          file handle of new directory
- * \param name (input):
- *          name for the old file
- * \param name (input):
- *          name for the new file
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param gpfs_fh_old file handle of old file
+ *  @param gpfs_fh_new file handle of new directory
+ *  @param old_name name for the old file
+ *  @param new_name name for the new file
  *
- * \return status of operation
+ *  @return status of operation
  */
-fsal_status_t fsal_internal_rename_fh(int dirfd,
-				      struct gpfs_file_handle *p_old_handle,
-				      struct gpfs_file_handle *p_new_handle,
-				      const char *p_old_name,
-				      const char *p_new_name)
+fsal_status_t
+fsal_internal_rename_fh(int dirfd, struct gpfs_file_handle *gpfs_fh_old,
+			struct gpfs_file_handle *gpfs_fh_new,
+			const char *old_name, const char *new_name)
 {
-	int rc;
 	struct rename_fh_arg renamearg;
-	int errsv = 0;
+	int rc, errsv;
 
-	if (!p_old_name || !p_new_name)
+	if (!old_name || !new_name)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 	renamearg.mountdirfd = dirfd;
-	renamearg.old_len = strlen(p_old_name);
-	renamearg.old_name = p_old_name;
-	renamearg.new_len = strlen(p_new_name);
-	renamearg.new_name = p_new_name;
-	renamearg.old_fh = p_old_handle;
-	renamearg.new_fh = p_new_handle;
+	renamearg.old_len = strlen(old_name);
+	renamearg.old_name = old_name;
+	renamearg.new_len = strlen(new_name);
+	renamearg.new_name = new_name;
+	renamearg.old_fh = gpfs_fh_old;
+	renamearg.new_fh = gpfs_fh_new;
+
+	fsal_set_credentials(op_ctx->creds);
 
 	rc = gpfs_ganesha(OPENHANDLE_RENAME_BY_FH, &renamearg);
 	errsv = errno;
 
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	fsal_restore_ganesha_credentials();
+
+	if (unlikely(rc < 0))
+		return FSAL_INTERNAL_ERROR(errsv, "OPENHANDLE_RENAME_BY_FH");
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-
 }
 
 /**
- * fsal_readlink_by_handle:
- * Reads the contents of the link
+ *  @brief Reads the contents of the link
  *
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param gpfs_fh file handle of file
+ *  @param buf Buffer
+ *  @param maxlen Max length of buffer
  *
- * \return status of operation
+ *  @return status of operation
  */
-
-fsal_status_t fsal_readlink_by_handle(int dirfd,
-				      struct gpfs_file_handle *p_handle,
-				      char *__buf, size_t *maxlen)
+fsal_status_t
+fsal_readlink_by_handle(int dirfd, struct gpfs_file_handle *gpfs_fh, char *buf,
+			size_t maxlen)
 {
-	int rc;
 	struct readlink_fh_arg readlinkarg;
-	int errsv = 0;
+	int rc;
 
 	readlinkarg.mountdirfd = dirfd;
-	readlinkarg.handle = p_handle;
-	readlinkarg.buffer = __buf;
-	readlinkarg.size = *maxlen;
+	readlinkarg.handle = gpfs_fh;
+	readlinkarg.buffer = buf;
+	readlinkarg.size = maxlen - 1; /* reserve 1 for terminating 0-byte */
 
 	rc = gpfs_ganesha(OPENHANDLE_READLINK_BY_FH, &readlinkarg);
-	errsv = errno;
 
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		return fsalstat(posix2fsal_error(errsv), errsv);
-	}
+	if (unlikely(rc < 0))
+		return FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_READLINK_BY_FH");
 
-	if (rc < *maxlen) {
-		__buf[rc] = '\0';
-		*maxlen = rc;
-	}
+	buf[rc] = '\0';
+
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
 /**
- *  fsal_internal_version;
+ *  @brief fsal_internal_version;
  *
- * \return GPFS version
+ *  @return GPFS version
  */
-
 int fsal_internal_version(void)
 {
 	int rc;
-	int errsv = 0;
 
-	rc = gpfs_ganesha(OPENHANDLE_GET_VERSION, &rc);
-	errsv = errno;
-
-	if (rc < 0) {
-		if (errsv == EUNATCH)
-			LogFatal(COMPONENT_FSAL, "GPFS Returned EUNATCH");
-		LogDebug(COMPONENT_FSAL, "GPFS get version failed with rc %d",
-			 rc);
-	} else
+	if (unlikely(gpfs_ganesha(OPENHANDLE_GET_VERSION2, &rc) < 0))
+		FSAL_INTERNAL_ERROR(errno, "OPENHANDLE_GET_VERSION2");
+	else
 		LogDebug(COMPONENT_FSAL, "GPFS get version %d", rc);
 
 	return rc;
 }
 
-/* Get NFS4 ACL as well as stat. For now, get stat only until NFS4 ACL
- * support is enabled. */
-fsal_status_t fsal_get_xstat_by_handle(int dirfd,
-				       struct gpfs_file_handle *p_handle,
-				       gpfsfsal_xstat_t *p_buffxstat,
-				       uint32_t *expire_time_attr,
-				       bool expire, bool use_acl)
+/**
+ *  @brief Get NFS4 ACL as well as stat.
+ *
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param gpfs_fh file handle of file
+ *  @param buffxstat Buffer
+ *  @param expire_time_attr Expire time attributes
+ *  @param expire Bool expire
+ *  @param use_acl Bool whether to ACL is to be used
+ *  @return status of operation
+ */
+fsal_status_t
+fsal_get_xstat_by_handle(int dirfd, struct gpfs_file_handle *gpfs_fh,
+			 gpfsfsal_xstat_t *buffxstat, gpfs_acl_t *acl_buf,
+			 unsigned int acl_buflen, uint32_t *expire_time_attr,
+			 bool expire, bool use_acl)
 {
+	struct xstat_arg xstatarg = {0};
+	int errsv;
 	int rc;
-	struct xstat_arg xstatarg;
-	int errsv = 0;
 
-	if (!p_handle || !p_buffxstat)
+	if (!gpfs_fh || !buffxstat)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 	/* Initialize acl header so that GPFS knows what we want. */
 	if (use_acl) {
-		gpfs_acl_t *pacl_gpfs;
-
-		pacl_gpfs = (gpfs_acl_t *) p_buffxstat->buffacl;
-		pacl_gpfs->acl_level = 0;
-		pacl_gpfs->acl_version = GPFS_ACL_VERSION_NFS4;
-		pacl_gpfs->acl_type = GPFS_ACL_TYPE_NFS4;
-		pacl_gpfs->acl_len = GPFS_ACL_BUF_SIZE;
-		xstatarg.acl = pacl_gpfs;
+		acl_buf->acl_level = 0;
+		acl_buf->acl_version = GPFS_ACL_VERSION_NFS4;
+		acl_buf->acl_type = GPFS_ACL_TYPE_NFS4;
+		acl_buf->acl_len = acl_buflen;
+		xstatarg.acl = acl_buf;
 		xstatarg.attr_valid = XATTR_STAT | XATTR_ACL;
 	} else {
 		xstatarg.acl = NULL;
@@ -726,33 +534,55 @@ fsal_status_t fsal_get_xstat_by_handle(int dirfd,
 		xstatarg.attr_valid |= XATTR_EXPIRE;
 
 	xstatarg.mountdirfd = dirfd;
-	xstatarg.handle = p_handle;
+	xstatarg.handle = gpfs_fh;
 	xstatarg.attr_changed = 0;
-	xstatarg.buf = &p_buffxstat->buffstat;
-	xstatarg.fsid = (struct fsal_fsid *)&p_buffxstat->fsal_fsid;
+	xstatarg.buf = &buffxstat->buffstat;
+	xstatarg.fsid = (struct fsal_fsid *)&buffxstat->fsal_fsid;
 	xstatarg.attr_valid |= XATTR_FSID;
 	xstatarg.expire_attr = expire_time_attr;
 
 	rc = gpfs_ganesha(OPENHANDLE_GET_XSTAT, &xstatarg);
 	errsv = errno;
 	LogDebug(COMPONENT_FSAL,
-		 "gpfs_ganesha: GET_XSTAT returned, fd %d rc %d fh_size %d",
-		 dirfd, rc, p_handle->handle_size);
+		 "GET_XSTAT returned, fd %d rc %d fh_size %d",
+		 dirfd, rc, gpfs_fh->handle_size);
 
 	if (rc < 0) {
-		if (errsv == ENODATA) {
+		switch (errsv) {
+		case ENODATA:
 			/* For the special file that do not have ACL, GPFS
 			   returns ENODATA. In this case, return okay with
 			   stat.
 			*/
-			p_buffxstat->attr_valid = XATTR_STAT;
+			buffxstat->attr_valid = XATTR_STAT;
 			LogFullDebug(COMPONENT_FSAL,
-				     "retrieved only stat, not acl");
+				     "GET_XSTAT retrieved only stat, not acl");
 			return fsalstat(ERR_FSAL_NO_ERROR, 0);
-		} else {
+
+		case ENOSPC:
+			/* If the supplied acl buffer is too small, we
+			 * get this errno! acl_len will be updated to
+			 * the required length.
+			 *
+			 * Return success and let the caller check the length
+			 */
+			if (use_acl && acl_buf->acl_len > acl_buflen) {
+				LogFullDebug(COMPONENT_FSAL,
+					"GET_XSTAT returned buffer too small, passed len: %u, required len: %u, ",
+					acl_buflen, acl_buf->acl_len);
+				errno = 0;
+				break;
+			}
+
+			LogWarn(COMPONENT_FSAL,
+				"GET_XSTAT returned bogus ENOSPC, passed len: %u, required len: %u",
+				acl_buflen, acl_buf->acl_len);
+			return fsalstat(ERR_FSAL_SERVERFAULT, errsv);
+
+		default:
 			/* Handle other errors. */
 			LogFullDebug(COMPONENT_FSAL,
-				     "fsal_get_xstat_by_handle returned errno:%d -- %s",
+				     "GET_XSTAT returned errno:%d -- %s",
 				     errsv, strerror(errsv));
 			if (errsv == EUNATCH)
 				LogFatal(COMPONENT_FSAL,
@@ -762,40 +592,51 @@ fsal_status_t fsal_get_xstat_by_handle(int dirfd,
 	}
 
 	if (use_acl)
-		p_buffxstat->attr_valid = XATTR_FSID | XATTR_STAT | XATTR_ACL;
+		buffxstat->attr_valid = XATTR_FSID | XATTR_STAT | XATTR_ACL;
 	else
-		p_buffxstat->attr_valid = XATTR_FSID | XATTR_STAT;
+		buffxstat->attr_valid = XATTR_FSID | XATTR_STAT;
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
-/* Set NFS4 ACL as well as stat. For now, set stat only until NFS4 ACL
- * support is enabled. */
-fsal_status_t fsal_set_xstat_by_handle(int dirfd,
-				       const struct req_op_context *p_context,
-				       struct gpfs_file_handle *p_handle,
-				       int attr_valid, int attr_changed,
-				       gpfsfsal_xstat_t *p_buffxstat)
+/**
+ *  @brief Set NFS4 ACL as well as stat.
+ *
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param op_ctx Context
+ *  @param gpfs_fh file handle of file
+ *  @param attr_valid Attributes valid
+ *  @param attr_changed Attributes changed
+ *  @param buffxstat Buffer
+ *
+ *  @return status of operation
+ */
+fsal_status_t
+fsal_set_xstat_by_handle(int dirfd, const struct req_op_context *op_ctx,
+			 struct gpfs_file_handle *gpfs_fh, int attr_valid,
+			 int attr_changed, gpfsfsal_xstat_t *buffxstat,
+			 gpfs_acl_t *acl_buf)
 {
-	int rc, errsv;
-	struct xstat_arg xstatarg;
+	struct xstat_arg xstatarg = {0};
+	int errsv;
+	int rc;
 
-	if (!p_handle || !p_buffxstat)
+	if (!gpfs_fh || !buffxstat)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
 	xstatarg.attr_valid = attr_valid;
 	xstatarg.mountdirfd = dirfd;
-	xstatarg.handle = p_handle;
-	xstatarg.acl = (gpfs_acl_t *) p_buffxstat->buffacl;
+	xstatarg.handle = gpfs_fh;
+	xstatarg.acl = acl_buf;
 	xstatarg.attr_changed = attr_changed;
-	xstatarg.buf = &p_buffxstat->buffstat;
+	xstatarg.buf = &buffxstat->buffstat;
 
 	/* We explicitly do NOT do setfsuid/setfsgid here because truncate,
 	   even to enlarge a file, doesn't actually allocate blocks. GPFS
 	   implements sparse files, so blocks of all 0 will not actually
 	   be allocated.
 	 */
-	fsal_set_credentials(p_context->creds);
+	fsal_set_credentials(op_ctx->creds);
 
 	rc = gpfs_ganesha(OPENHANDLE_SET_XSTAT, &xstatarg);
 	errsv = errno;
@@ -814,32 +655,34 @@ fsal_status_t fsal_set_xstat_by_handle(int dirfd,
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
-/* trucate by handle */
-fsal_status_t fsal_trucate_by_handle(int dirfd,
-				     const struct req_op_context *p_context,
-				     struct gpfs_file_handle *p_handle,
-				     u_int64_t size)
+/**
+ *  @param dirfd Open file descriptor of parent directory
+ *  @param op_ctx Context
+ *  @param gpfs_fh file handle of file
+ *  @param size Size
+ *
+ *  @return status of operation
+ */
+fsal_status_t
+fsal_trucate_by_handle(int dirfd, const struct req_op_context *op_ctx,
+		       struct gpfs_file_handle *gpfs_fh, u_int64_t size)
 {
-	int attr_valid;
-	int attr_changed;
-	gpfsfsal_xstat_t buffxstat;
+	gpfsfsal_xstat_t buffxstat = {0};
 
-	if (!p_handle || !p_context)
+	if (!gpfs_fh || !op_ctx)
 		return fsalstat(ERR_FSAL_FAULT, 0);
 
-	attr_valid = XATTR_STAT;
-	attr_changed = XATTR_SIZE;
 	buffxstat.buffstat.st_size = size;
 
-	return fsal_set_xstat_by_handle(dirfd, p_context, p_handle, attr_valid,
-					attr_changed, &buffxstat);
+	return fsal_set_xstat_by_handle(dirfd, op_ctx, gpfs_fh, XATTR_STAT,
+					XATTR_SIZE, &buffxstat, NULL);
 }
 
 /**
- *  fsal_error_is_event:
- *  Indicates if an FSAL error should be posted as an event
- *  \param status(input): The fsal status whom event is to be tested.
- *  \return - true if the error event is to be posted.
+ *  @brief Indicates if an FSAL error should be posted as an event
+ *
+ *  @param status(input): The fsal status whom event is to be tested.
+ *  @return - true if the error event is to be posted.
  *          - false if the error event is NOT to be posted.
  */
 bool fsal_error_is_event(fsal_status_t status)
@@ -857,10 +700,11 @@ bool fsal_error_is_event(fsal_status_t status)
 }
 
 /**
- *  fsal_error_is_info:
- *  Indicates if an FSAL error should be posted as an INFO level debug msg.
- *  \param status(input): The fsal status whom event is to be tested.
- *  \return - true if the error event is to be posted.
+ *  @brief Indicates if an FSAL error should be posted as an INFO level debug
+ *         message.
+ *
+ *  @param status(input): The fsal status whom event is to be tested.
+ *  @return - true if the error event is to be posted.
  *          - false if the error event is NOT to be posted.
  */
 bool fsal_error_is_info(fsal_status_t status)

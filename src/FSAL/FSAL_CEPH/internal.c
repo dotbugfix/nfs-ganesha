@@ -37,93 +37,13 @@
  */
 
 #include <sys/stat.h>
+#include <cephfs/libcephfs.h>
 #include "fsal_types.h"
 #include "fsal.h"
 #include "fsal_convert.h"
 #include "FSAL/fsal_commonlib.h"
-
-#define CEPH_INTERNAL_C
+#include "statx_compat.h"
 #include "internal.h"
-
-/**
- * The attributes tis FSAL can interpret or supply.
- */
-
-const attrmask_t supported_attributes = (
-	ATTR_TYPE      | ATTR_SIZE     | ATTR_FSID  | ATTR_FILEID |
-	ATTR_MODE      | ATTR_NUMLINKS | ATTR_OWNER | ATTR_GROUP  |
-	ATTR_ATIME     | ATTR_RAWDEV   | ATTR_CTIME | ATTR_MTIME  |
-	ATTR_SPACEUSED | ATTR_CHGTIME);
-
-/**
- * The attributes this FSAL can set.
- */
-
-const attrmask_t settable_attributes = (
-	ATTR_MODE  | ATTR_OWNER | ATTR_GROUP | ATTR_ATIME	 |
-	ATTR_CTIME | ATTR_MTIME | ATTR_SIZE  | ATTR_MTIME_SERVER |
-	ATTR_ATIME_SERVER);
-
-/**
- * @brief Convert a struct stat from Ceph to a struct attrlist
- *
- * This function writes the content of the supplied struct stat to the
- * struct fsalsattr.
- *
- * @param[in]  buffstat Stat structure
- * @param[out] fsalattr FSAL attributes
- */
-
-void ceph2fsal_attributes(const struct stat *buffstat,
-			    struct attrlist *fsalattr)
-{
-	FSAL_CLEAR_MASK(fsalattr->mask);
-
-	/* Fills the output struct */
-	fsalattr->type = posix2fsal_type(buffstat->st_mode);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_TYPE);
-
-	fsalattr->filesize = buffstat->st_size;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_SIZE);
-
-	fsalattr->fsid = posix2fsal_fsid(buffstat->st_dev);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_FSID);
-
-	fsalattr->fileid = buffstat->st_ino;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_FILEID);
-
-	fsalattr->mode = unix2fsal_mode(buffstat->st_mode);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_MODE);
-
-	fsalattr->numlinks = buffstat->st_nlink;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_NUMLINKS);
-
-	fsalattr->owner = buffstat->st_uid;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_OWNER);
-
-	fsalattr->group = buffstat->st_gid;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_GROUP);
-
-	fsalattr->atime = posix2fsal_time(buffstat->st_atime, 0);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_ATIME);
-
-	fsalattr->ctime = posix2fsal_time(buffstat->st_ctime, 0);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_CTIME);
-
-	fsalattr->mtime = posix2fsal_time(buffstat->st_mtime, 0);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_MTIME);
-
-	fsalattr->chgtime =
-	    posix2fsal_time(MAX(buffstat->st_mtime, buffstat->st_ctime), 0);
-	fsalattr->change = fsalattr->chgtime.tv_sec;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_CHGTIME);
-
-	fsalattr->spaceused = buffstat->st_blocks * S_BLKSIZE;
-	FSAL_SET_MASK(fsalattr->mask, ATTR_SPACEUSED);
-
-	fsalattr->rawdev = posix2fsal_devt(buffstat->st_rdev);
-	FSAL_SET_MASK(fsalattr->mask, ATTR_RAWDEV);
-}
 
 /**
  * @brief Construct a new filehandle
@@ -132,45 +52,39 @@ void ceph2fsal_attributes(const struct stat *buffstat,
  * it to the export.  After this call the attributes have been filled
  * in and the handdle is up-to-date and usable.
  *
- * @param[in]  st     Stat data for the file
+ * @param[in]  stx    ceph_statx data for the file
  * @param[in]  export Export on which the object lives
  * @param[out] obj    Object created
  *
  * @return 0 on success, negative error codes on failure.
  */
 
-int construct_handle(const struct stat *st, struct Inode *i,
-		     struct export *export, struct handle **obj)
+void construct_handle(const struct ceph_statx *stx, struct Inode *i,
+	struct ceph_export *export, struct ceph_handle **obj)
 {
 	/* Pointer to the handle under construction */
-	struct handle *constructing = NULL;
+	struct ceph_handle *constructing = NULL;
 
 	assert(i);
-	*obj = NULL;
 
-	constructing = gsh_calloc(1, sizeof(struct handle));
-	if (constructing == NULL)
-		return -ENOMEM;
+	constructing = gsh_calloc(1, sizeof(struct ceph_handle));
 
-	constructing->vi.ino.val = st->st_ino;
+	constructing->vi.ino.val = stx->stx_ino;
 #ifdef CEPH_NOSNAP
-	constructing->vi.snapid.val = st->st_dev;
+	constructing->vi.snapid.val = stx->stx_dev;
 #endif /* CEPH_NOSNAP */
 	constructing->i = i;
 	constructing->up_ops = export->export.up_ops;
-	constructing->handle.attrs = &constructing->attributes;
-
-	ceph2fsal_attributes(st, &constructing->attributes);
 
 	fsal_obj_handle_init(&constructing->handle, &export->export,
-			     constructing->attributes.type);
-	handle_ops_init(&constructing->handle.obj_ops);
+			     posix2fsal_type(stx->stx_mode));
+	constructing->handle.obj_ops = &CephFSM.handle_ops;
+	constructing->handle.fsid = posix2fsal_fsid(stx->stx_dev);
+	constructing->handle.fileid = stx->stx_ino;
 
 	constructing->export = export;
 
 	*obj = constructing;
-
-	return 0;
 }
 
 /**
@@ -179,9 +93,111 @@ int construct_handle(const struct stat *st, struct Inode *i,
  * @param[in] obj Handle to release
  */
 
-void deconstruct_handle(struct handle *obj)
+void deconstruct_handle(struct ceph_handle *obj)
 {
 	ceph_ll_put(obj->export->cmount, obj->i);
 	fsal_obj_handle_fini(&obj->handle);
 	gsh_free(obj);
+}
+
+unsigned int
+attrmask2ceph_want(attrmask_t mask)
+{
+	unsigned int want = 0;
+
+	if (mask & ATTR_MODE)
+		want |= CEPH_STATX_MODE;
+	if (mask & ATTR_OWNER)
+		want |= CEPH_STATX_UID;
+	if (mask & ATTR_GROUP)
+		want |= CEPH_STATX_GID;
+	if (mask & ATTR_SIZE)
+		want |= CEPH_STATX_SIZE;
+	if (mask & ATTR_NUMLINKS)
+		want |= CEPH_STATX_NLINK;
+	if (mask & ATTR_SPACEUSED)
+		want |= CEPH_STATX_BLOCKS;
+	if (mask & ATTR_ATIME)
+		want |= CEPH_STATX_ATIME;
+	if (mask & ATTR_CTIME)
+		want |= CEPH_STATX_CTIME;
+	if (mask & ATTR_MTIME)
+		want |= CEPH_STATX_MTIME;
+	if (mask & ATTR_CREATION)
+		want |= CEPH_STATX_BTIME;
+	if (mask & ATTR_CHANGE)
+		want |= CEPH_STATX_VERSION;
+	if (mask & ATTR_CHGTIME)
+		want |= (CEPH_STATX_CTIME|CEPH_STATX_MTIME);
+
+	return want;
+}
+
+void ceph2fsal_attributes(const struct ceph_statx *stx,
+			  struct attrlist *fsalattr)
+{
+	/* These are always considered to be available */
+	fsalattr->valid_mask |= ATTR_TYPE|ATTR_FSID|ATTR_RAWDEV|ATTR_FILEID;
+	fsalattr->supported = CEPH_SUPPORTED_ATTRS;
+	fsalattr->type = posix2fsal_type(stx->stx_mode);
+	fsalattr->rawdev = posix2fsal_devt(stx->stx_rdev);
+	fsalattr->fsid = posix2fsal_fsid(stx->stx_dev);
+	fsalattr->fileid = stx->stx_ino;
+
+	if (stx->stx_mask & CEPH_STATX_MODE) {
+		fsalattr->valid_mask |= ATTR_MODE;
+		fsalattr->mode = unix2fsal_mode(stx->stx_mode);
+	}
+	if (stx->stx_mask & CEPH_STATX_UID) {
+		fsalattr->valid_mask |= ATTR_OWNER;
+		fsalattr->owner = stx->stx_uid;
+	}
+	if (stx->stx_mask & CEPH_STATX_GID) {
+		fsalattr->valid_mask |= ATTR_GROUP;
+		fsalattr->group = stx->stx_gid;
+	}
+	if (stx->stx_mask & CEPH_STATX_SIZE) {
+		fsalattr->valid_mask |= ATTR_SIZE;
+		fsalattr->filesize = stx->stx_size;
+	}
+	if (stx->stx_mask & CEPH_STATX_NLINK) {
+		fsalattr->valid_mask |= ATTR_NUMLINKS;
+		fsalattr->numlinks = stx->stx_nlink;
+	}
+
+	if (stx->stx_mask & CEPH_STATX_BLOCKS) {
+		fsalattr->valid_mask |= ATTR_SPACEUSED;
+		fsalattr->spaceused = stx->stx_blocks * S_BLKSIZE;
+	}
+
+	/* Use full timer resolution */
+	if (stx->stx_mask & CEPH_STATX_ATIME) {
+		fsalattr->valid_mask |= ATTR_ATIME;
+		fsalattr->atime = stx->stx_atime;
+	}
+	if (stx->stx_mask & CEPH_STATX_CTIME) {
+		fsalattr->valid_mask |= ATTR_CTIME;
+		fsalattr->ctime = stx->stx_ctime;
+	}
+	if (stx->stx_mask & CEPH_STATX_MTIME) {
+		fsalattr->valid_mask |= ATTR_MTIME;
+		fsalattr->mtime = stx->stx_mtime;
+	}
+	if (stx->stx_mask & CEPH_STATX_BTIME) {
+		fsalattr->valid_mask |= ATTR_CREATION;
+		fsalattr->creation = stx->stx_btime;
+	}
+
+	if (stx->stx_mask & CEPH_STATX_VERSION) {
+		fsalattr->valid_mask |= ATTR_CHANGE;
+		fsalattr->change = stx->stx_version;
+	}
+
+	if ((stx->stx_mask & (CEPH_STATX_CTIME|CEPH_STATX_MTIME)) ==
+	     (CEPH_STATX_CTIME|CEPH_STATX_MTIME)) {
+		fsalattr->valid_mask |= ATTR_CHGTIME;
+		fsalattr->chgtime =
+		    (gsh_time_cmp(&fsalattr->mtime, &fsalattr->ctime) > 0) ?
+		    fsalattr->mtime : fsalattr->ctime;
+	}
 }

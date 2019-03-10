@@ -37,7 +37,6 @@
 #include "nfs4.h"
 #include "nfs_core.h"
 #include "sal_functions.h"
-#include "cache_inode.h"
 #include "nfs_proto_functions.h"
 
 /**
@@ -77,9 +76,8 @@ int nfs4_op_release_lockowner(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	/* Check clientid */
-	rc = nfs_client_id_get_confirmed(arg_RELEASE_LOCKOWNER4->lock_owner.
-					 clientid,
-					 &nfs_client_id);
+	rc = nfs_client_id_get_confirmed(
+		arg_RELEASE_LOCKOWNER4->lock_owner.clientid, &nfs_client_id);
 
 	if (rc != CLIENT_ID_SUCCESS) {
 		res_RELEASE_LOCKOWNER4->status = clientid_error_to_nfsstat(rc);
@@ -112,7 +110,7 @@ int nfs4_op_release_lockowner(struct nfs_argop4 *op, compound_data_t *data,
 				       NULL,
 				       0,
 				       NULL,
-				       CARE_NOT);
+				       CARE_NOT, true);
 
 	if (lock_owner == NULL) {
 		/* the owner doesn't exist, we are done */

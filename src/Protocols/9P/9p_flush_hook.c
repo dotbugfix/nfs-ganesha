@@ -49,7 +49,6 @@
 #include "abstract_mem.h"
 #include "abstract_atomic.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_dupreq.h"
@@ -101,9 +100,9 @@ void _9p_FlushFlushHook(struct _9p_conn *conn, int tag, unsigned long sequence)
 			 * so we can send the RFLUSH.
 			 * warning: this will unlock the bucket lock */
 			while (!fc.reply_sent)
-				pthread_cond_wait(&fc.condition,
-						  &conn->flush_buckets[bucket].
-						  lock);
+				pthread_cond_wait(
+					&fc.condition,
+					&conn->flush_buckets[bucket].lock);
 			break;
 		}
 	}

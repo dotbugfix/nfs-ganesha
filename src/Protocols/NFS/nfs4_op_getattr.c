@@ -33,53 +33,16 @@
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
+#include <assert.h>
 #include "log.h"
 #include "gsh_rpc.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
 #include "nfs_file_handle.h"
-
-static inline bool check_fs_locations(cache_entry_t *entry)
-{
-	fsal_status_t st;
-	fs_locations4 fs_locs;
-	fs_location4 fs_loc;
-	component4 fs_path;
-	component4 fs_root;
-	component4 fs_server;
-	char root[MAXPATHLEN];
-	char path[MAXPATHLEN];
-	char server[MAXHOSTNAMELEN];
-
-	fs_root.utf8string_len = sizeof(root);
-	fs_root.utf8string_val = root;
-	fs_path.utf8string_len = sizeof(path);
-	fs_path.utf8string_val = path;
-	fs_locs.fs_root.pathname4_len = 1;
-	fs_locs.fs_root.pathname4_val = &fs_path;
-	fs_server.utf8string_len = sizeof(server);
-	fs_server.utf8string_val = server;
-	fs_loc.server.server_len = 1;
-	fs_loc.server.server_val = &fs_server;
-	fs_loc.rootpath.pathname4_len = 1;
-	fs_loc.rootpath.pathname4_val = &fs_root;
-	fs_locs.locations.locations_len = 1;
-	fs_locs.locations.locations_val = &fs_loc;
-
-	/* For now allow for one fs locations, fs_locations() should set:
-	   root and update its length, can not be bigger than MAXPATHLEN
-	   path and update its length, can not be bigger than MAXPATHLEN
-	   server and update its length, can not be bigger than MAXHOSTNAMELEN
-	*/
-	st = entry->obj_handle->obj_ops.fs_locations(entry->obj_handle,
-						     &fs_locs);
-
-	return !FSAL_IS_ERROR(st);
-}
+#include "nfs_convert.h"
 
 /**
  * @brief Gets attributes for an entry in the FSAL.
@@ -99,6 +62,11 @@ int nfs4_op_getattr(struct nfs_argop4 *op, compound_data_t *data,
 {
 	GETATTR4args * const arg_GETATTR4 = &op->nfs_argop4_u.opgetattr;
 	GETATTR4res * const res_GETATTR4 = &resp->nfs_resop4_u.opgetattr;
+	attrmask_t mask;
+	struct attrlist attrs;
+	bool current_obj_is_referral = false;
+	fattr4 *obj_attributes =
+		&res_GETATTR4->GETATTR4res_u.resok4.obj_attributes;
 
 	/* This is a NFS4_OP_GETTAR */
 	resp->resop = NFS4_OP_GETATTR;
@@ -108,38 +76,106 @@ int nfs4_op_getattr(struct nfs_argop4 *op, compound_data_t *data,
 	res_GETATTR4->status = nfs4_sanity_check_FH(data, NO_FILE_TYPE, false);
 
 	if (res_GETATTR4->status != NFS4_OK)
-		return res_GETATTR4->status;
+		goto out;
 
 	/* Sanity check: if no attributes are wanted, nothing is to be
 	 * done.  In this case NFS4_OK is to be returned */
 	if (arg_GETATTR4->attr_request.bitmap4_len == 0) {
 		res_GETATTR4->status = NFS4_OK;
-		return res_GETATTR4->status;
+		goto out;
 	}
 
 	/* Get only attributes that are allowed to be read */
 	if (!nfs4_Fattr_Check_Access_Bitmap(&arg_GETATTR4->attr_request,
 					    FATTR4_ATTR_READ)) {
 		res_GETATTR4->status = NFS4ERR_INVAL;
-		return res_GETATTR4->status;
+		goto out;
 	}
+
+	res_GETATTR4->status =
+	    bitmap4_to_attrmask_t(&arg_GETATTR4->attr_request, &mask);
+
+	if (res_GETATTR4->status != NFS4_OK)
+		goto out;
+
+	/* Add mode to what we actually ask for so we can do fslocations
+	 * test.
+	 */
+	fsal_prepare_attrs(&attrs, mask | ATTR_MODE);
 
 	nfs4_bitmap4_Remove_Unsupported(&arg_GETATTR4->attr_request);
 
-	res_GETATTR4->status =
-		   cache_entry_To_Fattr(data->current_entry,
-					&res_GETATTR4->GETATTR4res_u.resok4.
-					obj_attributes,
-					data,
-					&data->currentFH,
-					&arg_GETATTR4->attr_request);
+	res_GETATTR4->status = file_To_Fattr(
+			data, mask, &attrs,
+			obj_attributes,
+			&arg_GETATTR4->attr_request);
 
-	if (data->current_entry->type == DIRECTORY &&
-	    is_sticky_bit_set(data->current_entry->obj_handle->attrs) &&
-	    !attribute_is_set(&arg_GETATTR4->attr_request,
-			       FATTR4_FS_LOCATIONS) &&
-	    check_fs_locations(data->current_entry))
-		res_GETATTR4->status = NFS4ERR_MOVED;
+	current_obj_is_referral = data->current_obj->obj_ops->is_referral(
+					data->current_obj, &attrs, false);
+
+	/*
+	 * If it is a referral point, return the FATTR4_RDATTR_ERROR if
+	 * requested along with the requested restricted attrs.
+	 */
+	if (res_GETATTR4->status == NFS4_OK &&
+	    current_obj_is_referral) {
+		bool fill_rdattr_error = true;
+		bool fslocations_requested = attribute_is_set(
+						&arg_GETATTR4->attr_request,
+						FATTR4_FS_LOCATIONS);
+
+		if (!fslocations_requested) {
+			if (!attribute_is_set(&arg_GETATTR4->attr_request,
+						FATTR4_RDATTR_ERROR)) {
+				fill_rdattr_error = false;
+			}
+		}
+
+		if (fill_rdattr_error) {
+			struct xdr_attrs_args args;
+
+			memset(&args, 0, sizeof(args));
+			args.attrs = &attrs;
+
+			if (nfs4_Fattr_Fill_Error(data, obj_attributes,
+						  NFS4ERR_MOVED,
+						  &arg_GETATTR4->attr_request,
+						  &args)
+			    != 0) {
+				/* Report an error. */
+				res_GETATTR4->status = NFS4ERR_SERVERFAULT;
+			}
+		} else {
+			/* Report the referral. */
+			res_GETATTR4->status = NFS4ERR_MOVED;
+		}
+	}
+
+	/* Done with the attrs */
+	fsal_release_attrs(&attrs);
+
+	if (res_GETATTR4->status == NFS4_OK) {
+		/* Fill in and check response size and make sure it fits. */
+		data->op_resp_size = sizeof(nfsstat4) +
+			res_GETATTR4->GETATTR4res_u.resok4.obj_attributes
+			.attr_vals.attrlist4_len;
+
+		res_GETATTR4->status =
+			check_resp_room(data, data->op_resp_size);
+	}
+
+out:
+
+	if (res_GETATTR4->status != NFS4_OK) {
+		/* The attributes that may have been allocated will not be
+		 * consumed. Since the response array was allocated with
+		 * gsh_calloc, the buffer pointer is always NULL or valid.
+		 */
+		nfs4_Fattr_Free(obj_attributes);
+
+		/* Indicate the failed response size. */
+		data->op_resp_size = sizeof(nfsstat4);
+	}
 
 	return res_GETATTR4->status;
 }				/* nfs4_op_getattr */

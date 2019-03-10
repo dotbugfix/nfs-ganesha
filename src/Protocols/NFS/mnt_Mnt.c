@@ -41,9 +41,9 @@
 #include "export_mgr.h"
 
 /**
- * @brief The Mount proc mount function, for all versions.
+ * @brief The Mount proc mount function for MOUNT_V3 version
  *
- * The MOUNT proc proc function, for all versions.
+ * The MOUNT proc proc function for MOUNT_V3 version
  *
  * @param[in]  arg     The export path to be mounted
  * @param[in]  req     ignored
@@ -54,23 +54,25 @@
 int mnt_Mnt(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 {
 	struct gsh_export *export = NULL;
-	struct fsal_obj_handle *pfsal_handle = NULL;
 	int auth_flavor[NB_AUTH_FLAVOR];
 	int index_auth = 0;
 	int i = 0;
 	char dumpfh[1024];
 	int retval = NFS_REQ_OK;
 	nfs_fh3 *fh3 = (nfs_fh3 *) &res->res_mnt3.mountres3_u.mountinfo.fhandle;
-	cache_entry_t *entry = NULL;
+	struct fsal_obj_handle *obj = NULL;
+	mountres3_ok * const RES_MOUNTINFO =
+	    &res->res_mnt3.mountres3_u.mountinfo;
+
 
 	LogDebug(COMPONENT_NFSPROTO,
-		 "REQUEST PROCESSING: Calling mnt_Mnt path=%s", arg->arg_mnt);
+		 "REQUEST PROCESSING: Calling MNT_MNT path=%s", arg->arg_mnt);
 
 	/* Paranoid command to clean the result struct. */
 	memset(res, 0, sizeof(nfs_res_t));
 
 	/* Quick escape if an unsupported MOUNT version */
-	if (req->rq_vers != MOUNT_V3) {
+	if (req->rq_msg.cb_vers != MOUNT_V3) {
 		res->res_mnt1.status = NFSERR_ACCES;
 		goto out;
 	}
@@ -88,11 +90,24 @@ int mnt_Mnt(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 	    (arg->arg_mnt[strlen(arg->arg_mnt) - 1] == '/'))
 		arg->arg_mnt[strlen(arg->arg_mnt) - 1] = '\0';
 
-	/*  Find the export for the dirname (using as well Path or Tag) */
-	if (arg->arg_mnt[0] == '/')
-		export = get_gsh_export_by_path(arg->arg_mnt, false);
-	else
+	/*  Find the export for the dirname (using as well Path, Pseudo, or Tag)
+	 */
+	if (arg->arg_mnt[0] != '/') {
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "Searching for export by tag for %s",
+			     arg->arg_mnt);
 		export = get_gsh_export_by_tag(arg->arg_mnt);
+	} else if (nfs_param.core_param.mount_path_pseudo) {
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "Searching for export by pseudo for %s",
+			     arg->arg_mnt);
+		export = get_gsh_export_by_pseudo(arg->arg_mnt, false);
+	} else {
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "Searching for export by path for %s",
+			     arg->arg_mnt);
+		export = get_gsh_export_by_path(arg->arg_mnt, false);
+	}
 
 	if (export == NULL) {
 		/* No export found, return ACCESS error. */
@@ -106,8 +121,8 @@ int mnt_Mnt(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 	}
 
 	/* set the export in the context */
-	op_ctx->export = export;
-	op_ctx->fsal_export = op_ctx->export->fsal_export;
+	op_ctx->ctx_export = export;
+	op_ctx->fsal_export = op_ctx->ctx_export->fsal_export;
 
 	/* Check access based on client. Don't bother checking TCP/UDP as some
 	 * clients use UDP for MOUNT even when they will use TCP for NFS.
@@ -117,7 +132,7 @@ int mnt_Mnt(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 	if ((op_ctx->export_perms->options & EXPORT_OPTION_NFSV3) == 0) {
 		LogInfo(COMPONENT_NFSPROTO,
 			"MOUNT: Export entry %s does not support NFS v3 for client %s",
-			export->fullpath,
+			export_path(export),
 			op_ctx->client
 				? op_ctx->client->hostaddr_str
 				: "unknown client");
@@ -127,21 +142,19 @@ int mnt_Mnt(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 
 	/* retrieve the associated NFS handle */
 	if (arg->arg_mnt[0] != '/' ||
-	    !strcmp(arg->arg_mnt, export->fullpath)) {
-		if (nfs_export_get_root_entry(export, &entry)
-		    != CACHE_INODE_SUCCESS) {
+	    !strcmp(arg->arg_mnt, export_path(export))) {
+		if (FSAL_IS_ERROR(nfs_export_get_root_entry(export, &obj))) {
 			res->res_mnt3.fhs_status = MNT3ERR_ACCES;
 			goto out;
 		}
-		pfsal_handle = entry->obj_handle;
 	} else {
-		LogEvent(COMPONENT_NFSPROTO,
+		LogInfo(COMPONENT_NFSPROTO,
 			 "MOUNT: Performance warning: Export entry is not cached");
 
 		if (FSAL_IS_ERROR(op_ctx->fsal_export->exp_ops.lookup_path(
 						op_ctx->fsal_export,
 						arg->arg_mnt,
-						&pfsal_handle))) {
+						&obj, NULL))) {
 			res->res_mnt3.fhs_status = MNT3ERR_ACCES;
 			goto out;
 		}
@@ -152,25 +165,18 @@ int mnt_Mnt(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 	 * The mountinfo.fhandle definition is an overlay on/of nfs_fh3.
 	 * redefine and eliminate one or the other.
 	 */
-	res->res_mnt3.fhs_status = nfs3_AllocateFH(fh3);
-
-	if (res->res_mnt3.fhs_status == MNT3_OK) {
-		if (!nfs3_FSALToFhandle(fh3, pfsal_handle, export)) {
-			res->res_mnt3.fhs_status = MNT3ERR_INVAL;
-		} else {
-			if (isDebug(COMPONENT_NFSPROTO))
-				sprint_fhandle3(dumpfh, fh3);
-			res->res_mnt3.fhs_status = MNT3_OK;
-		}
-	}
-
-	if (entry != NULL) {
-		/* Release the export root cache inode entry */
-		cache_inode_put(entry);
+	if (!nfs3_FSALToFhandle(true, fh3, obj, export)) {
+		res->res_mnt3.fhs_status = MNT3ERR_INVAL;
 	} else {
-		/* Release the fsal_obj_handle created for the path */
-		pfsal_handle->obj_ops.release(pfsal_handle);
+		if (isDebug(COMPONENT_NFSPROTO))
+			sprint_fhandle3(dumpfh, fh3);
+		res->res_mnt3.fhs_status = MNT3_OK;
 	}
+
+	/* Release the fsal_obj_handle created for the path */
+	LogFullDebug(COMPONENT_FSAL,
+		     "Releasing %p", obj);
+	obj->obj_ops->put_ref(obj);
 
 	/* Return the supported authentication flavor in V3 based
 	 * on the client's export permissions. These should be listed
@@ -201,16 +207,8 @@ int mnt_Mnt(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 				? op_ctx->client->hostaddr_str
 				: "unknown client");
 
-	mountres3_ok * const RES_MOUNTINFO =
-	    &res->res_mnt3.mountres3_u.mountinfo;
-
 	RES_MOUNTINFO->auth_flavors.auth_flavors_val =
 		gsh_calloc(index_auth, sizeof(int));
-
-	if (RES_MOUNTINFO->auth_flavors.auth_flavors_val == NULL) {
-		retval = NFS_REQ_DROP;
-		goto out;
-	}
 
 	RES_MOUNTINFO->auth_flavors.auth_flavors_len = index_auth;
 	for (i = 0; i < index_auth; i++)
@@ -219,7 +217,7 @@ int mnt_Mnt(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 
  out:
 	if (export != NULL) {
-		op_ctx->export = NULL;
+		op_ctx->ctx_export = NULL;
 		op_ctx->fsal_export = NULL;
 		put_gsh_export(export);
 	}
@@ -243,10 +241,10 @@ void mnt1_Mnt_Free(nfs_res_t *res)
 
 void mnt3_Mnt_Free(nfs_res_t *res)
 {
+	mountres3_ok *resok = &res->res_mnt3.mountres3_u.mountinfo;
+
 	if (res->res_mnt3.fhs_status == MNT3_OK) {
-		gsh_free(res->res_mnt3.mountres3_u.mountinfo.auth_flavors.
-			 auth_flavors_val);
-		gsh_free(res->res_mnt3.mountres3_u.mountinfo.fhandle.
-			 fhandle3_val);
+		gsh_free(resok->auth_flavors.auth_flavors_val);
+		gsh_free(resok->fhandle.fhandle3_val);
 	}
 }

@@ -1,11 +1,11 @@
 /*
- * vim:expandtab:shiftwidth=8:tabstop=8:
+ * vim:shiftwidth=8:tabstop=8:
  *
  * Copyright (C) Panasas Inc., 2011
  * Author: Jim Lieb jlieb@panasas.com
  *
  * contributeur : Philippe DENIEL   philippe.deniel@cea.fr
- *                Thomas LEIBOVICI  thomas.leibovici@cea.fr
+ *		Thomas LEIBOVICI  thomas.leibovici@cea.fr
  *
  *
  * This program is free software; you can redistribute it and/or
@@ -46,6 +46,7 @@
 #include "pseudofs_methods.h"
 #include "nfs_exports.h"
 #include "export_mgr.h"
+#include "mdcache.h"
 
 #ifdef __FreeBSD__
 #include <sys/endian.h>
@@ -57,7 +58,6 @@
 /* helpers to/from other PSEUDO objects
  */
 
-struct fsal_staticfsinfo_t *pseudofs_staticinfo(struct fsal_module *hdl);
 
 /* export object methods
  */
@@ -107,103 +107,6 @@ static fsal_status_t get_dynamic_info(struct fsal_export *exp_hdl,
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
-static bool fs_supports(struct fsal_export *exp_hdl,
-			fsal_fsinfo_options_t option)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_supports(info, option);
-}
-
-static uint64_t fs_maxfilesize(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_maxfilesize(info);
-}
-
-static uint32_t fs_maxread(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_maxread(info);
-}
-
-static uint32_t fs_maxwrite(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_maxwrite(info);
-}
-
-static uint32_t fs_maxlink(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_maxlink(info);
-}
-
-static uint32_t fs_maxnamelen(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_maxnamelen(info);
-}
-
-static uint32_t fs_maxpathlen(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_maxpathlen(info);
-}
-
-static struct timespec fs_lease_time(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_lease_time(info);
-}
-
-static fsal_aclsupp_t fs_acl_support(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_acl_support(info);
-}
-
-static attrmask_t fs_supported_attrs(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_supported_attrs(info);
-}
-
-static uint32_t fs_umask(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_umask(info);
-}
-
-static uint32_t fs_xattr_access_rights(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = pseudofs_staticinfo(exp_hdl->fsal);
-	return fsal_xattr_access_rights(info);
-}
-
 /* get_quota
  * return quotas for this export.
  * path could cross a lower mount boundary which could
@@ -215,6 +118,7 @@ static uint32_t fs_xattr_access_rights(struct fsal_export *exp_hdl)
 
 static fsal_status_t get_quota(struct fsal_export *exp_hdl,
 			       const char *filepath, int quota_type,
+			       int quota_id,
 			       fsal_quota_t *pquota)
 {
 	/* PSEUDOFS doesn't support quotas */
@@ -227,6 +131,7 @@ static fsal_status_t get_quota(struct fsal_export *exp_hdl,
 
 static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 			       const char *filepath, int quota_type,
+			       int quota_id,
 			       fsal_quota_t *pquota, fsal_quota_t *presquota)
 {
 	/* PSEUDOFS doesn't support quotas */
@@ -236,14 +141,13 @@ static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 /* extract a file handle from a buffer.
  * do verification checks and flag any and all suspicious bits.
  * Return an updated fh_desc into whatever was passed.  The most
- * common behavior, done here is to just reset the length.  There
- * is the option to also adjust the start pointer.
+ * common behavior, done here is to just reset the length.
  */
 
-static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
-				    fsal_digesttype_t in_type,
-				    struct gsh_buffdesc *fh_desc,
-				    int flags)
+static fsal_status_t wire_to_host(struct fsal_export *exp_hdl,
+				  fsal_digesttype_t in_type,
+				  struct gsh_buffdesc *fh_desc,
+				  int flags)
 {
 	size_t fh_min;
 	uint64_t *hashkey;
@@ -281,21 +185,9 @@ void pseudofs_export_ops_init(struct export_ops *ops)
 {
 	ops->release = release;
 	ops->lookup_path = pseudofs_lookup_path;
-	ops->extract_handle = extract_handle;
+	ops->wire_to_host = wire_to_host;
 	ops->create_handle = pseudofs_create_handle;
 	ops->get_fs_dynamic_info = get_dynamic_info;
-	ops->fs_supports = fs_supports;
-	ops->fs_maxfilesize = fs_maxfilesize;
-	ops->fs_maxread = fs_maxread;
-	ops->fs_maxwrite = fs_maxwrite;
-	ops->fs_maxlink = fs_maxlink;
-	ops->fs_maxnamelen = fs_maxnamelen;
-	ops->fs_maxpathlen = fs_maxpathlen;
-	ops->fs_lease_time = fs_lease_time;
-	ops->fs_acl_support = fs_acl_support;
-	ops->fs_supported_attrs = fs_supported_attrs;
-	ops->fs_umask = fs_umask;
-	ops->fs_xattr_access_rights = fs_xattr_access_rights;
 	ops->get_quota = get_quota;
 	ops->set_quota = set_quota;
 }
@@ -323,17 +215,8 @@ fsal_status_t pseudofs_create_export(struct fsal_module *fsal_hdl,
 		return fsalstat(posix2fsal_error(errno), errno);
 	}
 
-	retval = fsal_export_init(&myself->export);
-
-	if (retval != 0) {
-		LogMajor(COMPONENT_FSAL,
-			 "Could not initialize export");
-		gsh_free(myself);
-		return fsalstat(posix2fsal_error(retval), retval);
-	}
-
+	fsal_export_init(&myself->export);
 	pseudofs_export_ops_init(&myself->export.exp_ops);
-	myself->export.up_ops = up_ops;
 
 	retval = fsal_attach_export(fsal_hdl, &myself->export.exports);
 
@@ -341,21 +224,18 @@ fsal_status_t pseudofs_create_export(struct fsal_module *fsal_hdl,
 		/* seriously bad */
 		LogMajor(COMPONENT_FSAL,
 			 "Could not attach export");
-		goto errout;
+		gsh_free(myself->export_path);
+		gsh_free(myself->root_handle);
+		free_export_ops(&myself->export);
+		gsh_free(myself);	/* elvis has left the building */
+
+		return fsalstat(posix2fsal_error(retval), retval);
 	}
 
 	myself->export.fsal = fsal_hdl;
 
 	/* Save the export path. */
-	myself->export_path = gsh_strdup(op_ctx->export->fullpath);
-
-	if (myself->export_path == NULL) {
-		LogCrit(COMPONENT_FSAL,
-			"Could not allocate export path");
-		retval = ENOMEM;
-		goto errout;
-	}
-
+	myself->export_path = gsh_strdup(op_ctx->ctx_export->fullpath);
 	op_ctx->fsal_export = &myself->export;
 
 	LogDebug(COMPONENT_FSAL,
@@ -363,18 +243,4 @@ fsal_status_t pseudofs_create_export(struct fsal_module *fsal_hdl,
 		 myself, myself->export_path);
 
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
-
- errout:
-
-	if (myself->export_path != NULL)
-		gsh_free(myself->export_path);
-
-	if (myself->root_handle != NULL)
-		gsh_free(myself->root_handle);
-
-	free_export_ops(&myself->export);
-
-	gsh_free(myself);	/* elvis has left the building */
-
-	return fsalstat(posix2fsal_error(retval), retval);
 }

@@ -12,13 +12,16 @@ SET(fsalpanfs_LIB_SRCS
    ../handle_syscalls.c
    ../file.c
    ../xattrs.c
+   ../state.c
    ../vfs_methods.h
+   ../empty_check_hsm.c
    subfsal_panfs.c
    attrs.c
    handle.c
   )
 
-add_library(fsalpanfs SHARED ${fsalpanfs_LIB_SRCS})
+add_library(fsalpanfs MODULE ${fsalpanfs_LIB_SRCS})
+add_sanitizers(fsalpanfs)
 
 target_link_libraries(fsalpanfs
   gos

@@ -25,7 +25,8 @@
 
 /**
  * @file    nfs_rpc_tcp_socket_manager_thread.c
- * @brief   The file that contain the 'rpc_tcp_socket_manager_thread' routine for the nfsd.
+ * @brief   The file that contain the 'rpc_tcp_socket_manager_thread' routine
+ *          for the nfsd.
  *
  * nfs_rpc_dispatcher.c : The file that contain the
  * 'rpc_tcp_socket_manager_thread.c' routine for the nfsd (and all
@@ -46,7 +47,6 @@
 #include "nfs4.h"
 #include "mount.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_file_handle.h"

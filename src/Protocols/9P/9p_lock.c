@@ -41,7 +41,6 @@
 #include <netdb.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "export_mgr.h"
 #include "sal_functions.h"
 #include "fsal.h"
@@ -88,7 +87,7 @@ int _9p_lock(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	memset(&lock, 0, sizeof(lock));
 	memset(&conflict, 0, sizeof(conflict));
 
-	char name[MAXNAMLEN];
+	char name[MAXNAMLEN+1];
 
 	struct addrinfo hints, *result;
 	struct sockaddr_storage client_addr;
@@ -127,7 +126,13 @@ int _9p_lock(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	/* Tmp hook to avoid lock issue when compiling kernels.
 	 * This should not impact ONE client only
 	 * get the client's ip addr */
-	snprintf(name, MAXNAMLEN, "%.*s", *client_id_len, client_id_str);
+	if (*client_id_len >= sizeof(name)) {
+		LogDebug(COMPONENT_9P, "request with name too long (%u)",
+			 *client_id_len);
+		return _9p_rerror(req9p, msgtag, ENAMETOOLONG, plenout,
+				  preply);
+	}
+	snprintf(name, sizeof(name), "%.*s", *client_id_len, client_id_str);
 
 	memset((char *)&hints, 0, sizeof(struct addrinfo));
 	hints.ai_family = AF_INET;
@@ -159,15 +164,20 @@ int _9p_lock(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 			status = _9P_LOCK_GRACE;
 			break;
 		}
-
-		state_status = state_lock(pfid->pentry,
-					  powner, &pfid->state,
+		PTHREAD_RWLOCK_wrlock(&pfid->pentry->state_hdl->state_lock);
+		state_status = state_lock(pfid->pentry, powner, pfid->state,
 					  STATE_NON_BLOCKING, NULL, &lock,
 					  &holder, &conflict);
+		PTHREAD_RWLOCK_unlock(&pfid->pentry->state_hdl->state_lock);
 
 		if (state_status == STATE_SUCCESS)
 			status = _9P_LOCK_SUCCESS;
-		else if (state_status == STATE_LOCK_BLOCKED)
+		else if (state_status == STATE_LOCK_BLOCKED ||
+			 state_status == STATE_LOCK_CONFLICT)
+			/**
+			 * Should handle _9P_LOCK_FLAGS_BLOCK in *flags,
+			 * but linux client replays blocking requests
+			 */
 			status = _9P_LOCK_BLOCKED;
 		else
 			status = _9P_LOCK_ERROR;
@@ -175,8 +185,8 @@ int _9p_lock(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 		break;
 
 	case _9P_LOCK_TYPE_UNLCK:
-		if (state_unlock(pfid->pentry, &pfid->state,
-				 powner, false, 0, &lock)
+		if (state_unlock(pfid->pentry, pfid->state, powner, false, 0,
+				 &lock)
 			    != STATE_SUCCESS)
 			status = _9P_LOCK_ERROR;
 		else
@@ -186,7 +196,6 @@ int _9p_lock(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 
 	default:
 		return _9p_rerror(req9p, msgtag, EINVAL, plenout, preply);
-		break;
 	}			/* switch( *type ) */
 
 	/* Build the reply */

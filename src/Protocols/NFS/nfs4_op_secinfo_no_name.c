@@ -33,12 +33,22 @@
 #include "config.h"
 #include "fsal.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
 #include "sal_functions.h"
 #include "export_mgr.h"
+
+#ifdef _HAVE_GSSAPI
+/* flavor, oid len, qop, service */
+#define GSS_RESP_SIZE (4 * BYTES_PER_XDR_UNIT)
+#endif
+/* nfsstat4, resok_len, 2 flavors
+ * NOTE this requires space for up to 2 extra xdr units if the export doesn't
+ * allow AUTH_NONE and/or AUTH_UNIX. The response size is overall so small
+ * this op should never be the cause of overflow of maxrespsize...
+ */
+#define RESP_SIZE (4 * BYTES_PER_XDR_UNIT)
 
 /**
  * @brief NFSv4 SECINFO_NO_NAME operation
@@ -57,8 +67,12 @@ int nfs4_op_secinfo_no_name(struct nfs_argop4 *op, compound_data_t *data,
 {
 	SECINFO_NO_NAME4res * const res_SECINFO_NO_NAME4 =
 	    &resp->nfs_resop4_u.opsecinfo_no_name;
+	secinfo4 *resok_val;
+#ifdef _HAVE_GSSAPI
 	sec_oid4 v5oid = { krb5oid.length, (char *)krb5oid.elements };
+#endif /* _HAVE_GSSAPI */
 	int num_entry = 0;
+	uint32_t resp_size = RESP_SIZE;
 
 	res_SECINFO_NO_NAME4->status = NFS4_OK;
 
@@ -78,12 +92,7 @@ int nfs4_op_secinfo_no_name(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	/* Get the number of entries */
-	if (op_ctx->export_perms->options & EXPORT_OPTION_AUTH_NONE)
-		num_entry++;
-
-	if (op_ctx->export_perms->options & EXPORT_OPTION_AUTH_UNIX)
-		num_entry++;
-
+#ifdef _HAVE_GSSAPI
 	if (op_ctx->export_perms->options &
 	    EXPORT_OPTION_RPCSEC_GSS_NONE)
 		num_entry++;
@@ -96,14 +105,27 @@ int nfs4_op_secinfo_no_name(struct nfs_argop4 *op, compound_data_t *data,
 	    EXPORT_OPTION_RPCSEC_GSS_PRIV)
 		num_entry++;
 
-	res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.SECINFO4resok_val =
-	     gsh_calloc(num_entry, sizeof(secinfo4));
+	resp_size += (RNDUP(krb5oid.length) + GSS_RESP_SIZE) * num_entry;
+#endif
 
-	if (res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.SECINFO4resok_val
-	    == NULL) {
-		res_SECINFO_NO_NAME4->status = NFS4ERR_SERVERFAULT;
+	if (op_ctx->export_perms->options & EXPORT_OPTION_AUTH_NONE)
+		num_entry++;
+
+	if (op_ctx->export_perms->options & EXPORT_OPTION_AUTH_UNIX)
+		num_entry++;
+
+	/* Check for space in response. */
+	res_SECINFO_NO_NAME4->status = check_resp_room(data, resp_size);
+
+	if (res_SECINFO_NO_NAME4->status != NFS4_OK)
 		goto out;
-	}
+
+	data->op_resp_size = resp_size;
+
+	resok_val = gsh_calloc(num_entry, sizeof(secinfo4));
+
+	res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.SECINFO4resok_val
+		= resok_val;
 
 	/**
 	 * @todo We give here the order in which the client should try
@@ -112,59 +134,40 @@ int nfs4_op_secinfo_no_name(struct nfs_argop4 *op, compound_data_t *data,
 	 */
 	int idx = 0;
 
+#ifdef _HAVE_GSSAPI
 	if (op_ctx->export_perms->options &
 	    EXPORT_OPTION_RPCSEC_GSS_PRIV) {
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx]
-		    .flavor = RPCSEC_GSS;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx]
-		    .secinfo4_u.flavor_info.service = RPCSEC_GSS_SVC_PRIVACY;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx]
-		    .secinfo4_u.flavor_info.qop = GSS_C_QOP_DEFAULT;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx++]
-		    .secinfo4_u.flavor_info.oid = v5oid;
+		resok_val[idx].flavor = RPCSEC_GSS;
+		resok_val[idx].secinfo4_u.flavor_info.service =
+			RPCSEC_GSS_SVC_PRIVACY;
+		resok_val[idx].secinfo4_u.flavor_info.qop = GSS_C_QOP_DEFAULT;
+		resok_val[idx++].secinfo4_u.flavor_info.oid = v5oid;
 	}
 
 	if (op_ctx->export_perms->options &
 	    EXPORT_OPTION_RPCSEC_GSS_INTG) {
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx].flavor = RPCSEC_GSS;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx]
-		    .secinfo4_u.flavor_info.service = RPCSEC_GSS_SVC_INTEGRITY;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx]
-		    .secinfo4_u.flavor_info.qop = GSS_C_QOP_DEFAULT;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx++]
-		    .secinfo4_u.flavor_info.oid = v5oid;
+		resok_val[idx].flavor = RPCSEC_GSS;
+		resok_val[idx].secinfo4_u.flavor_info.service =
+			RPCSEC_GSS_SVC_INTEGRITY;
+		resok_val[idx].secinfo4_u.flavor_info.qop = GSS_C_QOP_DEFAULT;
+		resok_val[idx++].secinfo4_u.flavor_info.oid = v5oid;
 	}
 
 	if (op_ctx->export_perms->options &
 	    EXPORT_OPTION_RPCSEC_GSS_NONE) {
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx].flavor = RPCSEC_GSS;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx]
-		    .secinfo4_u.flavor_info.service = RPCSEC_GSS_SVC_NONE;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx]
-		    .secinfo4_u.flavor_info.qop = GSS_C_QOP_DEFAULT;
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx++]
-		    .secinfo4_u.flavor_info.oid = v5oid;
+		resok_val[idx].flavor = RPCSEC_GSS;
+		resok_val[idx].secinfo4_u.flavor_info.service =
+			RPCSEC_GSS_SVC_NONE;
+		resok_val[idx].secinfo4_u.flavor_info.qop = GSS_C_QOP_DEFAULT;
+		resok_val[idx++].secinfo4_u.flavor_info.oid = v5oid;
 	}
+#endif /* _HAVE_GSSAPI */
 
 	if (op_ctx->export_perms->options & EXPORT_OPTION_AUTH_UNIX)
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx++].flavor = AUTH_UNIX;
+		resok_val[idx++].flavor = AUTH_UNIX;
 
 	if (op_ctx->export_perms->options & EXPORT_OPTION_AUTH_NONE)
-		res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.
-		    SECINFO4resok_val[idx++].flavor = AUTH_NONE;
+		resok_val[idx++].flavor = AUTH_NONE;
 
 	res_SECINFO_NO_NAME4->SECINFO4res_u.resok4.SECINFO4resok_len = idx;
 
@@ -174,9 +177,9 @@ int nfs4_op_secinfo_no_name(struct nfs_argop4 *op, compound_data_t *data,
 	data->currentFH.nfs_fh4_len = 0;
 
 	/* Release CurrentFH reference to export. */
-	if (op_ctx->export) {
-		put_gsh_export(op_ctx->export);
-		op_ctx->export = NULL;
+	if (op_ctx->ctx_export) {
+		put_gsh_export(op_ctx->ctx_export);
+		op_ctx->ctx_export = NULL;
 		op_ctx->fsal_export = NULL;
 	}
 

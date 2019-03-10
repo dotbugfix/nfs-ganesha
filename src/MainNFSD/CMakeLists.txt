@@ -18,6 +18,7 @@ SET(MainServices_STAT_SRCS
    nfs_rpc_dispatcher_thread.c
    nfs_rpc_tcp_socket_manager_thread.c
    nfs_init.c
+   nfs_lib.c
    nfs_reaper_thread.c
    ../support/client_mgr.c
 )
@@ -37,9 +38,6 @@ endif(USE_9P AND USE_9P_RDMA)
 
 if(USE_NFS_RDMA)
   add_definitions(-D_USE_NFS_RDMA)
-  SET(MainServices_STAT_SRCS
-    ${MainServices_STAT_SRCS}
-    nfs_rpc_rdma.c)
 endif(USE_NFS_RDMA)
 
 if(USE_CB_SIMULATOR)
@@ -63,12 +61,11 @@ if(USE_CB_SIMULATOR)
 endif(USE_CB_SIMULATOR)
 
 add_library(MainServices STATIC ${MainServices_STAT_SRCS})
+add_sanitizers(MainServices)
 
 # FSAL core sources
 # fsal_manager and fsal_destroyer are the only objects referenced by the
 # core server all the rest are for the common support of fsal plugins.
-# we put them here in the core rather than in a lib so that they are always
-# present and available for runtime linkage.
 
 set(fsal_CORE_SRCS
    ../FSAL/fsal_convert.c
@@ -79,10 +76,20 @@ set(fsal_CORE_SRCS
    ../FSAL/default_methods.c
    ../FSAL/common_pnfs.c
    ../FSAL/fsal_destroyer.c
+   ../FSAL/fsal_helper.c
    ../FSAL_UP/fsal_up_top.c
    ../FSAL_UP/fsal_up_async.c
-   ../FSAL_UP/fsal_up_utils.c
 )
+
+if (USE_ACL_MAPPING)
+  set(fsal_CORE_SRCS
+      ${fsal_CORE_SRCS}
+      ../FSAL/posix_acls.c
+  )
+endif(USE_ACL_MAPPING)
+
+add_library(FsalCore STATIC ${fsal_CORE_SRCS})
+add_sanitizers(FsalCore)
 
 ########### next target ###############
 
@@ -94,6 +101,7 @@ add_executable(ganesha.nfsd
   ${ganesha.nfsd_SRCS}
   ${fsal_CORE_SRCS}
 )
+add_sanitizers(ganesha.nfsd)
 
 target_link_libraries(ganesha.nfsd
   MainServices
@@ -102,6 +110,7 @@ target_link_libraries(ganesha.nfsd
   config_parsing
   ${LIBTIRPC_LIBRARIES}
   ${SYSTEM_LIBRARIES}
+  ${LTTNG_LIBRARIES}
 )
 
 install(TARGETS ganesha.nfsd COMPONENT daemon DESTINATION bin)

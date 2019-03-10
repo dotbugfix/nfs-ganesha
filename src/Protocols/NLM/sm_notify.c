@@ -17,24 +17,42 @@
 
 #define ERR_MSG1 "%s address too long\n"
 
-/* Default timeout can be changed using clnt_control() */
-static struct timeval TIMEOUT = { 25, 0 };
+/* attempt to match (irrational) behaviour of previous versions */
+static const struct timespec tout = { 15, 0 };
+
+/* This function is dragged in by the use of abstract_mem.h, so
+ * we define a simple version that does a printf rather than
+ * pull in the entirety of log_functions.c into this standalone
+ * program.
+ */
+void LogMallocFailure(const char *file, int line, const char *function,
+		      const char *allocator)
+{
+	printf("Aborting %s due to out of memory", allocator);
+}
 
 void *
 nsm_notify_1(notify *argp, CLIENT *clnt)
 {
 	static char clnt_res;
-	AUTH *nsm_auth;
-
-	nsm_auth = authnone_create();
+	struct clnt_req *cc;
+	enum clnt_stat ret;
 
 	memset((char *)&clnt_res, 0, sizeof(clnt_res));
-	if (clnt_call(clnt, nsm_auth, SM_NOTIFY,
-		(xdrproc_t) xdr_notify, (caddr_t) argp,
-		(xdrproc_t) xdr_void, (caddr_t) &clnt_res,
-		TIMEOUT) != RPC_SUCCESS) {
-		return NULL;
+
+	cc = gsh_malloc(sizeof(*cc));
+	clnt_req_fill(cc, clnt, authnone_ncreate(), SM_NOTIFY,
+		      (xdrproc_t) xdr_notify, argp,
+		      (xdrproc_t) xdr_void, &clnt_res);
+	ret = clnt_req_setup(cc, tout);
+	if (ret == RPC_SUCCESS) {
+		cc->cc_refreshes = 1;
+		ret = CLNT_CALL_WAIT(cc);
 	}
+	clnt_req_release(cc);
+
+	if (ret != RPC_SUCCESS)
+		return NULL;
 	return (void *)&clnt_res;
 }
 
@@ -149,7 +167,7 @@ int main(int argc, char **argv)
 	/* free resources */
 	gsh_free(buf->buf);
 	gsh_free(buf);
-	clnt_destroy(clnt);
+	CLNT_DESTROY(clnt);
 
 	close(fd);
 

@@ -80,6 +80,8 @@ void ganesha_yyerror(YYLTYPE *yylloc_param,
 		     void *yyscanner,
 		     char*);
 
+struct glist_head all_blocks;
+
 struct config_node *config_block(char *blockname,
 				 struct config_node *list,
 				 YYLTYPE *yylloc_param,
@@ -155,10 +157,7 @@ config:
 
 
 deflist:
-{ /* empty */
-  $$ = NULL;
-}
-| definition
+definition
 {
   $$ = $1;
 }
@@ -195,6 +194,7 @@ statement:
 ;
 
 block:
+RCURLY_OP
 { /* empty */
   $$ = NULL;
 }
@@ -227,10 +227,8 @@ exprlist:
 }
 ;
 
-expression: /* empty */ {
-  $$ = NULL;
-}
-| TOK_PATH
+expression:
+TOK_PATH
 {
   $$ = config_term(NULL, $1, TERM_PATH, &@$, st);
 }
@@ -380,12 +378,27 @@ void ganesha_yyerror(YYLTYPE *yylloc_param,
 /**
  *  Create a block item with the given content
  */
+
+void dump_all_blocks(void)
+{
+	struct glist_head *glh;
+	struct config_node *node;
+
+	int ix = 0;
+	glist_for_each(glh, &all_blocks) {
+		node = glist_entry(glh, struct config_node, blocks);
+		printf("%s: ix: %d node blockname: %s\n",
+			__func__, ix, node->u.nterm.name);
+		++ix;
+	}
+}
+
 struct config_node *config_block(char *blockname,
 				 struct config_node *list,
 				 YYLTYPE *yylloc_param,
 				 struct parser_state *st)
 {
-	struct config_node *node, *cnode;
+	struct config_node *node;
 
 	node = gsh_calloc(1, sizeof(struct config_node));
 	if (node == NULL) {
@@ -393,6 +406,7 @@ struct config_node *config_block(char *blockname,
 		return NULL;
 	}
 	glist_init(&node->node);
+	glist_init(&node->blocks);
 	node->u.nterm.name = blockname;
 	node->filename = yylloc_param->filename;
 	node->linenumber = yylloc_param->first_line;
@@ -402,6 +416,7 @@ struct config_node *config_block(char *blockname,
 		glist_add_tail(&list->node, &node->u.nterm.sub_nodes);
 		link_node(node);
 	}
+	glist_add_tail(&all_blocks, &node->blocks);
 	return node;
 }
 

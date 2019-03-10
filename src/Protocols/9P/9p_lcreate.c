@@ -41,8 +41,6 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
-#include "cache_inode_lru.h"
 #include "fsal.h"
 #include "9p.h"
 
@@ -61,11 +59,14 @@ int _9p_lcreate(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	struct _9p_qid qid_newfile;
 	u32 iounit = _9P_IOUNIT;
 
-	cache_entry_t *pentry_newfile = NULL;
-	char file_name[MAXNAMLEN];
-	int64_t fileid;
-	cache_inode_status_t cache_status;
+	struct fsal_obj_handle *pentry_newfile = NULL;
+	char file_name[MAXNAMLEN+1];
+	fsal_status_t fsal_status;
 	fsal_openflags_t openflags = 0;
+
+	struct attrlist sattr;
+	fsal_verifier_t verifier;
+	enum fsal_create_mode createmode = FSAL_UNCHECKED;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -97,56 +98,69 @@ int _9p_lcreate(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 				 EXPORT_OPTION_WRITE_ACCESS) == 0)
 		return _9p_rerror(req9p, msgtag, EROFS, plenout, preply);
 
-	snprintf(file_name, MAXNAMLEN, "%.*s", *name_len, name_str);
-
-	/* Create the file */
-
-	/* BUGAZOMEU: @todo : the gid parameter is not used yet,
-	 * flags is not yet used */
-	cache_status =
-	    cache_inode_create(pfid->pentry, file_name, REGULAR_FILE, *mode,
-			       NULL, &pentry_newfile);
-	if (pentry_newfile == NULL)
-		return _9p_rerror(req9p, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
+	if (*name_len >= sizeof(file_name)) {
+		LogDebug(COMPONENT_9P, "request with name too long (%u)",
+			 *name_len);
+		return _9p_rerror(req9p, msgtag, ENAMETOOLONG, plenout,
 				  preply);
-
-	fileid = cache_inode_fileid(pentry_newfile);
+	}
+	snprintf(file_name, sizeof(file_name), "%.*s", *name_len, name_str);
 
 	_9p_openflags2FSAL(flags, &openflags);
-	pfid->state.state_data.fid.share_access =
+	pfid->state->state_data.fid.share_access =
 		_9p_openflags_to_share_access(flags);
 
-	cache_status = cache_inode_open(pentry_newfile, openflags, 0);
-	if (cache_status != CACHE_INODE_SUCCESS) {
-		return _9p_rerror(req9p, msgtag,
-				  _9p_tools_errno(cache_status),
-				  plenout, preply);
+	memset(&verifier, 0, sizeof(verifier));
+
+	memset(&sattr, 0, sizeof(sattr));
+	sattr.valid_mask = ATTR_MODE | ATTR_GROUP;
+	sattr.mode = *mode;
+	sattr.group = *gid;
+
+	if (*flags & 0x10) {
+		/* Filesize is already 0. */
+		sattr.valid_mask |= ATTR_SIZE;
 	}
 
-	/* Pin as well. We probably want to close the file if this fails,
-	 * but it won't happen - right?! */
-	cache_status = cache_inode_inc_pin_ref(pentry_newfile);
-	if (cache_status != CACHE_INODE_SUCCESS)
+	if (*flags & 0x1000) {
+		/* If OEXCL, use FSAL_EXCLUSIVE_9P create mode
+		 * so that we can pass the attributes specified
+		 * above. Verifier is ignored for this create mode
+		 * because we don't have to deal with retry.
+		 */
+		createmode = FSAL_EXCLUSIVE_9P;
+	}
+
+	fsal_status = fsal_open2(pfid->pentry,
+				 pfid->state,
+				 openflags,
+				 createmode,
+				 file_name,
+				 &sattr,
+				 verifier,
+				 &pentry_newfile,
+				 NULL);
+
+	/* Release the attributes (may release an inherited ACL) */
+	fsal_release_attrs(&sattr);
+
+	if (FSAL_IS_ERROR(fsal_status))
 		return _9p_rerror(req9p, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
-				  preply);
+				  _9p_tools_errno(fsal_status),
+				  plenout, preply);
 
 	/* put parent directory entry */
-	cache_inode_put(pfid->pentry);
+	pfid->pentry->obj_ops->put_ref(pfid->pentry);
 
 	/* Build the qid */
 	qid_newfile.type = _9P_QTFILE;
 	qid_newfile.version = 0;
-	qid_newfile.path = fileid;
-
-	iounit = 0;		/* default value */
+	qid_newfile.path = pentry_newfile->fileid;
 
 	/* The fid will represent the new file now - we can't fail anymore */
 	pfid->pentry = pentry_newfile;
 	pfid->qid = qid_newfile;
-	pfid->specdata.xattr.xattr_id = 0;
-	pfid->specdata.xattr.xattr_content = NULL;
+	pfid->xattr = NULL;
 	pfid->opens = 1;
 
 	/* Build the reply */

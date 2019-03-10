@@ -38,11 +38,9 @@
 #include <pthread.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <sys/xattr.h>
+#include "os/xattr.h"
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
-#include "cache_inode_lru.h"
 #include "fsal.h"
 #include "9p.h"
 
@@ -59,7 +57,7 @@ int _9p_xattrwalk(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	size_t attrsize = 0;
 
 	fsal_status_t fsal_status;
-	char name[MAXNAMLEN];
+	char name[MAXNAMLEN+1];
 	fsal_xattrent_t xattrs_arr[XATTRS_ARRAY_LEN];
 	int eod_met = false;
 	unsigned int nb_xattrs_read = 0;
@@ -102,128 +100,155 @@ int _9p_xattrwalk(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
+	if (*name_len >= sizeof(name)) {
+		LogDebug(COMPONENT_9P, "request with name too long (%u)",
+			 *name_len);
+		return _9p_rerror(req9p, msgtag, ENAMETOOLONG, plenout,
+				  preply);
+	}
+
 	pxattrfid = gsh_calloc(1, sizeof(struct _9p_fid));
-	if (pxattrfid == NULL)
-		return _9p_rerror(req9p, msgtag, ENOMEM, plenout, preply);
 
 	/* set op_ctx, it will be useful if FSAL is later called */
 	_9p_init_opctx(pfid, req9p);
 
-	/* Initiate xattr's fid by copying file's fid in it */
+	/* Initiate xattr's fid by copying file's fid in it.
+	 * Don't copy the state_t pointer.
+	 */
 	memcpy((char *)pxattrfid, (char *)pfid, sizeof(struct _9p_fid));
+	pxattrfid->state = NULL;
 
-	snprintf(name, MAXNAMLEN, "%.*s", *name_len, name_str);
+	snprintf(name, sizeof(name), "%.*s", *name_len, name_str);
 
-	pxattrfid->specdata.xattr.xattr_content = gsh_malloc(XATTR_BUFFERSIZE);
-	if (pxattrfid->specdata.xattr.xattr_content == NULL) {
-		gsh_free(pxattrfid);
-		return _9p_rerror(req9p, msgtag, ENOMEM, plenout, preply);
-	}
+	pxattrfid->xattr = gsh_malloc(sizeof(*pxattrfid->xattr) +
+				      XATTR_BUFFERSIZE);
 
 	if (*name_len == 0) {
 		/* xattrwalk is used with an empty name,
 		 * this is a listxattr request */
-		fsal_status =
-		    pxattrfid->pentry->obj_handle->obj_ops.list_ext_attrs(
-			pxattrfid->pentry->obj_handle,
+		fsal_status = pxattrfid->pentry->obj_ops->list_ext_attrs(
+			pxattrfid->pentry,
 			FSAL_XATTR_RW_COOKIE,	/* Start with RW cookie,
 						 * hiding RO ones */
-			 xattrs_arr,
-			 XATTRS_ARRAY_LEN, /** @todo fix static length */
-			 &nb_xattrs_read,
-			 &eod_met);
+			xattrs_arr,
+			XATTRS_ARRAY_LEN, /** @todo fix static length */
+			&nb_xattrs_read,
+			&eod_met);
 
 		if (FSAL_IS_ERROR(fsal_status)) {
-			gsh_free(pxattrfid->specdata.xattr.xattr_content);
+			gsh_free(pxattrfid->xattr);
 			gsh_free(pxattrfid);
 			return _9p_rerror(req9p, msgtag,
-					  _9p_tools_errno
-					  (cache_inode_error_convert
-					   (fsal_status)), plenout, preply);
+					  _9p_tools_errno(fsal_status), plenout,
+					  preply);
 		}
 
 		/* if all xattrent are not read,
 		 * returns ERANGE as listxattr does */
 		if (eod_met != true) {
-			gsh_free(pxattrfid->specdata.xattr.xattr_content);
+			gsh_free(pxattrfid->xattr);
 			gsh_free(pxattrfid);
 			return _9p_rerror(req9p, msgtag, ERANGE,
 					  plenout, preply);
 		}
 
-		xattr_cursor = pxattrfid->specdata.xattr.xattr_content;
+		xattr_cursor = pxattrfid->xattr->xattr_content;
 		attrsize = 0;
 		for (i = 0; i < nb_xattrs_read; i++) {
-			tmplen =
-			    snprintf(xattr_cursor, MAXNAMLEN, "%s",
-				     xattrs_arr[i].xattr_name);
-			xattr_cursor[tmplen] = '\0';	/* Just to be sure */
-			/* +1 for trailing '\0' */
-			xattr_cursor += tmplen + 1;
-			attrsize += tmplen + 1;
-
-			/* Make sure not to go beyond the buffer */
-			if (attrsize > XATTR_BUFFERSIZE) {
-				gsh_free(pxattrfid->specdata.xattr.
-					 xattr_content);
+			tmplen = strnlen(xattrs_arr[i].xattr_name, MAXNAMLEN);
+			/* Make sure not to go beyond the buffer
+			 * @todo realloc here too */
+			if (attrsize + tmplen + 1 > XATTR_BUFFERSIZE) {
+				gsh_free(pxattrfid->xattr);
 				gsh_free(pxattrfid);
 				return _9p_rerror(req9p, msgtag, ERANGE,
 						  plenout, preply);
 			}
+
+			memcpy(xattr_cursor, xattrs_arr[i].xattr_name, tmplen);
+			xattr_cursor[tmplen] = '\0';
+			/* +1 for trailing '\0' */
+			xattr_cursor += tmplen + 1;
+			attrsize += tmplen + 1;
+
 		}
 	} else {
-		/* xattrwalk has a non-empty name, use regular setxattr */
+		/* xattrwalk has a non-empty name, use regular getxattr */
 		fsal_status =
-		    pxattrfid->pentry->obj_handle->obj_ops.
-		    getextattr_id_by_name(pxattrfid->pentry->obj_handle,
-					  name,
-					  &pxattrfid->specdata.xattr.xattr_id);
+		    pxattrfid->pentry->obj_ops->getextattr_value_by_name(
+					     pxattrfid->pentry, name,
+					     pxattrfid->xattr->xattr_content,
+					     XATTR_BUFFERSIZE,
+					     &attrsize);
 
+		if (fsal_status.minor == ERANGE) {
+			/* we need a bigger buffer, do one more request with
+			 * 0-size to get length and reallocate/try again */
+			fsal_status =
+			   pxattrfid->pentry->obj_ops->getextattr_value_by_name(
+					     pxattrfid->pentry, name,
+					     pxattrfid->xattr->xattr_content,
+					     0, &attrsize);
+			if (FSAL_IS_ERROR(fsal_status)) {
+				gsh_free(pxattrfid->xattr);
+				gsh_free(pxattrfid);
 
+				/* fsal_status.minor is a valid errno code */
+				return _9p_rerror(req9p, msgtag,
+						  fsal_status.minor, plenout,
+						  preply);
+			}
+
+			/* Check our own limit too before reallocating */
+			if (attrsize > _9P_XATTR_MAX_SIZE) {
+				gsh_free(pxattrfid->xattr);
+				gsh_free(pxattrfid);
+
+				return _9p_rerror(req9p, msgtag, E2BIG,
+						  plenout, preply);
+			}
+
+			pxattrfid->xattr = gsh_realloc(pxattrfid->xattr,
+					sizeof(*pxattrfid->xattr) + attrsize);
+
+			fsal_status =
+			   pxattrfid->pentry->obj_ops->getextattr_value_by_name(
+					     pxattrfid->pentry, name,
+					     pxattrfid->xattr->xattr_content,
+					     attrsize, &attrsize);
+		}
 		if (FSAL_IS_ERROR(fsal_status)) {
-			gsh_free(pxattrfid->specdata.xattr.xattr_content);
+			gsh_free(pxattrfid->xattr);
 			gsh_free(pxattrfid);
 
 			/* ENOENT for xattr is ENOATTR */
 			if (fsal_status.major == ERR_FSAL_NOENT)
 				return _9p_rerror(req9p, msgtag, ENOATTR,
 						  plenout, preply);
-			else
-				return _9p_rerror(req9p, msgtag,
-						  _9p_tools_errno
-						  (cache_inode_error_convert
-						   (fsal_status)), plenout,
-						  preply);
-		}
-
-		fsal_status =
-		    pxattrfid->pentry->obj_handle->obj_ops.
-		    getextattr_value_by_name(pxattrfid->pentry->obj_handle,
-					     name,
-					     pxattrfid->specdata.xattr.
-					     xattr_content, XATTR_BUFFERSIZE,
-					     &attrsize);
-
-		if (FSAL_IS_ERROR(fsal_status)) {
-			gsh_free(pxattrfid->specdata.xattr.xattr_content);
-			gsh_free(pxattrfid);
 
 			/* fsal_status.minor is a valid errno code */
 			return _9p_rerror(req9p, msgtag,
 					  fsal_status.minor, plenout, preply);
 		}
 	}
+	pxattrfid->xattr->xattr_size = attrsize;
+	pxattrfid->xattr->xattr_write = _9P_XATTR_READ_ONLY;
 
 	req9p->pconn->fids[*attrfid] = pxattrfid;
 
 	/* Increments refcount as we're manually making a new copy */
-	(void) cache_inode_lru_ref(pfid->pentry, LRU_REQ_STALE_OK);
+	pfid->pentry->obj_ops->get_ref(pfid->pentry);
 
 	/* hold reference on gdata */
 	uid2grp_hold_group_data(pxattrfid->gdata);
 
-	get_gsh_export_ref(pfid->export);
+	get_gsh_export_ref(pfid->fid_export);
 	get_9p_user_cred_ref(pfid->ucred);
+
+	if (pxattrfid->ppentry != NULL) {
+		/* Increments refcount for ppentry */
+		pxattrfid->ppentry->obj_ops->get_ref(pxattrfid->ppentry);
+	}
 
 	/* Build the reply */
 	_9p_setinitptr(cursor, preply, _9P_RXATTRWALK);

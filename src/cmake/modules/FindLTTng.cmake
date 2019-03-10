@@ -36,7 +36,7 @@ find_path(LTTNG_INCLUDE_DIR
 find_path(LTTNG_LIBRARY_DIR
           NAMES liblttng-ust.so
           PATHS ${LTTNG_PATH_HINT}
-          PATH_SUFFIXES lib lib64
+	  PATH_SUFFIXES lib/${CMAKE_LIBRARY_ARCHITECTURE} lib lib64
           DOC "The LTTng libraries")
 
 find_library(LTTNG_UST_LIBRARY lttng-ust PATHS ${LTTNG_LIBRARY_DIR})
@@ -44,6 +44,22 @@ find_library(URCU_LIBRARY urcu-bp PATHS ${LTTNG_LIBRARY_DIR})
 find_library(UUID_LIBRARY uuid)
 
 set(LTTNG_LIBRARIES ${LTTNG_UST_LIBRARY} ${URCU_LIBRARY} ${UUID_LIBRARY})
+
+find_path(LTTNG_CTL_INCLUDE_DIR
+          NAMES lttng/lttng.h
+          PATHS ${LTTNG_PATH_HINT}
+          PATH_SUFFIXES include
+	  DOC "The LTTng CTL include headers")
+
+find_path(LTTNG_CTL_LIBRARY_DIR
+          NAMES liblttng-ctl.so
+          PATHS ${LTTNG_PATH_HINT}
+	  PATH_SUFFIXES lib/${CMAKE_LIBRARY_ARCHITECTURE} lib lib64
+          DOC "The LTTng libraries")
+
+find_library(LTTNG_CTL_LIBRARY lttng-ctl PATHS ${LTTNG_CTL_LIBRARY_DIR})
+
+set(LTTNG_CTL_LIBRARIES ${LTTNG_CTL_LIBRARY})
 
 message(STATUS "Looking for lttng executable...")
 set(LTTNG_NAMES "lttng;lttng-ctl")
@@ -61,8 +77,17 @@ find_program(LEX_PROGRAM
 # handle the QUIETLY and REQUIRED arguments and set PRELUDE_FOUND to TRUE if
 # all listed variables are TRUE
 include(FindPackageHandleStandardArgs)
-FIND_PACKAGE_HANDLE_STANDARD_ARGS(LTTNG
-                                  REQUIRED_VARS LTTNG_INCLUDE_DIR LTTNG_LIBRARY_DIR)
+FIND_PACKAGE_HANDLE_STANDARD_ARGS(
+	LTTng
+	REQUIRED_VARS
+		LTTNG_INCLUDE_DIR
+		LTTNG_LIBRARY_DIR
+		LTTNG_UST_LIBRARY
+		URCU_LIBRARY
+		UUID_LIBRARY
+		LTTNG_CTL_INCLUDE_DIR
+		LTTNG_CTL_LIBRARY_DIR
+	)
 # VERSION FPHSA options not handled by CMake version < 2.8.2)
 #                                  VERSION_VAR)
 mark_as_advanced(LTTNG_INCLUDE_DIR)

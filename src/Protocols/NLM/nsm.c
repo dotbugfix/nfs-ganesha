@@ -36,6 +36,9 @@ AUTH *nsm_auth;
 unsigned long nsm_count;
 char *nodename;
 
+/* retry timeout default to the moon and back */
+static const struct timespec tout = { 3, 0 };
+
 bool nsm_connect(void)
 {
 	struct utsname utsname;
@@ -51,22 +54,22 @@ bool nsm_connect(void)
 	}
 
 	nodename = gsh_strdup(utsname.nodename);
-	if (nodename == NULL) {
-		LogCrit(COMPONENT_NLM,
-			"failed to allocate memory for nodename");
-		return false;
-	}
 
-	nsm_clnt = gsh_clnt_create("localhost", SM_PROG, SM_VERS, "tcp");
+	nsm_clnt = clnt_ncreate("localhost", SM_PROG, SM_VERS, "tcp");
 
-	if (nsm_clnt == NULL) {
-		LogCrit(COMPONENT_NLM, "failed to connect to statd");
+	if (CLNT_FAILURE(nsm_clnt)) {
+		char *err = rpc_sperror(&nsm_clnt->cl_error, "failed");
+
+		LogCrit(COMPONENT_NLM, "connect to statd %s", err);
+		gsh_free(err);
+		CLNT_DESTROY(nsm_clnt);
+		nsm_clnt = NULL;
 		gsh_free(nodename);
 		nodename = NULL;
 	}
 
 	/* split auth (for authnone, idempotent) */
-	nsm_auth = authnone_create();
+	nsm_auth = authnone_ncreate();
 
 	return nsm_clnt != NULL;
 }
@@ -74,7 +77,7 @@ bool nsm_connect(void)
 void nsm_disconnect(void)
 {
 	if (nsm_count == 0 && nsm_clnt != NULL) {
-		gsh_clnt_destroy(nsm_clnt);
+		CLNT_DESTROY(nsm_clnt);
 		nsm_clnt = NULL;
 		AUTH_DESTROY(nsm_auth);
 		nsm_auth = NULL;
@@ -85,10 +88,11 @@ void nsm_disconnect(void)
 
 bool nsm_monitor(state_nsm_client_t *host)
 {
-	enum clnt_stat ret;
+	struct clnt_req *cc;
+	char *t;
 	struct mon nsm_mon;
 	struct sm_stat_res res;
-	struct timeval tout = { 25, 0 };
+	enum clnt_stat ret;
 
 	if (host == NULL)
 		return true;
@@ -113,7 +117,7 @@ bool nsm_monitor(state_nsm_client_t *host)
 	/* create a connection to nsm on the localhost */
 	if (!nsm_connect()) {
 		LogCrit(COMPONENT_NLM,
-			"Can not monitor %s clnt_create returned NULL",
+			"Monitor %s nsm_connect failed",
 			nsm_mon.mon_id.mon_name);
 		PTHREAD_MUTEX_unlock(&nsm_mutex);
 		PTHREAD_MUTEX_unlock(&host->ssc_mutex);
@@ -123,31 +127,33 @@ bool nsm_monitor(state_nsm_client_t *host)
 	/* Set this after we call nsm_connect() */
 	nsm_mon.mon_id.my_id.my_name = nodename;
 
-	ret = clnt_call(nsm_clnt,
-			nsm_auth,
-			SM_MON,
-			(xdrproc_t) xdr_mon,
-			&nsm_mon,
-			(xdrproc_t) xdr_sm_stat_res,
-			&res,
-			tout);
+	cc = gsh_malloc(sizeof(*cc));
+	clnt_req_fill(cc, nsm_clnt, nsm_auth, SM_MON,
+		      (xdrproc_t) xdr_mon, &nsm_mon,
+		      (xdrproc_t) xdr_sm_stat_res, &res);
+	ret = clnt_req_setup(cc, tout);
+	if (ret == RPC_SUCCESS) {
+		ret = CLNT_CALL_WAIT(cc);
+	}
 
 	if (ret != RPC_SUCCESS) {
+		t = rpc_sperror(&cc->cc_error, "failed");
 		LogCrit(COMPONENT_NLM,
-			"Can not monitor %s SM_MON ret %d %s",
-			nsm_mon.mon_id.mon_name,
-			ret,
-			clnt_sperror(nsm_clnt, ""));
+			"Monitor %s SM_MON %s",
+			nsm_mon.mon_id.mon_name, t);
+		gsh_free(t);
 
+		clnt_req_release(cc);
 		nsm_disconnect();
 		PTHREAD_MUTEX_unlock(&nsm_mutex);
 		PTHREAD_MUTEX_unlock(&host->ssc_mutex);
 		return false;
 	}
+	clnt_req_release(cc);
 
 	if (res.res_stat != STAT_SUCC) {
 		LogCrit(COMPONENT_NLM,
-			"Can not monitor %s SM_MON status %d",
+			"Monitor %s SM_MON failed (%d)",
 			nsm_mon.mon_id.mon_name, res.res_stat);
 
 		nsm_disconnect();
@@ -170,10 +176,11 @@ bool nsm_monitor(state_nsm_client_t *host)
 
 bool nsm_unmonitor(state_nsm_client_t *host)
 {
-	enum clnt_stat ret;
+	struct clnt_req *cc;
+	char *t;
 	struct sm_stat res;
 	struct mon_id nsm_mon_id;
-	struct timeval tout = { 25, 0 };
+	enum clnt_stat ret;
 
 	if (host == NULL)
 		return true;
@@ -195,7 +202,7 @@ bool nsm_unmonitor(state_nsm_client_t *host)
 	/* create a connection to nsm on the localhost */
 	if (!nsm_connect()) {
 		LogCrit(COMPONENT_NLM,
-			"Can not unmonitor %s clnt_create returned NULL",
+			"Unmonitor %s nsm_connect failed",
 			nsm_mon_id.mon_name);
 		PTHREAD_MUTEX_unlock(&nsm_mutex);
 		PTHREAD_MUTEX_unlock(&host->ssc_mutex);
@@ -205,32 +212,34 @@ bool nsm_unmonitor(state_nsm_client_t *host)
 	/* Set this after we call nsm_connect() */
 	nsm_mon_id.my_id.my_name = nodename;
 
-	ret = clnt_call(nsm_clnt,
-			nsm_auth,
-			SM_UNMON,
-			(xdrproc_t) xdr_mon_id,
-			&nsm_mon_id,
-			(xdrproc_t) xdr_sm_stat,
-			&res,
-			tout);
+	cc = gsh_malloc(sizeof(*cc));
+	clnt_req_fill(cc, nsm_clnt, nsm_auth, SM_UNMON,
+		      (xdrproc_t) xdr_mon_id, &nsm_mon_id,
+		      (xdrproc_t) xdr_sm_stat, &res);
+	ret = clnt_req_setup(cc, tout);
+	if (ret == RPC_SUCCESS) {
+		ret = CLNT_CALL_WAIT(cc);
+	}
 
 	if (ret != RPC_SUCCESS) {
+		t = rpc_sperror(&cc->cc_error, "failed");
 		LogCrit(COMPONENT_NLM,
-			"Can not unmonitor %s SM_MON ret %d %s",
-			nsm_mon_id.mon_name,
-			ret,
-			clnt_sperror(nsm_clnt, ""));
+			"Unmonitor %s SM_MON %s",
+			nsm_mon_id.mon_name, t);
+		gsh_free(t);
 
+		clnt_req_release(cc);
 		nsm_disconnect();
 		PTHREAD_MUTEX_unlock(&nsm_mutex);
 		PTHREAD_MUTEX_unlock(&host->ssc_mutex);
 		return false;
 	}
+	clnt_req_release(cc);
 
 	atomic_store_int32_t(&host->ssc_monitored, false);
 	nsm_count--;
 
-	LogDebug(COMPONENT_NLM, "Unonitored %s for nodename %s",
+	LogDebug(COMPONENT_NLM, "Unmonitored %s for nodename %s",
 		 nsm_mon_id.mon_name, nodename);
 
 	nsm_disconnect();
@@ -242,10 +251,11 @@ bool nsm_unmonitor(state_nsm_client_t *host)
 
 void nsm_unmonitor_all(void)
 {
-	enum clnt_stat ret;
+	struct clnt_req *cc;
+	char *t;
 	struct sm_stat res;
 	struct my_id nsm_id;
-	struct timeval tout = { 25, 0 };
+	enum clnt_stat ret;
 
 	nsm_id.my_prog = NLMPROG;
 	nsm_id.my_vers = NLM4_VERS;
@@ -256,7 +266,7 @@ void nsm_unmonitor_all(void)
 	/* create a connection to nsm on the localhost */
 	if (!nsm_connect()) {
 		LogCrit(COMPONENT_NLM,
-			"Can not unmonitor all clnt_create returned NULL");
+			"Unmonitor all nsm_connect failed");
 		PTHREAD_MUTEX_unlock(&nsm_mutex);
 		return;
 	}
@@ -264,21 +274,23 @@ void nsm_unmonitor_all(void)
 	/* Set this after we call nsm_connect() */
 	nsm_id.my_name = nodename;
 
-	ret = clnt_call(nsm_clnt,
-			nsm_auth,
-			SM_UNMON_ALL,
-			(xdrproc_t) xdr_my_id,
-			&nsm_id,
-			(xdrproc_t) xdr_sm_stat,
-			&res,
-			tout);
+	cc = gsh_malloc(sizeof(*cc));
+	clnt_req_fill(cc, nsm_clnt, nsm_auth, SM_UNMON_ALL,
+		      (xdrproc_t) xdr_my_id, &nsm_id,
+		      (xdrproc_t) xdr_sm_stat, &res);
+	ret = clnt_req_setup(cc, tout);
+	if (ret == RPC_SUCCESS) {
+		ret = CLNT_CALL_WAIT(cc);
+	}
 
 	if (ret != RPC_SUCCESS) {
+		t = rpc_sperror(&cc->cc_error, "failed");
 		LogCrit(COMPONENT_NLM,
-			"Can not unmonitor all ret %d %s",
-			ret,
-			clnt_sperror(nsm_clnt, ""));
+			"Unmonitor all %s",
+			t);
+		gsh_free(t);
 	}
+	clnt_req_release(cc);
 
 	nsm_disconnect();
 	PTHREAD_MUTEX_unlock(&nsm_mutex);

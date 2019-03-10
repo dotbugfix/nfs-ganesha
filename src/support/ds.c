@@ -48,6 +48,11 @@ struct server_by_id {
 
 static struct server_by_id server_by_id;
 
+/** List of all active data servers,
+  * protected by server_by_id.lock
+  */
+static struct glist_head dslist;
+
 /**
  * @brief Compute cache slot for an entry
  *
@@ -89,7 +94,7 @@ static int server_id_cmpf(const struct avltree_node *lhs,
 
 struct fsal_pnfs_ds *pnfs_ds_alloc(void)
 {
-	return gsh_calloc(sizeof(struct fsal_pnfs_ds), 1);
+	return gsh_calloc(1, sizeof(struct fsal_pnfs_ds));
 }
 
 /**
@@ -131,6 +136,7 @@ bool pnfs_ds_insert(struct fsal_pnfs_ds *pds)
 
 	/* update cache */
 	atomic_store_voidptr(cache_slot, &pds->ds_node);
+	glist_add_tail(&dslist, &pds->ds_list);
 
 	pnfs_ds_get_ref(pds);		/* == 2 */
 	if (pds->mds_export != NULL) {
@@ -249,6 +255,9 @@ void pnfs_ds_remove(uint16_t id_servers, bool final)
 
 		pds = avltree_container_of(node, struct fsal_pnfs_ds, ds_node);
 
+		/* Remove the DS from the DS list */
+		glist_del(&pds->ds_list);
+
 		/* Eliminate repeated locks during draining. Idempotent. */
 		pds->pnfs_ds_status = PNFS_DS_STALE;
 	}
@@ -283,6 +292,33 @@ void pnfs_ds_remove(uint16_t id_servers, bool final)
 }
 
 /**
+ * @brief Remove all DSs left in the system
+ *
+ * Make sure all DSs are freed on shutdown.  This will catch all DSs not
+ * associated with an export.
+ *
+ */
+void remove_all_dss(void)
+{
+	struct glist_head tmplist, *glist, *glistn;
+	struct fsal_pnfs_ds *pds;
+
+	glist_init(&tmplist);
+
+	/* pnfs_ds_remove() take the lock, so move the entire list to a tmp head
+	 * under the lock, then process it outside the lock. */
+	PTHREAD_RWLOCK_wrlock(&server_by_id.lock);
+	glist_splice_tail(&tmplist, &dslist);
+	PTHREAD_RWLOCK_unlock(&server_by_id.lock);
+
+	/* Now we can safely process the list without the lock */
+	glist_for_each_safe(glist, glistn, &tmplist) {
+		pds = glist_entry(glist, struct fsal_pnfs_ds, ds_list);
+		pnfs_ds_remove(pds->id_servers, true);
+	}
+}
+
+/**
  * @brief Commit a FSAL sub-block
  *
  * Use the Name parameter passed in via the self_struct to lookup the
@@ -292,7 +328,7 @@ void pnfs_ds_remove(uint16_t id_servers, bool final)
  * fsal method can process the rest of the parameters in the block
  */
 
-static int fsal_commit(void *node, void *link_mem, void *self_struct,
+static int fsal_cfg_commit(void *node, void *link_mem, void *self_struct,
 		       struct config_error_type *err_type)
 {
 	struct fsal_args *fp = self_struct;
@@ -317,16 +353,22 @@ static int fsal_commit(void *node, void *link_mem, void *self_struct,
 		fsal_put(fsal);
 		LogCrit(COMPONENT_CONFIG,
 			"Could not create pNFS DS");
+		LogFullDebug(COMPONENT_FSAL,
+			     "FSAL %s refcount %"PRIu32,
+			     fsal->name,
+			     atomic_fetch_int32_t(&fsal->refcount));
 		err_type->init = true;
 		errcnt++;
 	}
 
 	LogEvent(COMPONENT_CONFIG,
-		 "DS %d fsal_commit at FSAL (%s) with path (%s)",
+		 "DS %d fsal config commit at FSAL (%s) with path (%s)",
 		 pds->id_servers, pds->fsal->name, pds->fsal->path);
 
 err:
 	release_root_op_context();
+	/* Don't leak the FSAL block */
+	err_type->dispose = true;
 	return errcnt;
 }
 
@@ -340,7 +382,14 @@ err:
 
 static void *pds_init(void *link_mem, void *self_struct)
 {
-	if (self_struct == NULL) {
+	static struct fsal_pnfs_ds special_ds;
+
+	if (link_mem == (void *)~0UL) {
+		/* This is the special case of no config.  We cannot malloc
+		 * this, as it's never committed, so it's leaked. */
+		memset(&special_ds, 0, sizeof(special_ds));
+		return &special_ds;
+	} else if (self_struct == NULL) {
 		return pnfs_ds_alloc();
 	} else { /* free resources case */
 		pnfs_ds_free(self_struct);
@@ -404,7 +453,7 @@ static void pds_display(const char *step, void *node,
  * @brief Table of FSAL sub-block parameters
  *
  * NOTE: this points to a struct that is private to
- * fsal_commit.
+ * fsal_cfg_commit.
  */
 
 static struct config_item fsal_params[] = {
@@ -426,7 +475,7 @@ static struct config_item pds_items[] = {
 	CONF_ITEM_UI16("Number", 0, UINT16_MAX, 0,
 		       fsal_pnfs_ds, id_servers),
 	CONF_RELAX_BLOCK("FSAL", fsal_params,
-			 fsal_init, fsal_commit,
+			 fsal_init, fsal_cfg_commit,
 			 fsal_pnfs_ds, fsal),
 	CONFIG_EOL
 };
@@ -486,5 +535,7 @@ void server_pkginit(void)
 #endif
 	PTHREAD_RWLOCK_init(&server_by_id.lock, &rwlock_attr);
 	avltree_init(&server_by_id.t, server_id_cmpf, 0);
+	glist_init(&dslist);
 	memset(&server_by_id.cache, 0, sizeof(server_by_id.cache));
+	pthread_rwlockattr_destroy(&rwlock_attr);
 }

@@ -93,26 +93,27 @@ static enum load_state {
 
 
 /**
- * @brief Start the PSEUDOFS FSAL
+ * @brief Start a static FSAL
  *
- * The pseudofs fsal is static (always present) so it needs its own
- * startup.  This is a stripped down version of load_fsal() that is
- * done very early in server startup.
+ * Start a FSAL that's statically linked in.
+ *
+ * @param[in] name	FSAL name
+ * @param[in] init	Initialization function for FSAL
  */
 
-static void load_fsal_pseudo(void)
+static void load_fsal_static(const char *name, void (*init)(void))
 {
+	char pname[24];
 	char *dl_path;
 	struct fsal_module *fsal;
 
-	dl_path = gsh_strdup("Builtin-PseudoFS");
-	if (dl_path == NULL)
-		LogFatal(COMPONENT_INIT, "Couldn't Register FSAL_PSEUDO");
+	snprintf(pname, sizeof(pname), "Builtin-%s", name);
+	dl_path = gsh_strdup(pname);
 
 	PTHREAD_MUTEX_lock(&fsal_lock);
 
 	if (load_state != idle)
-		LogFatal(COMPONENT_INIT, "Couldn't Register FSAL_PSEUDO");
+		LogFatal(COMPONENT_INIT, "Couldn't Register FSAL_%s", name);
 
 	if (dl_error) {
 		gsh_free(dl_error);
@@ -124,12 +125,12 @@ static void load_fsal_pseudo(void)
 	PTHREAD_MUTEX_unlock(&fsal_lock);
 
 	/* now it is the module's turn to register itself */
-	pseudo_fsal_init();
+	init();
 
 	PTHREAD_MUTEX_lock(&fsal_lock);
 
 	if (load_state != registered)
-		LogFatal(COMPONENT_INIT, "Couldn't Register FSAL_PSEUDO");
+		LogFatal(COMPONENT_INIT, "Couldn't Register FSAL_%s", name);
 
 	/* we now finish things up, doing things the module can't see */
 
@@ -155,8 +156,11 @@ void start_fsals(void)
 	/* .init was a long time ago... */
 	load_state = idle;
 
+	/* Load FSAL_MDCACHE */
+	load_fsal_static("MDCACHE", mdcache_fsal_init);
+
 	/* Load FSAL_PSEUDO */
-	load_fsal_pseudo();
+	load_fsal_static("PSEUDO", pseudo_fsal_init);
 }
 
 /**
@@ -189,7 +193,7 @@ static const char *pathfmt = "%s/libfsal%s.so";
 int load_fsal(const char *name,
 	      struct fsal_module **fsal_hdl_p)
 {
-	void *dl;
+	void *dl = NULL;
 	int retval = EBUSY;	/* already loaded */
 	char *dl_path;
 	struct fsal_module *fsal;
@@ -209,8 +213,7 @@ int load_fsal(const char *name,
 		bp++;
 	}
 	dl_path = gsh_strdup(path);
-	if (dl_path == NULL)
-		return ENOMEM;
+
 	PTHREAD_MUTEX_lock(&fsal_lock);
 	if (load_state != idle)
 		goto errout;
@@ -223,23 +226,18 @@ int load_fsal(const char *name,
 	PTHREAD_MUTEX_unlock(&fsal_lock);
 
 	LogDebug(COMPONENT_INIT, "Loading FSAL %s with %s", name, path);
-#ifdef LINUX
+#if defined(LINUX) && !defined(SANITIZE_ADDRESS)
 	dl = dlopen(path, RTLD_NOW | RTLD_LOCAL | RTLD_DEEPBIND);
-#elif FREEBSD
+#elif defined(FREEBSD) || defined(SANITIZE_ADDRESS)
 	dl = dlopen(path, RTLD_NOW | RTLD_LOCAL);
 #endif
 
 	PTHREAD_MUTEX_lock(&fsal_lock);
 	if (dl == NULL) {
-#ifdef ELIBACC
-		retval = ELIBACC;	/* hand craft a meaningful error */
-#else
-		retval = EPERM;	/* ELIBACC does not exist on MacOS */
-#endif
-		dl_error = gsh_strdup(dlerror());
-		LogCrit(COMPONENT_INIT, "Could not dlopen module:%s Error:%s",
-			path, dl_error);
-		goto errout;
+		dl_error = dlerror();
+		LogFatal(COMPONENT_INIT,
+			 "Could not dlopen module: %s Error: %s. You might want to install the nfs-ganesha-%s package",
+			 path, dl_error, name);
 	}
 	dlerror();	/* clear it */
 
@@ -295,7 +293,11 @@ int load_fsal(const char *name,
 	new_fsal = NULL;
 
 	/* take initial ref so we can pass it back... */
-	atomic_inc_int32_t(&fsal->refcount);
+	fsal_get(fsal);
+
+	LogFullDebug(COMPONENT_FSAL,
+		     "FSAL %s refcount %"PRIu32,
+		     name, atomic_fetch_int32_t(&fsal->refcount));
 
 	fsal->path = dl_path;
 	fsal->dl_handle = dl;
@@ -338,9 +340,13 @@ struct fsal_module *lookup_fsal(const char *name)
 	glist_for_each(entry, &fsal_list) {
 		fsal = glist_entry(entry, struct fsal_module, fsals);
 		if (strcasecmp(name, fsal->name) == 0) {
-			atomic_inc_int32_t(&fsal->refcount);
+			fsal_get(fsal);
 			PTHREAD_MUTEX_unlock(&fsal_lock);
 			op_ctx->fsal_module = fsal;
+			LogFullDebug(COMPONENT_FSAL,
+				     "FSAL %s refcount %"PRIu32,
+				     name,
+				     atomic_fetch_int32_t(&fsal->refcount));
 			return fsal;
 		}
 	}
@@ -399,13 +405,8 @@ int register_fsal(struct fsal_module *fsal_hdl, const char *name,
 		goto errout;
 	}
 	new_fsal = fsal_hdl;
-	if (name != NULL) {
+	if (name != NULL)
 		new_fsal->name = gsh_strdup(name);
-		if (new_fsal->name == NULL) {
-			so_error = ENOMEM;
-			goto errout;
-		}
-	}
 
 	/* init ops vector to system wide defaults
 	 * from FSAL/default_methods.c
@@ -419,6 +420,7 @@ int register_fsal(struct fsal_module *fsal_hdl, const char *name,
 		PTHREAD_RWLOCK_PREFER_WRITER_NONRECURSIVE_NP);
 #endif
 	PTHREAD_RWLOCK_init(&fsal_hdl->lock, &attrs);
+	pthread_rwlockattr_destroy(&attrs);
 	glist_init(&fsal_hdl->servers);
 	glist_init(&fsal_hdl->handles);
 	glist_init(&fsal_hdl->exports);
@@ -431,10 +433,9 @@ int register_fsal(struct fsal_module *fsal_hdl, const char *name,
 	return 0;
 
  errout:
-	if (fsal_hdl->path)
-		gsh_free(fsal_hdl->path);
-	if (fsal_hdl->name)
-		gsh_free(fsal_hdl->name);
+
+	gsh_free(fsal_hdl->path);
+	gsh_free(fsal_hdl->name);
 	load_state = error;
 	PTHREAD_MUTEX_unlock(&fsal_lock);
 	LogCrit(COMPONENT_INIT, "FSAL \"%s\" failed to register because: %s",
@@ -466,10 +467,8 @@ int unregister_fsal(struct fsal_module *fsal_hdl)
 			fsal_hdl->name, refcount);
 		return EBUSY;
 	}
-	if (fsal_hdl->path)
-		gsh_free(fsal_hdl->path);
-	if (fsal_hdl->name)
-		gsh_free(fsal_hdl->name);
+	gsh_free(fsal_hdl->path);
+	gsh_free(fsal_hdl->name);
 	return 0;
 }
 
@@ -493,11 +492,10 @@ void *fsal_init(void *link_mem, void *self_struct)
 	if (link_mem == NULL) {
 		return self_struct; /* NOP */
 	} else if (self_struct == NULL) {
-		return gsh_calloc(sizeof(struct fsal_args), 1);
+		return gsh_calloc(1, sizeof(struct fsal_args));
 	} else {
 		fp = self_struct;
-		if (fp->name != NULL)
-			gsh_free(fp->name);
+		gsh_free(fp->name);
 		gsh_free(fp);
 		return NULL;
 	}
@@ -555,6 +553,11 @@ int fsal_load_init(void *node, const char *name, struct fsal_module **fsal_hdl,
 					  name);
 			fsal_put(*fsal_hdl);
 			err_type->fsal = true;
+			LogFullDebug(COMPONENT_FSAL,
+				     "FSAL %s refcount %"PRIu32,
+				     name,
+				     atomic_fetch_int32_t(
+						&(*fsal_hdl)->refcount));
 			return 1;
 		}
 	}

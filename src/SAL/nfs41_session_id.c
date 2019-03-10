@@ -36,12 +36,16 @@
 
 #include "config.h"
 #include "nfs_core.h"
+#include "nfs_proto_functions.h"
 #include "sal_functions.h"
+#ifdef USE_LTTNG
+#include "gsh_lttng/nfs4.h"
+#endif
 
 /**
  * @brief Pool for allocating session data
  */
-pool_t *nfs41_session_pool = NULL;
+pool_t *nfs41_session_pool;
 
 /**
  * @param Session ID hash
@@ -53,7 +57,7 @@ hash_table_t *ht_session_id;
  * @param counter for creating session IDs.
  */
 
-uint64_t global_sequence = 0;
+uint64_t global_sequence;
 
 /**
  * @brief Display a session ID
@@ -231,16 +235,22 @@ void nfs41_Build_sessionid(clientid4 *clientid, char *sessionid)
 	memcpy(sessionid + sizeof(clientid4), &seq, sizeof(seq));
 }
 
-int32_t inc_session_ref(nfs41_session_t *session)
+int32_t _inc_session_ref(nfs41_session_t *session, const char *func, int line)
 {
 	int32_t refcnt = atomic_inc_int32_t(&session->refcount);
+#ifdef USE_LTTNG
+	tracepoint(nfs4, session_ref, func, line, session, refcnt);
+#endif
 	return refcnt;
 }
 
-int32_t dec_session_ref(nfs41_session_t *session)
+int32_t _dec_session_ref(nfs41_session_t *session, const char *func, int line)
 {
 	int i;
 	int32_t refcnt = atomic_dec_int32_t(&session->refcount);
+#ifdef USE_LTTNG
+	tracepoint(nfs4, session_unref, func, line, session, refcnt);
+#endif
 
 	if (refcnt == 0) {
 
@@ -254,8 +264,17 @@ int32_t dec_session_ref(nfs41_session_t *session)
 		dec_client_id_ref(session->clientid_record);
 		/* Destroy this session's mutexes and condition variable */
 
-		for (i = 0; i < NFS41_NB_SLOTS; i++)
-			PTHREAD_MUTEX_destroy(&session->slots[i].lock);
+		for (i = 0; i < session->nb_slots; i++) {
+			nfs41_session_slot_t *slot;
+
+			slot = &session->fc_slots[i];
+			PTHREAD_MUTEX_destroy(&slot->lock);
+			if (slot->cached_result.res_cached) {
+				slot->cached_result.res_cached = false;
+				nfs4_Compound_Free((nfs_res_t *)
+						   &slot->cached_result);
+			}
+		}
 
 		PTHREAD_COND_destroy(&session->cb_cond);
 		PTHREAD_MUTEX_destroy(&session->cb_mutex);
@@ -263,6 +282,10 @@ int32_t dec_session_ref(nfs41_session_t *session)
 		/* Destroy the session's back channel (if any) */
 		if (session->flags & session_bc_up)
 			nfs_rpc_destroy_chan(&session->cb_chan);
+
+		/* Free the slot tables */
+		gsh_free(session->fc_slots);
+		gsh_free(session->bc_slots);
 
 		/* Free the memory for the session */
 		pool_free(nfs41_session_pool, session);
@@ -332,7 +355,7 @@ int nfs41_Session_Get_Pointer(char sessionid[NFS4_SESSIONID_SIZE],
 	struct gsh_buffdesc key;
 	struct gsh_buffdesc val;
 	struct hash_latch latch;
-	char str[LOG_BUFF_LEN];
+	char str[LOG_BUFF_LEN] = "\0";
 	struct display_buffer dspbuf = {sizeof(str), str, str};
 	bool str_valid = false;
 	hash_error_t code;
@@ -404,6 +427,82 @@ int nfs41_Session_Del(char sessionid[NFS4_SESSIONID_SIZE])
 void nfs41_Session_PrintAll(void)
 {
 	hashtable_log(COMPONENT_SESSIONS, ht_session_id);
+}
+
+bool check_session_conn(nfs41_session_t *session,
+			compound_data_t *data,
+			bool can_associate)
+{
+	int i, num;
+	sockaddr_t addr;
+	bool associate = false;
+
+	/* Copy the address coming over the wire. */
+	copy_xprt_addr(&addr, data->req->rq_xprt);
+
+	PTHREAD_RWLOCK_rdlock(&session->conn_lock);
+
+retry:
+
+	/* Save number of connections for use outside the lock */
+	num = session->num_conn;
+
+	for (i = 0; i < session->num_conn; i++) {
+		if (isFullDebug(COMPONENT_SESSIONS)) {
+			char str1[LOG_BUFF_LEN / 2] = "\0";
+			char str2[LOG_BUFF_LEN / 2] = "\0";
+			struct display_buffer db1 = {sizeof(str1), str1, str1};
+			struct display_buffer db2 = {sizeof(str2), str2, str2};
+
+			display_sockaddr(&db1, &addr);
+			display_sockaddr(&db2, &session->connections[i]);
+			LogFullDebug(COMPONENT_SESSIONS,
+				     "Comparing addr %s for %s to Session bound addr %s",
+				     str1, data->opname, str2);
+		}
+
+		if (cmp_sockaddr(&addr, &session->connections[i], false)) {
+			/* We found a match */
+			PTHREAD_RWLOCK_unlock(&session->conn_lock);
+			return true;
+		}
+	}
+
+	if (!can_associate || num == NFS41_MAX_CONNECTIONS) {
+		/* We either aren't allowd to associate a new address or there
+		 * is no room.
+		 */
+		PTHREAD_RWLOCK_unlock(&session->conn_lock);
+
+		if (isDebug(COMPONENT_SESSIONS)) {
+			char str1[LOG_BUFF_LEN / 2] = "\0";
+			struct display_buffer db1 = {sizeof(str1), str1, str1};
+
+			display_sockaddr(&db1, &addr);
+			LogDebug(COMPONENT_SESSIONS,
+				     "Found no match for addr %s for %s",
+				     str1, data->opname);
+		}
+
+		return false;
+	}
+
+	if (!associate) {
+		/* First pass was with read lock, now acquire write lock and
+		 * try again.
+		 */
+		associate = true;
+		PTHREAD_RWLOCK_unlock(&session->conn_lock);
+		PTHREAD_RWLOCK_wrlock(&session->conn_lock);
+		goto retry;
+	}
+
+	/* Add the new connection. */
+	memcpy(&session->connections[session->num_conn++], &addr, sizeof(addr));
+
+	PTHREAD_RWLOCK_unlock(&session->conn_lock);
+
+	return true;
 }
 
 /** @} */

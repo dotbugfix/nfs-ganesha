@@ -6,6 +6,7 @@
 
 #include "config.h"
 #include "config_parsing.h"
+#include "conf_url.h"
 #include "analyse.h"
 #include "abstract_mem.h"
 #include "conf_yacc.h"
@@ -39,17 +40,22 @@ do { \
 #define DEBUG_LEX(...) (void)0
 #endif
 
+#define BS_FLAG_NONE  0
+#define BS_FLAG_URL   1
+
 struct bufstack {
 	struct bufstack *prev;
 	YY_BUFFER_STATE bs;
 	int lineno;
 	char *filename;
 	FILE *f;
+	char *fbuf;
+	uint32_t flags;
 };
 
 static char *filter_string(char *src, int esc);
-static int new_file(char *filename,
-	     struct parser_state *st);
+static int new_file(char *filename, struct parser_state *st);
+static int fetch_url(char *name_tok, struct parser_state *st);
 static int pop_file(struct parser_state *st);
 
 %}
@@ -91,13 +97,13 @@ ON           [Oo][Nn]
 NO           [Nn][Oo]
 FALSE        [Ff][Aa][Ll][Ss][Ee]
 OFF          [Oo][Ff][Ff]
-OCTNUM       0[1-7][0-7]*
+OCTNUM       0[0-7][0-7]*
 HEXNUM       0[xX][0-9a-fA-F]+
 DECNUM       (0|[1-9][0-9]*)
 NINEP        9[pP]
 
 INCLPATH     \/?([a-zA-Z0-9\-\.\_])+(\/[a-zA-Z0-9\-\.\_]+)*
-PATHNAME     (\/[a-zA-Z0-9\-\.\_]+)\/?
+PATHNAME     \/([a-zA-Z0-9\-\.\_]+\/?)?
 LONGPATH     (\/?[a-zA-Z0-9\-\.\_]+(\/[a-zA-Z0-9\-\.\_]+)+)\/?
 TOKEN_CHARS  [a-zA-Z_\?][a-zA-Z0-9\._\-]*
 
@@ -108,9 +114,14 @@ WILDCARD     ({WC}*{WP})+{WC}*
 
 COMMENTEXT	 #.*$
 ID_CHARS [a-zA-Z_][a-zA-Z0-9_\-]*
+NETGROUP_CHARS [a-zA-Z_][a-zA-Z0-9_.\-]*
+
+/* URL types, e.g., (rados|http|ftp) */
+URLTYPES     (rados)
+INCLUDE_URL  {URLTYPES}:\/\/[a-zA-Z0-9\-\.\_&=\/]+
 
 /* INCLUDE state is used for picking the name of the include file */
-%START YY_INIT DEFINITION TERM INCLUDE
+%START YY_INIT DEFINITION TERM INCLUDE URL
 
 %%
 %{
@@ -143,6 +154,39 @@ ID_CHARS [a-zA-Z_][a-zA-Z0-9_\-]*
 
 		DEBUG_LEX("Calling new_file with quoted %s\n", yytext);
 		c = new_file(yytext, stp);
+		if (c == ENOMEM)
+			yyterminate();
+		BEGIN YY_INIT;
+		DEBUG_LEX("done new file\n");
+	}
+}
+
+<YY_INIT>"%url" { /* URL include file start */
+	DEBUG_LEX("URL\n");
+	BEGIN URL;
+	/* not a token, return nothing */
+}
+
+<URL>{INCLUDE_URL} {
+
+	{
+		int c;
+
+		DEBUG_LEX("Calling new_file with unquoted %s\n", yytext);
+		c = fetch_url(yytext, stp);
+		if (c == ENOMEM)
+			yyterminate();
+		BEGIN YY_INIT;
+		DEBUG_LEX("done new file\n");
+	}
+}
+
+<URL>\"{INCLUDE_URL}\" {
+	{
+		int c;
+
+		DEBUG_LEX("Calling new_file with quoted %s\n", yytext);
+		c = fetch_url(yytext, stp);
 		if (c == ENOMEM)
 			yyterminate();
 		BEGIN YY_INIT;
@@ -298,7 +342,7 @@ ID_CHARS [a-zA-Z_][a-zA-Z0-9_\-]*
 		return TOK_V6CIDR;
 }
 
-<TERM>{AT}{ID_CHARS} { /* a netgroup used for clients */
+<TERM>{AT}{NETGROUP_CHARS} { /* a netgroup used for clients */
 	DEBUG_LEX(" netgroup :%s", yytext);
 	yylval->token = save_token(yytext, false, stp);
 	return TOK_NETGROUP;
@@ -361,8 +405,7 @@ int ganeshun_yy_init_parser(char *srcfile, struct parser_state *st)
 	int rc = ENOMEM;
 
 	confroot = gsh_calloc(1, sizeof(struct config_root));
-	if (confroot == NULL)
-		goto nospc;
+
 	glist_init(&confroot->root.node);
 	glist_init(&confroot->root.u.nterm.sub_nodes);
 	confroot->root.type = TYPE_ROOT;
@@ -371,10 +414,6 @@ int ganeshun_yy_init_parser(char *srcfile, struct parser_state *st)
 	rc = new_file(srcfile, st);
 	if (rc == 0)
 		confroot->root.filename = gsh_strdup(srcfile);
-	return rc;
-
-nospc:
-	st->err_type->resource = true;
 	return rc;
 }
 
@@ -419,18 +458,13 @@ static int new_file(char *name_tok,
 		} else {
 			confroot->conf_dir = gsh_strdup(".");
 		}
-		if (confroot->conf_dir == NULL)
-			goto errout;
 	}
 	if (filename[0] == '/') {
 		fullpath = gsh_strdup(filename);
-		if (fullpath == NULL)
-			goto errout;
 	} else {
-		fullpath = gsh_calloc(1, (strlen(filename) +
-					  strlen(confroot->conf_dir) + 2));
-		if (fullpath == NULL)
-			goto errout;
+		fullpath = gsh_malloc(strlen(filename) +
+				      strlen(confroot->conf_dir) + 2);
+
 		sprintf(fullpath, "%s/%s", confroot->conf_dir, filename);
 	}
 	/* loop detection */
@@ -444,13 +478,9 @@ static int new_file(char *name_tok,
 		}
 	}
 	bs = gsh_calloc(1, sizeof(struct bufstack));
-	if (bs == NULL) {
-		goto errout;
-	}
+
 	flist = gsh_calloc(1, sizeof(struct file_list));
-	if (flist == NULL) {
-		goto errout;
-	}
+
 	in_file = fopen(fullpath, "r" );
 	if (in_file == NULL) {
 		rc = errno;
@@ -480,14 +510,74 @@ errout:
 		st->err_type->resource = true;
 	else
 		st->err_type->scan = true;
-	if (flist != NULL)
-		gsh_free(flist);
-	if (bs != NULL)
-		gsh_free(bs);
-	if (fullpath != NULL)
-		gsh_free(fullpath);
+
+	gsh_free(flist);
+	gsh_free(bs);
+	gsh_free(fullpath);
+
 	return rc;
 }
+
+/* fetch_url */
+static int fetch_url(char *name_tok, struct parser_state *st)
+{
+	struct bufstack *bs = NULL;
+	YY_BUFFER_STATE inbuf;
+	struct file_list *flist = NULL;
+	struct file_list *fp;
+	void *yyscanner = st->scanner;
+	struct yyguts_t * yyg = (struct yyguts_t*)yyscanner;
+	struct config_root *confroot = st->root_node;
+	char *filename = NULL;
+	int rc = ENOMEM;
+
+#ifdef NO_URL_RECURSION
+	/* forbid URL chasing */
+	if (st->curbs && (st->curbs->flags & BS_FLAG_URL)) {
+		config_parse_error(yylloc, st,
+			"new url (%s) transitive fetch from (%s), ignored",
+			name_tok, st->curbs->filename);
+		goto errout;
+	}
+#endif
+	filename = gsh_strdup(name_tok);
+
+	bs = gsh_calloc(1, sizeof(struct bufstack));
+	flist = gsh_calloc(1, sizeof(struct file_list));
+
+	rc = config_url_fetch(filename, &bs->f, &bs->fbuf);
+	if (bs->f == NULL) {
+		config_parse_error(yylloc, st,
+			"new url (%s) open error (%s), ignored",
+			filename, strerror(rc));
+		goto errout;
+	}
+	bs->bs = ganeshun_yy_create_buffer(bs->f, YY_BUF_SIZE, yyscanner);
+	if (st->curbs)
+		st->curbs->lineno = yylineno;
+	bs->prev = st->curbs;
+	bs->filename = filename;
+	bs->flags = BS_FLAG_URL;
+	ganeshun_yy_switch_to_buffer(bs->bs, yyscanner);
+	st->current_file = gsh_strdup(bs->filename);
+	st->curbs = bs;
+	flist->pathname = gsh_strdup(bs->filename); /* XXX */
+	flist->next = confroot->files;
+	confroot->files = flist;
+	return 0;
+
+errout:
+	if (rc == ENOMEM)
+		st->err_type->resource = true;
+	else
+		st->err_type->scan = true;
+
+	gsh_free(flist);
+	gsh_free(bs);
+	gsh_free(filename);
+
+	return rc;
+} /* fetch_url() */
 
 static int pop_file(struct parser_state *st)
 {
@@ -498,7 +588,11 @@ static int pop_file(struct parser_state *st)
 
 	if (bs == NULL)
 		return 0;
-	fclose(bs->f);
+	if (bs->flags & BS_FLAG_URL) {
+		config_url_release(bs->f, bs->fbuf);
+	} else {
+		fclose(bs->f);
+	}
 	ganeshun_yy_delete_buffer(bs->bs, yyscanner);
 	prevbs = bs->prev;
 	st->curbs = prevbs;

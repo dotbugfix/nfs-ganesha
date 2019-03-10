@@ -91,17 +91,18 @@ static nfsstat4 ds_read(struct fsal_ds_handle *const ds_pub,
 		container_of(ds_pub, struct glfs_ds_handle, ds);
 	int    rc = 0;
 	struct glusterfs_export *glfs_export =
-	container_of(ds_pub->pds->mds_export->fsal_export,
+	container_of(ds_pub->pds->mds_fsal_export,
 		     struct glusterfs_export, export);
 
 	if (ds->glhandle == NULL)
-		LogDebug(COMPONENT_PNFS, "ds_read glhandle NULL");
+		LogDebug(COMPONENT_PNFS, "glhandle NULL");
 
-	rc = glfs_h_anonymous_read(glfs_export->gl_fs, ds->glhandle,
+	rc = glfs_h_anonymous_read(glfs_export->gl_fs->fs, ds->glhandle,
 				   buffer, requested_length, offset);
 	if (rc < 0) {
+		rc = errno;
 		LogMajor(COMPONENT_PNFS, "Read failed on DS");
-		return posix2nfs4_error(-rc);
+		return posix2nfs4_error(rc);
 	}
 
 	*supplied_length = rc;
@@ -143,24 +144,24 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
 	struct glfs_ds_handle *ds =
 		container_of(ds_pub, struct glfs_ds_handle, ds);
 	struct glusterfs_export *glfs_export =
-	container_of(ds_pub->pds->mds_export->fsal_export,
+	container_of(ds_pub->pds->mds_fsal_export,
 		     struct glusterfs_export, export);
 	int    rc = 0;
 
 	memset(writeverf, 0, NFS4_VERIFIER_SIZE);
 
 	if (ds->glhandle == NULL)
-		LogDebug(COMPONENT_PNFS, "ds_write glhandle NULL");
+		LogDebug(COMPONENT_PNFS, "glhandle NULL");
 
-	rc = glfs_h_anonymous_write(glfs_export->gl_fs, ds->glhandle,
+	rc = glfs_h_anonymous_write(glfs_export->gl_fs->fs, ds->glhandle,
 				    buffer, write_length, offset);
 	if (rc < 0) {
-		LogMajor(COMPONENT_PNFS, "status after write %d", -rc);
-		return posix2nfs4_error(-rc);
+		rc = errno;
+		LogMajor(COMPONENT_PNFS, "status after write %d", rc);
+		return posix2nfs4_error(rc);
 	}
 
-	/**
-	 * TODO:Here DS is performing the write operation, so the MDS is not
+	/** @todo:Here DS is performing the write operation, so the MDS is not
 	 *      aware of the change.We should inform MDS through upcalls about
 	 *      change in file attributes such as size and time.
 	 */
@@ -168,6 +169,10 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
 
 	*stability_got = stability_wanted;
 	ds->stability_got = stability_wanted;
+
+	/* Incase of MDS being DS, there shall not be upcalls sent from
+	 * backend. Hence invalidate the entry here */
+	(void)upcall_inode_invalidate(glfs_export->gl_fs, ds->glhandle);
 
 	return NFS4_OK;
 }
@@ -197,26 +202,43 @@ static nfsstat4 ds_commit(struct fsal_ds_handle *const ds_pub,
 	struct glfs_ds_handle *ds =
 		container_of(ds_pub, struct glfs_ds_handle, ds);
 	int rc = 0;
+	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
 
 	if (ds->stability_got == FILE_SYNC4) {
 		struct glusterfs_export *glfs_export =
-			container_of(ds_pub->pds->mds_export->fsal_export,
+			container_of(ds_pub->pds->mds_fsal_export,
 				     struct glusterfs_export, export);
 		struct glfs_fd *glfd = NULL;
 
-		glfd = glfs_h_open(glfs_export->gl_fs, ds->glhandle, O_RDWR);
+		SET_GLUSTER_CREDS(glfs_export, &op_ctx->creds->caller_uid,
+				  &op_ctx->creds->caller_gid,
+				  op_ctx->creds->caller_glen,
+				  op_ctx->creds->caller_garray);
+
+		glfd = glfs_h_open(glfs_export->gl_fs->fs, ds->glhandle,
+				   O_RDWR);
 		if (glfd == NULL) {
 			LogDebug(COMPONENT_PNFS, "glfd in ds_handle is NULL");
+			SET_GLUSTER_CREDS(glfs_export, NULL, NULL, 0, NULL);
 			return NFS4ERR_SERVERFAULT;
 		}
+#ifdef USE_GLUSTER_STAT_FETCH_API
+		rc = glfs_fsync(glfd, NULL, NULL);
+#else
 		rc = glfs_fsync(glfd);
+#endif
 		if (rc != 0)
-			LogMajor(COMPONENT_PNFS, "ds_commit() failed  %d", -rc);
+			LogMajor(COMPONENT_PNFS,
+				 "glfs_fsync failed %d", errno);
 		rc = glfs_close(glfd);
 		if (rc != 0)
-			LogDebug(COMPONENT_PNFS, "status after close %d", -rc);
+			LogDebug(COMPONENT_PNFS,
+				 "status after close %d", errno);
+
+		SET_GLUSTER_CREDS(glfs_export, NULL, NULL, 0, NULL);
 	}
-	if (rc < 0)
+
+	if ((rc != 0) || (status.major != ERR_FSAL_NO_ERROR))
 		return NFS4ERR_INVAL;
 
 	return NFS4_OK;
@@ -256,7 +278,7 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
 	unsigned char globjhdl[GFAPI_HANDLE_LENGTH] = {'\0'};
 	struct stat sb;
 	struct glusterfs_export *glfs_export =
-		container_of(pds->mds_export->fsal_export,
+		container_of(pds->mds_fsal_export,
 			     struct glusterfs_export, export);
 
 	*handle = NULL;
@@ -266,16 +288,14 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
 
 	ds = gsh_calloc(1, sizeof(struct glfs_ds_handle));
 
-	if (ds == NULL)
-		return NFS4ERR_SERVERFAULT;
-
 	*handle = &ds->ds;
 	fsal_ds_handle_init(*handle, pds);
 
 	memcpy(globjhdl, hdl_desc->addr, GFAPI_HANDLE_LENGTH);
 
 	/* Create glfs_object for the DS handle */
-	ds->glhandle =	glfs_h_create_from_handle(glfs_export->gl_fs, globjhdl,
+	ds->glhandle =	glfs_h_create_from_handle(glfs_export->gl_fs->fs,
+						  globjhdl,
 						  GFAPI_HANDLE_LENGTH, &sb);
 	if (ds->glhandle == NULL) {
 		LogDebug(COMPONENT_PNFS,

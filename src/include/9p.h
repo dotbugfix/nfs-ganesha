@@ -39,13 +39,10 @@
 
 #include "9p_types.h"
 #include "fsal_types.h"
-#include "cache_inode.h"
 #include "sal_data.h"
 
 #ifdef _USE_9P_RDMA
-#include <infiniband/arch.h>
-#include <rdma/rdma_cma.h>
-#include "mooshika.h"
+#include <mooshika.h>
 #endif
 
 #define NB_PREALLOC_HASH_9P 100
@@ -193,10 +190,18 @@ enum _9p_msg_t {
 	_9P_RWSTAT,
 };
 
+/* Arbitrary max xattr size, 64k is the limit for VFS given in man xattr(7) */
+#define _9P_XATTR_MAX_SIZE 65535
+
 /**
- * This constant is used to use system.posix_acl_access pseudo xattr
+ * 9p internal flags for xattrs: set as guard for read/write and actual
+ * setxattr "flush" call
  */
-#define ACL_ACCESS_XATTR_ID 0xFFFFFFFF
+enum _9p_xattr_write {
+	_9P_XATTR_READ_ONLY,
+	_9P_XATTR_CAN_WRITE,
+	_9P_XATTR_DID_WRITE
+};
 
 /**
  * enum _9p_qid_t - QID types
@@ -295,29 +300,34 @@ struct _9p_user_cred {
 			   * creds field). */
 };
 
+/**
+ *
+ * @brief Internal 9P structure for xattr operations, linked in fid
+ *
+ * This structure is allocated as needed (xattrwalk/create) and freed
+ * on clunk
+ */
+struct _9p_xattr_desc {
+	char xattr_name[MAXNAMLEN + 1];
+	u64 xattr_size;
+	u64 xattr_offset;
+	enum _9p_xattr_write xattr_write;
+	char xattr_content[];
+};
+
 struct _9p_fid {
 	u32 fid;
 	/** Ganesha export of the file (refcounted). */
-	struct gsh_export *export;
+	struct gsh_export *fid_export;
 	struct _9p_user_cred *ucred; /*< Client credentials (refcounted). */
 	struct group_data *gdata;
-	cache_entry_t *pentry;
+	struct fsal_obj_handle *pentry;
 	struct _9p_qid qid;
-	struct state_t state;
-	cache_entry_t *ppentry;
-	char name[MAXNAMLEN];
+	struct state_t *state;
+	struct fsal_obj_handle *ppentry;
+	char name[MAXNAMLEN+1];
 	u32 opens;
-	union {
-		u32 iounit;
-		struct _9p_xattr_desc {
-			unsigned int xattr_id;
-			caddr_t xattr_content;
-			u64 xattr_size;
-			u64 xattr_offset;
-			bool xattr_write;
-		} xattr;
-
-	} specdata;
+	struct _9p_xattr_desc *xattr;
 };
 
 enum _9p_trans_type {
@@ -711,7 +721,7 @@ void free_fid(struct _9p_fid *pfid);
 int _9p_tools_get_req_context_by_uid(u32 uid, struct _9p_fid *pfid);
 int _9p_tools_get_req_context_by_name(int uname_len, char *uname_str,
 				      struct _9p_fid *pfid);
-int _9p_tools_errno(cache_inode_status_t cache_status);
+int _9p_tools_errno(fsal_status_t fsal_status);
 void _9p_openflags2FSAL(u32 *inflags, fsal_openflags_t *outflags);
 int _9p_tools_clunk(struct _9p_fid *pfid);
 void _9p_cleanup_fids(struct _9p_conn *conn);

@@ -64,6 +64,11 @@
  * primitive must manage the b_current. display_finish will handle proper
  * indication of a full buffer or buffer overflow.
  *
+ * A display function that is not a primitive (only uses display functions
+ * themselves) SHOULD call display_start to make sure the buffer isn't already
+ * full. It also assures the buffer will not wind up without a NUL terminator
+ * should it not actually make any display calls.
+ *
  * The core routines:
  *
  * display_start validate and prepare to start appending to the buffer.
@@ -107,9 +112,10 @@ int display_force_overflow(struct display_buffer *dspbuf);
 static inline void display_reset_buffer(struct display_buffer *dspbuf)
 {
 	/* To re-use a buffer, all we need to do is roll b_current back to
-	 * b_start.
+	 * b_start and make it empty.
 	 */
 	dspbuf->b_current = dspbuf->b_start;
+	*dspbuf->b_current = '\0';
 }
 
 /**
@@ -122,9 +128,9 @@ static inline void display_reset_buffer(struct display_buffer *dspbuf)
  * This function is more efficient than strlen if the buffer hasn't overflowed.
  *
  */
-static inline int display_buffer_len(struct display_buffer *dspbuf)
+static inline size_t display_buffer_len(struct display_buffer *dspbuf)
 {
-	int len = dspbuf->b_current - dspbuf->b_start;
+	size_t len = dspbuf->b_current - dspbuf->b_start;
 
 	if (len == dspbuf->b_size) {
 		/* Buffer has overflowed, due to forced overflow or partial

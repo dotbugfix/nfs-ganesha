@@ -45,6 +45,14 @@
 #include "fsal_convert.h"
 #include <stdbool.h>
 #include <uuid/uuid.h>
+#include "statx_compat.h"
+#include "FSAL/fsal_commonlib.h"
+
+/* Max length of a user_id string that we pass to ceph_mount */
+#define MAXUIDLEN	(64)
+
+/* Max length of a secret key for this user */
+#define MAXSECRETLEN	(88)
 
 /**
  * Ceph Main (global) module object
@@ -52,7 +60,7 @@
 
 struct ceph_fsal_module {
 	struct fsal_module fsal;
-	fsal_staticfsinfo_t fs_info;
+	struct fsal_obj_ops handle_ops;
 	char *conf_path;
 };
 extern struct ceph_fsal_module CephFSM;
@@ -61,27 +69,43 @@ extern struct ceph_fsal_module CephFSM;
  * Ceph private export object
  */
 
-struct export {
+struct ceph_export {
 	struct fsal_export export;	/*< The public export object */
 	struct ceph_mount_info *cmount;	/*< The mount object used to
 					   access all Ceph methods on
 					   this export. */
-	struct handle *root;	/*< The root handle */
+	struct ceph_handle *root;	/*< The root handle */
+	char *user_id;			/* cephx user_id for this mount */
+	char *secret_key;
+};
+
+struct ceph_fd {
+	/** The open and share mode etc. */
+	fsal_openflags_t openflags;
+	/* rw lock to protect the file descriptor */
+	pthread_rwlock_t fdlock;
+	/** The cephfs file descriptor. */
+	Fh *fd;
+};
+
+struct ceph_state_fd {
+	struct state_t state;
+	struct ceph_fd ceph_fd;
 };
 
 /**
  * The 'private' Ceph FSAL handle
  */
 
-struct handle {
+struct ceph_handle {
 	struct fsal_obj_handle handle;	/*< The public handle */
-	struct attrlist attributes;
-	Fh *fd;
+	struct ceph_fd fd;
 	struct Inode *i;	/*< The Ceph inode */
 	const struct fsal_up_vector *up_ops;	/*< Upcall operations */
-	struct export *export;	/*< The first export this handle belongs to */
+	/*< The first export this handle belongs to */
+	struct ceph_export *export;
 	vinodeno_t vi;		/*< The object identifier */
-	fsal_openflags_t openflags;
+	struct fsal_share share;
 #ifdef CEPH_PNFS
 	uint64_t rd_issued;
 	uint64_t rd_serial;
@@ -117,34 +141,20 @@ struct ds {
 
 #endif				/* CEPH_PNFS */
 
-#ifndef CEPH_INTERNAL_C
-/* Keep internal.c from clashing with itself */
-extern attrmask_t supported_attributes;
-extern attrmask_t settable_attributes;
-#endif				/* !CEPH_INTERNAL_C */
+#define CEPH_SUPPORTED_ATTRS ((const attrmask_t) (ATTRS_POSIX))
 
-/**
- * Linux supports a stripe pattern with no more than 4096 stripes, but
- * for now we stick to 1024 to keep them da_addrs from being too
- * gigantic.
- */
-
-static const size_t BIGGEST_PATTERN = 1024;
-
-/* private helper for export object */
-
-static inline fsal_staticfsinfo_t *ceph_staticinfo(struct fsal_module *hdl)
-{
-	struct ceph_fsal_module *myself =
-	    container_of(hdl, struct ceph_fsal_module, fsal);
-	return &myself->fs_info;
-}
+#define CEPH_SETTABLE_ATTRIBUTES ((const attrmask_t) (			\
+	ATTR_MODE  | ATTR_OWNER | ATTR_GROUP | ATTR_ATIME	 |	\
+	ATTR_CTIME | ATTR_MTIME | ATTR_SIZE  | ATTR_MTIME_SERVER |	\
+	ATTR_ATIME_SERVER))
 
 /* Prototypes */
 
-int construct_handle(const struct stat *st, struct Inode *i,
-		     struct export *export, struct handle **obj);
-void deconstruct_handle(struct handle *obj);
+void construct_handle(const struct ceph_statx *stx,
+					struct Inode *i,
+					struct ceph_export *export,
+					struct ceph_handle **obj);
+void deconstruct_handle(struct ceph_handle *obj);
 
 /**
  * @brief FSAL status from Ceph error
@@ -161,7 +171,9 @@ static inline fsal_status_t ceph2fsal_error(const int ceph_errorcode)
 {
 	return fsalstat(posix2fsal_error(-ceph_errorcode), -ceph_errorcode);
 }
-void ceph2fsal_attributes(const struct stat *buffstat,
+
+unsigned int attrmask2ceph_want(attrmask_t mask);
+void ceph2fsal_attributes(const struct ceph_statx *stx,
 			  struct attrlist *fsalattr);
 
 void export_ops_init(struct export_ops *ops);
@@ -171,5 +183,11 @@ void pnfs_ds_ops_init(struct fsal_pnfs_ds_ops *ops);
 void export_ops_pnfs(struct export_ops *ops);
 void handle_ops_pnfs(struct fsal_obj_ops *ops);
 #endif				/* CEPH_PNFS */
+
+struct state_t *ceph_alloc_state(struct fsal_export *exp_hdl,
+				 enum state_type state_type,
+				 struct state_t *related_state);
+
+void ceph_free_state(struct fsal_export *exp_hdl, struct state_t *state);
 
 #endif				/* !FSAL_CEPH_INTERNAL_INTERNAL__ */

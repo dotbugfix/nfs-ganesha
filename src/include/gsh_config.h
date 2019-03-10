@@ -58,6 +58,8 @@ typedef enum protos {
 	P_MNT,			/*< Mount (for v3) */
 	P_NLM,			/*< NLM (for v3) */
 	P_RQUOTA,		/*< RQUOTA (for v3) */
+	P_NFS_VSOCK,		/*< NFS over vmware, qemu vmci sockets */
+	P_NFS_RDMA,		/*< NFS over RPC/RDMA */
 	P_COUNT			/*< Number of protocols */
 } protos;
 
@@ -80,7 +82,7 @@ typedef enum protos {
 /**
  * @brief Default value for core_param.nb_worker
  */
-#define NB_WORKER_THREAD_DEFAULT 16
+#define NB_WORKER_THREAD_DEFAULT 256
 
 /**
  * @brief Default value for core_param.drc.tcp.npart
@@ -143,11 +145,6 @@ typedef enum protos {
 #define DRC_UDP_CHECKSUM true
 
 /**
- * @brief Default value for core_param.rpc.debug_flags
- */
-#define TIRPC_DEBUG_FLAGS 0x0
-
-/**
  * Default value for core_param.rpc.max_send_buffer_size
  */
 #define NFS_DEFAULT_SEND_BUFFER_SIZE 1048576
@@ -156,6 +153,12 @@ typedef enum protos {
  * Default value for core_param.rpc.max_recv_buffer_size
  */
 #define NFS_DEFAULT_RECV_BUFFER_SIZE 1048576
+
+/**
+ * @brief Turn off all protocols
+ */
+
+#define CORE_OPTION_NONE 0x00000000	/*< No operations are supported */
 
 /**
  * @brief Support NFSv3
@@ -171,7 +174,17 @@ typedef enum protos {
 /**
  * @brief Support 9p
  */
-#define CORE_OPTION_9P 0x00000004	/*< NFSv4 operations are supported */
+#define CORE_OPTION_9P 0x00000004	/*< 9P operations are supported */
+
+/**
+ * @brief NFS AF_VSOCK
+ */
+#define CORE_OPTION_NFS_VSOCK 0x00000008 /*< AF_VSOCK NFS listener */
+
+/**
+ * @brief Support RPC/RDMA v1
+ */
+#define CORE_OPTION_NFS_RDMA 0x00000010 /*< RPC/RDMA v1 NFS listener */
 
 /**
  * @brief Support NFSv3 and NFSv4.
@@ -181,16 +194,19 @@ typedef enum protos {
 /**
  * @brief Support all protocols
  */
-#define CORE_OPTION_ALL_VERS (CORE_OPTION_NFSV3 | CORE_OPTION_NFSV4 | \
-			      CORE_OPTION_9P)
+#define CORE_OPTION_ALL_VERS (CORE_OPTION_NFSV3 |			\
+				CORE_OPTION_NFSV4 |			\
+				CORE_OPTION_NFS_VSOCK |			\
+				CORE_OPTION_NFS_RDMA |			\
+				CORE_OPTION_9P)
 
 typedef struct nfs_core_param {
 	/** An array of port numbers, one for each protocol.  Set by
 	    the NFS_Port, MNT_Port, NLM_Port, and Rquota_Port options. */
 	uint16_t port[P_COUNT];
-	/** The address to which to bind for our listening port.
-	    IPv4 only, for now.  Set by the Bind_Addr option. */
-	struct sockaddr_in bind_addr;
+	/** The IPv4 or IPv6 address to which to bind for our
+	    listening port.  Set by the Bind_Addr option. */
+	struct sockaddr_storage bind_addr;
 	/** An array of RPC program numbers.  The correct values, by
 	    default, they may be set to incorrect values with the
 	    NFS_Program, MNT_Program, NLM_Program, and
@@ -217,13 +233,6 @@ typedef struct nfs_core_param {
 	    retry and there is no NFSERR_DELAY, this seems like an
 	    excellent idea. */
 	bool drop_delay_errors;
-	/** Total number of requests to allow into the dispatcher at
-	    once.  Defaults to 5000 and settable by Dispatch_Max_Reqs */
-	uint32_t dispatch_max_reqs;
-	/** Number of requests to allow into the dispatcher from one
-	    specific transport.  Defaults to 512 and settable by
-	    Dispatch_Max_Reqs_Xprt. */
-	uint32_t dispatch_max_reqs_xprt;
 	/** Parameters controlling the Duplicate Request Cache.  */
 	struct {
 		/** Whether to disable the DRC entirely.  Defaults to
@@ -297,10 +306,6 @@ typedef struct nfs_core_param {
 	} drc;
 	/** Parameters affecting the relation with TIRPC.   */
 	struct {
-		/** Debug flags for TIRPC.  Defaults to
-		    TIRPC_DEBUG_FLAGS and settable by
-		    RPC_Debug_Flags. */
-		uint32_t debug_flags;
 		/** Maximum number of connections for TIRPC.
 		    Defaults to 1024 and settable by
 		    RPC_Max_Connections. */
@@ -318,14 +323,21 @@ typedef struct nfs_core_param {
 		/** TIRPC ioq max simultaneous io threads.  Defaults to
 		    200 and settable by RPC_Ioq_ThrdMax. */
 		uint32_t ioq_thrd_max;
+		struct {
+			/** Partitions in GSS ctx cache table (default 13). */
+			uint32_t ctx_hash_partitions;
+			/** Max GSS contexts in cache (i.e.,
+			 * max GSS clients, default 16K)
+			 */
+			uint32_t max_ctx;
+			/** Max entries to expire in one idle
+			 * check (default 200)
+			 */
+			uint32_t max_gc;
+		} gss;
 	} rpc;
-	/** How long (in seconds) to let unused decoder threads wait before
-	    exiting.  Settable with Decoder_Fridge_Expiration_Delay. */
-	time_t decoder_fridge_expiration_delay;
-	/** How long (in seconds) to wait for the decoder fridge to
-	    accept a task before erroring.  Settable with
-	    Decoder_Fridge_Block_Timeout. */
-	time_t decoder_fridge_block_timeout;
+	/** Polling interval for blocked lock polling thread. */
+	time_t blocked_lock_poller_interval;
 	/** Protocols to support.  Should probably be renamed.
 	    Defaults to CORE_OPTION_ALL_VERS and is settable with
 	    NFS_Protocols (as a comma-separated list of 3 and 4.) */
@@ -344,8 +356,20 @@ typedef struct nfs_core_param {
 	/** Whether to support the Remote Quota protocol.  Defaults
 	    to true and is settable with Enable_RQUOTA. */
 	bool enable_RQUOTA;
+	/** Whether to collect NFS stats.  Defaults to true. */
+	bool enable_NFSSTATS;
 	/** Whether to use fast stats.  Defaults to false. */
 	bool enable_FASTSTATS;
+	/** Whether to collect FSAL stats.  Defaults to false. */
+	bool enable_FSALSTATS;
+	/** Whether tcp sockets should use SO_KEEPALIVE */
+	bool enable_tcp_keepalive;
+	/** Maximum number of TCP probes before dropping the connection */
+	uint32_t tcp_keepcnt;
+	/** Idle time before TCP starts to send keepalive probes */
+	uint32_t tcp_keepidle;
+	/** Time between each keepalive probe */
+	uint32_t tcp_keepintvl;
 	/** Whether to use short NFS file handle to accommodate VMware
 	    NFS client. Enable this if you have a VMware NFSv3 client.
 	    VMware NFSv3 client has a max limit of 56 byte file handles!
@@ -358,8 +382,18 @@ typedef struct nfs_core_param {
 	/** Path to the directory containing server specific
 	    modules.  In particular, this is where FSALs live. */
 	char *ganesha_modules_loc;
-	/* Frequency of dbus health heartbeat in ms. Set to 0 to disable */
+	/** Frequency of dbus health heartbeat in ms. Set to 0 to disable */
 	uint32_t heartbeat_freq;
+	/** Whether to use device major/minor for fsid. Defaults to false. */
+	bool fsid_device;
+	/** Whether to use Pseudo (true) or Path (false) for NFS v3 and 9P
+	    mounts. */
+	bool mount_path_pseudo;
+	/** DBus name prefix. Required if one wants to run multiple ganesha
+	    instances on single host. The prefix should be different for every
+	    ganesha instance. If this is set, dbus name will be
+	    <prefix>.org.ganesha.nfsd */
+	char *dbus_name_prefix;
 } nfs_core_parameter_t;
 
 /** @} */
@@ -395,6 +429,21 @@ typedef struct nfs_core_param {
  */
 #define DELEG_RECALL_RETRY_DELAY_DEFAULT 1
 
+/**
+ * @brief Default value of recovery_backend.
+ */
+#define RECOVERY_BACKEND_DEFAULT "fs"
+
+/**
+ * @brief NFSv4 minor versions
+ */
+#define NFSV4_MINOR_VERSION_ZERO	(1 << 0)
+#define NFSV4_MINOR_VERSION_ONE	(1 << 1)
+#define NFSV4_MINOR_VERSION_TWO	(1 << 2)
+#define NFSV4_MINOR_VERSION_ALL	(NFSV4_MINOR_VERSION_ZERO | \
+					 NFSV4_MINOR_VERSION_ONE | \
+					 NFSV4_MINOR_VERSION_TWO)
+
 typedef struct nfs_version4_parameter {
 	/** Whether to disable the NFSv4 grace period.  Defaults to
 	    false and settable with Graceless. */
@@ -421,6 +470,11 @@ typedef struct nfs_version4_parameter {
 	    group identifiers.  Defaults to true and is settable with
 	    Allow_Numeric_Owners. */
 	bool allow_numeric_owners;
+	/** Whether to ONLY use bare numeric IDs in NFSv4 owner and
+	    group identifiers.  Defaults to false and is settable with
+	    Only_Numeric_Owners. NB., this is permissible for a server
+	    implementation (RFC 5661). */
+	bool only_numeric_owners;
 	/** Whether to allow delegations. Defaults to false and settable
 	    with Delegations */
 	bool allow_delegations;
@@ -430,6 +484,12 @@ typedef struct nfs_version4_parameter {
 	bool pnfs_mds;
 	/** Whether this a pNFS DS server. Defaults to false */
 	bool pnfs_ds;
+	/** Recovery backend */
+	char *recovery_backend;
+	/** List of supported NFSV4 minor versions */
+	unsigned int minor_versions;
+	/** Number of allowed slots in the 4.1 slot table */
+	uint32_t nb_slots;
 } nfs_version4_parameter_t;
 
 /** @} */

@@ -36,7 +36,6 @@
 #ifndef NFS_PROTO_DATA_H
 #define NFS_PROTO_DATA_H
 
-#include "cache_inode_lru.h"
 #include "fsal_api.h"
 #include "rquota.h"
 
@@ -170,7 +169,6 @@ typedef union nfs_res__ {
 				   RPCSEC_GSS */
 #define MAKES_IO	0x0010	/* Request may do I/O
 				   (not allowed on MD ONLY exports */
-#define NEEDS_EXPORT	0x0020	/* Request needs an export */
 
 typedef int (*nfs_protocol_function_t) (nfs_arg_t *,
 					struct svc_req *,
@@ -191,7 +189,6 @@ typedef struct nfs_function_desc__ {
 } nfs_function_desc_t;
 
 typedef struct nfs_request {
-	SVCXPRT *xprt;
 	struct svc_req svc;
 	struct nfs_request_lookahead lookahead;
 	nfs_arg_t arg_nfs;
@@ -215,14 +212,16 @@ typedef struct rpc_call_channel {
 	time_t last_called;
 	CLIENT *clnt;
 	AUTH *auth;
+#ifdef _HAVE_GSSAPI
 	struct rpc_gss_sec gss_sec;
+#endif /* _HAVE_GSSAPI */
 } rpc_call_channel_t;
 
 /**
  * @todo Matt: this is automatically redundant, but in fact upstream
  * TI-RPC is not up-to-date with RFC 5665, will fix (Matt)
  *
- * @copyright 2012, Linux Box Corp
+ * @copyright 2012-2017, Linux Box Corp
 */
 enum rfc_5665_nc_type {
 	_NC_ERR,
@@ -237,23 +236,14 @@ enum rfc_5665_nc_type {
 };
 typedef enum rfc_5665_nc_type nc_type;
 
-static const struct __netid_nc_table {
+struct __netid_nc_table {
 	const char *netid;
-	int netid_len;
 	/* nc_type */
 	const nc_type nc;
 	int af;
-} netid_nc_table[] = {
-	{
-	"-", 1, _NC_ERR, 0}, {
-	"tcp", 3, _NC_TCP, AF_INET}, {
-	"tcp6", 4, _NC_TCP6, AF_INET6}, {
-	"rdma", 4, _NC_RDMA, AF_INET}, {
-	"rdma6", 5, _NC_RDMA6, AF_INET6}, {
-	"sctp", 4, _NC_SCTP, AF_INET}, {
-	"sctp6", 5, _NC_SCTP6, AF_INET6}, {
-	"udp", 3, _NC_UDP, AF_INET}, {
-	"udp6", 4, _NC_UDP6, AF_INET6},};
+};
+
+extern const struct __netid_nc_table netid_nc_table[9];
 
 nc_type nfs_netid_to_nc(const char *netid);
 void nfs_set_client_location(nfs_client_id_t *pclientid,
@@ -273,7 +263,7 @@ typedef struct nfs_client_cred_gss {
 	unsigned int svc;
 	unsigned int qop;
 #ifdef _HAVE_GSSAPI
-	gss_ctx_id_t gss_context_id;
+	struct svc_rpc_gss_data *gd;
 #endif
 } nfs_client_cred_gss_t;
 
@@ -307,13 +297,11 @@ typedef struct compound_data {
 	stateid4 saved_stateid;	/*< Saved stateid */
 	bool saved_stateid_valid;	/*< Saved stateid is valid */
 	unsigned int minorversion;	/*< NFSv4 minor version */
-	cache_entry_t *current_entry;	/*< Cache entry for current filehandle
-					 */
-	cache_entry_t *saved_entry;	/*< Cache entry for saved filehandle */
+	struct fsal_obj_handle *current_obj;	/*< Current object handle */
+	struct fsal_obj_handle *saved_obj;	/*< saved object handle */
 	struct fsal_ds_handle *current_ds;	/*< current ds handle */
 	struct fsal_ds_handle *saved_ds;	/*< Saved DS handle */
-	object_file_type_t current_filetype;	/*< File type of current entry
-						 */
+	object_file_type_t current_filetype;    /*< File type of current obj */
 	object_file_type_t saved_filetype;	/*< File type of saved entry */
 	struct gsh_export *saved_export; /*< Export entry related to the
 					     savedFH */
@@ -323,32 +311,46 @@ typedef struct compound_data {
 	nfs_client_cred_t credential;	/*< Raw RPC credentials */
 	nfs_client_id_t *preserved_clientid;	/*< clientid that has lease
 						   reserved, if any */
-	struct COMPOUND4res_extended *cached_res;	/*< NFv41: pointer to
+	struct COMPOUND4res_extended *cached_result;	/*< NFv41: pointer to
 							   cached RPC result in
 							   a session's slot */
-	bool use_drc;		/*< Set to true if session DRC is to be used */
+	bool use_slot_cached_result;	/*< Set to true if session DRC is to be
+					    used */
+	bool sa_cachethis;	/*< True if cachethis was specified in
+				    SEQUENCE op. */
 	uint32_t oppos;		/*< Position of the operation within the
 				    request processed  */
+	const char *opname;	/*< Name of the operation */
 	nfs41_session_t *session;	/*< Related session
 					   (found by OP_SEQUENCE) */
 	sequenceid4 sequence;	/*< Sequence ID of the current compound
 				   (if applicable) */
 	slotid4 slot;		/*< Slot ID of the current compound
 				   (if applicable) */
+	uint32_t resp_size;	/*< Running total response size. */
+	uint32_t op_resp_size;	/*< Current op's response size. */
 } compound_data_t;
+
+#define VARIABLE_RESP_SIZE (0)
 
 typedef int (*nfs4_op_function_t) (struct nfs_argop4 *, compound_data_t *,
 				   struct nfs_resop4 *);
 
+/**
+ * @brief Set the current entry in the context
+ *
+ * This manages refcounting on the object being stored in data.  This means it
+ * takes a ref on a new object, and releases it's ref on any old object.  If the
+ * caller has it's own ref, it must release it itself.
+ *
+ * @param[in] data	Compound data to set entry in
+ * @param[in] obj	Object to set
+ */
 static inline void set_current_entry(compound_data_t *data,
-				     cache_entry_t *entry)
+				     struct fsal_obj_handle *obj)
 {
 	/* Mark current_stateid as invalid */
 	data->current_stateid_valid = false;
-
-	/* Release the reference to the old entry */
-	if (data->current_entry)
-		cache_inode_put(data->current_entry);
 
 	/* Clear out the current_ds */
 	if (data->current_ds) {
@@ -356,15 +358,87 @@ static inline void set_current_entry(compound_data_t *data,
 		data->current_ds = NULL;
 	}
 
-	data->current_entry = entry;
+	if (data->current_obj) {
+		/* Release ref on old object */
+		data->current_obj->obj_ops->put_ref(data->current_obj);
+	}
 
-	if (entry == NULL) {
+	data->current_obj = obj;
+
+	if (obj == NULL) {
 		data->current_filetype = NO_FILE_TYPE;
 		return;
 	}
 
+	/* Get our ref on the new object */
+	data->current_obj->obj_ops->get_ref(data->current_obj);
+
 	/* Set the current file type */
-	data->current_filetype = entry->type;
+	data->current_filetype = obj->type;
+}
+
+/**
+ * @brief Set the saved entry in the context
+ *
+ * This manages refcounting on the object being stored in data.  This means it
+ * takes a ref on a new object, and releases it's ref on any old object.  If the
+ * caller has it's own ref, it must release it itself.
+ *
+ * @param[in] data	Compound data to set entry in
+ * @param[in] obj	Object to set
+ */
+static inline void set_saved_entry(compound_data_t *data,
+				   struct fsal_obj_handle *obj)
+{
+	struct gsh_export *current_export = op_ctx->ctx_export;
+	struct export_perms current_export_perms = *op_ctx->export_perms;
+	bool restore_op_ctx = false;
+
+	if (data->saved_ds != NULL || data->saved_obj != NULL) {
+		/* Setup correct op_ctx for releasing old saved */
+		op_ctx->ctx_export = data->saved_export;
+		op_ctx->fsal_export = data->saved_export
+					? data->saved_export->fsal_export
+					: NULL;
+		*op_ctx->export_perms = data->saved_export_perms;
+		restore_op_ctx = true;
+	}
+
+	/* Mark saved_stateid as invalid */
+	data->saved_stateid_valid = false;
+
+	/* Clear out the saved_ds */
+	if (data->saved_ds) {
+		ds_handle_put(data->saved_ds);
+		data->saved_ds = NULL;
+	}
+
+	if (data->saved_obj) {
+		/* Release ref on old object */
+		data->saved_obj->obj_ops->put_ref(data->saved_obj);
+	}
+
+	if (restore_op_ctx) {
+		/* Restore op_ctx */
+		op_ctx->ctx_export = current_export;
+		op_ctx->fsal_export = current_export
+					? current_export->fsal_export
+					: NULL;
+		*op_ctx->export_perms = current_export_perms;
+	}
+
+	data->saved_obj = obj;
+
+	if (obj == NULL) {
+		data->saved_filetype = NO_FILE_TYPE;
+		return;
+	}
+
+	/* Get our ref on the new object */
+	data->saved_obj->obj_ops->get_ref(data->saved_obj);
+
+	/* Set the saved file type */
+	data->saved_filetype = obj->type;
 }
 
 #endif				/* NFS_PROTO_DATA_H */

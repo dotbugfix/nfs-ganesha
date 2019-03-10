@@ -46,6 +46,8 @@
 #include "FSAL/fsal_commonlib.h"
 #include "FSAL/fsal_config.h"
 #include "internal.h"
+#include "statx_compat.h"
+#include "sal_functions.h"
 
 /**
  * @brief Clean up an export
@@ -62,8 +64,8 @@
 static void release(struct fsal_export *export_pub)
 {
 	/* The private, expanded export */
-	struct export *export =
-	    container_of(export_pub, struct export, export);
+	struct ceph_export *export =
+			container_of(export_pub, struct ceph_export, export);
 
 	deconstruct_handle(export->root);
 	export->root = 0;
@@ -95,19 +97,20 @@ static void release(struct fsal_export *export_pub)
 
 static fsal_status_t lookup_path(struct fsal_export *export_pub,
 				 const char *path,
-				 struct fsal_obj_handle **pub_handle)
+				 struct fsal_obj_handle **pub_handle,
+				 struct attrlist *attrs_out)
 {
 	/* The 'private' full export handle */
-	struct export *export =
-	    container_of(export_pub, struct export, export);
+	struct ceph_export *export =
+			container_of(export_pub, struct ceph_export, export);
 	/* The 'private' full object handle */
-	struct handle *handle = NULL;
+	struct ceph_handle *handle = NULL;
 	/* Inode pointer */
 	struct Inode *i = NULL;
 	/* FSAL status structure */
 	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
 	/* The buffer in which to store stat info */
-	struct stat st;
+	struct ceph_statx stx;
 	/* Return code from Ceph */
 	int rc;
 	/* Find the actual path in the supplied path */
@@ -129,21 +132,35 @@ static fsal_status_t lookup_path(struct fsal_export *export_pub,
 
 	*pub_handle = NULL;
 
+	/*
+	 * sanity check: ensure that this is the right export. realpath
+	 * must be a superset of the export fullpath, or the string
+	 * handling will be broken.
+	 */
+	if (strstr(realpath, op_ctx->ctx_export->fullpath) != realpath) {
+		status.major = ERR_FSAL_SERVERFAULT;
+		return status;
+	}
+
+	/* Advance past the export's fullpath */
+	realpath += strlen(op_ctx->ctx_export->fullpath);
+
+	/* special case the root */
 	if (strcmp(realpath, "/") == 0) {
 		assert(export->root);
 		*pub_handle = &export->root->handle;
 		return status;
 	}
 
-	rc = ceph_ll_walk(export->cmount, realpath, &i, &st);
+	rc = fsal_ceph_ll_walk(export->cmount, realpath, &i, &stx,
+				!!attrs_out, op_ctx->creds);
 	if (rc < 0)
 		return ceph2fsal_error(rc);
 
-	rc = construct_handle(&st, i, export, &handle);
-	if (rc < 0) {
-		ceph_ll_put(export->cmount, i);
-		return ceph2fsal_error(rc);
-	}
+	construct_handle(&stx, i, export, &handle);
+
+	if (attrs_out != NULL)
+		ceph2fsal_attributes(&stx, attrs_out);
 
 	*pub_handle = &handle->handle;
 	return status;
@@ -158,10 +175,10 @@ static fsal_status_t lookup_path(struct fsal_export *export_pub,
  * @param[in]  in_type  The type of digest being decoded
  * @param[out] fh_desc  Address and length of key
  */
-static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
-				    fsal_digesttype_t in_type,
-				    struct gsh_buffdesc *fh_desc,
-				    int flags)
+static fsal_status_t wire_to_host(struct fsal_export *exp_hdl,
+				  fsal_digesttype_t in_type,
+				  struct gsh_buffdesc *fh_desc,
+				  int flags)
 {
 	switch (in_type) {
 		/* Digested Handles */
@@ -191,11 +208,12 @@ static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
  */
 static fsal_status_t create_handle(struct fsal_export *export_pub,
 				   struct gsh_buffdesc *desc,
-				   struct fsal_obj_handle **pub_handle)
+				   struct fsal_obj_handle **pub_handle,
+				   struct attrlist *attrs_out)
 {
 	/* Full 'private' export structure */
-	struct export *export =
-	    container_of(export_pub, struct export, export);
+	struct ceph_export *export =
+			container_of(export_pub, struct ceph_export, export);
 	/* FSAL status to return */
 	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
 	/* The FSAL specific portion of the handle received by the
@@ -204,9 +222,9 @@ static fsal_status_t create_handle(struct fsal_export *export_pub,
 	/* Ceph return code */
 	int rc = 0;
 	/* Stat buffer */
-	struct stat st;
+	struct ceph_statx stx;
 	/* Handle to be created */
-	struct handle *handle = NULL;
+	struct ceph_handle *handle = NULL;
 	/* Inode pointer */
 	struct Inode *i;
 
@@ -217,21 +235,33 @@ static fsal_status_t create_handle(struct fsal_export *export_pub,
 		return status;
 	}
 
+	/* Check our local cache first */
 	i = ceph_ll_get_inode(export->cmount, *vi);
-	if (!i)
-		return ceph2fsal_error(-ESTALE);
+	if (!i) {
+		/*
+		 * Try the slow way, may not be in cache now.
+		 *
+		 * Currently, there is no interface for looking up a snapped
+		 * inode, so we just bail here in that case.
+		 */
+		if (vi->snapid.val != CEPH_NOSNAP)
+			return ceph2fsal_error(-ESTALE);
 
-	/* The ceph_ll_connectable_m should have populated libceph's
-	   cache with all this anyway */
-	rc = ceph_ll_getattr(export->cmount, i, &st, 0, 0);
+		rc = ceph_ll_lookup_inode(export->cmount, vi->ino, &i);
+		if (rc)
+			return ceph2fsal_error(rc);
+	}
+
+	rc = fsal_ceph_ll_getattr(export->cmount, i, &stx,
+		attrs_out ? CEPH_STATX_ATTR_MASK : CEPH_STATX_HANDLE_MASK,
+		op_ctx->creds);
 	if (rc < 0)
 		return ceph2fsal_error(rc);
 
-	rc = construct_handle(&st, i, export, &handle);
-	if (rc < 0) {
-		ceph_ll_put(export->cmount, i);
-		return ceph2fsal_error(rc);
-	}
+	construct_handle(&stx, i, export, &handle);
+
+	if (attrs_out != NULL)
+		ceph2fsal_attributes(&stx, attrs_out);
 
 	*pub_handle = &handle->handle;
 	return status;
@@ -254,8 +284,8 @@ static fsal_status_t get_fs_dynamic_info(struct fsal_export *export_pub,
 					 fsal_dynamicfsinfo_t *info)
 {
 	/* Full 'private' export */
-	struct export *export =
-	    container_of(export_pub, struct export, export);
+	struct ceph_export *export =
+			container_of(export_pub, struct ceph_export, export);
 	/* Return value from Ceph calls */
 	int rc = 0;
 	/* Filesystem stat */
@@ -279,200 +309,24 @@ static fsal_status_t get_fs_dynamic_info(struct fsal_export *export_pub,
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
 
-/**
- * @brief Query the FSAL's capabilities
- *
- * This function queries the capabilities of an FSAL export.
- *
- * @param[in] export_pub The public export handle
- * @param[in] option     The option to check
- *
- * @retval true if the option is supported.
- * @retval false if the option is unsupported (or unknown).
- */
-
-static bool fs_supports(struct fsal_export *export_pub,
-			fsal_fsinfo_options_t option)
+void ceph_prepare_unexport(struct fsal_export *export_pub)
 {
-	struct fsal_staticfsinfo_t *info = ceph_staticinfo(export_pub->fsal);
+	struct ceph_export *export =
+			container_of(export_pub, struct ceph_export, export);
 
-	return fsal_supports(info, option);
-}
+	/* Flush all buffers */
+	ceph_sync_fs(export->cmount);
 
-/**
- * @brief Return the longest file supported
- *
- * This function returns the length of the longest file supported.
- *
- * @param[in] export_pub The public export
- *
- * @return UINT64_MAX.
- */
-
-static uint64_t fs_maxfilesize(struct fsal_export *export_pub)
-{
-	return UINT64_MAX;
-}
-
-/**
- * @brief Return the longest read supported
- *
- * This function returns the length of the longest read supported.
- *
- * @param[in] export_pub The public export
- *
- * @return 4 mebibytes.
- */
-
-static uint32_t fs_maxread(struct fsal_export *export_pub)
-{
-	return 0x400000;
-}
-
-/**
- * @brief Return the longest write supported
- *
- * This function returns the length of the longest write supported.
- *
- * @param[in] export_pub The public export
- *
- * @return 4 mebibytes.
- */
-
-static uint32_t fs_maxwrite(struct fsal_export *export_pub)
-{
-	return 0x400000;
-}
-
-/**
- * @brief Return the maximum number of hard links to a file
- *
- * This function returns the maximum number of hard links supported to
- * any file.
- *
- * @param[in] export_pub The public export
- *
- * @return 1024.
- */
-
-static uint32_t fs_maxlink(struct fsal_export *export_pub)
-{
-	/* Ceph does not like hard links.  See the anchor table
-	   design.  We should fix this, but have to do it in the Ceph
-	   core. */
-	return 1024;
-}
-
-/**
- * @brief Return the maximum size of a Ceph filename
- *
- * This function returns the maximum filename length.
- *
- * @param[in] export_pub The public export
- *
- * @return UINT32_MAX.
- */
-
-static uint32_t fs_maxnamelen(struct fsal_export *export_pub)
-{
-	/* Ceph actually supports filenames of unlimited length, at
-	   least according to the protocol docs.  We may wish to
-	   constrain this later. */
-	return UINT32_MAX;
-}
-
-/**
- * @brief Return the maximum length of a Ceph path
- *
- * This function returns the maximum path length.
- *
- * @param[in] export_pub The public export
- *
- * @return UINT32_MAX.
- */
-
-static uint32_t fs_maxpathlen(struct fsal_export *export_pub)
-{
-	/* Similarly unlimited int he protocol */
-	return UINT32_MAX;
-}
-
-/**
- * @brief Return the lease time
- *
- * This function returns the lease time.
- *
- * @param[in] export_pub The public export
- *
- * @return five minutes.
- */
-
-static struct timespec fs_lease_time(struct fsal_export *export_pub)
-{
-	struct timespec lease = { 300, 0 };
-
-	return lease;
-}
-
-/**
- * @brief Return ACL support
- *
- * This function returns the export's ACL support.
- *
- * @param[in] export_pub The public export
- *
- * @return FSAL_ACLSUPPORT_DENY.
- */
-
-static fsal_aclsupp_t fs_acl_support(struct fsal_export *export_pub)
-{
-	return FSAL_ACLSUPPORT_DENY;
-}
-
-/**
- * @brief Return the attributes supported by this FSAL
- *
- * This function returns the mask of attributes this FSAL can support.
- *
- * @param[in] export_pub The public export
- *
- * @return supported_attributes as defined in internal.c.
- */
-
-static attrmask_t fs_supported_attrs(struct fsal_export *export_pub)
-{
-	return supported_attributes;
-}
-
-/**
- * @brief Return the mode under which the FSAL will create files
- *
- * This function modifies the default mode on any new file created.
- *
- * @param[in] export_pub The public export
- *
- * @return 0 (usually).  Bits set here turn off bits in created files.
- */
-
-static uint32_t fs_umask(struct fsal_export *export_pub)
-{
-	return fsal_umask(ceph_staticinfo(export_pub->fsal));
-}
-
-/**
- * @brief Return the mode for extended attributes
- *
- * This function returns the access mode applied to extended
- * attributes.  Dubious.
- *
- * @param[in] export_pub The public export
- *
- * @return 0644.
- */
-
-static uint32_t fs_xattr_access_rights(struct fsal_export *export_pub)
-{
-	return fsal_xattr_access_rights(ceph_staticinfo(export_pub->fsal));
+#if USE_FSAL_CEPH_ABORT_CONN
+	/*
+	 * If we're still a member of the cluster, do a hard abort on the
+	 * connection to ensure that state is left intact on the MDS when we
+	 * return. If we're not a member any longer, then just shutdown
+	 * cleanly.
+	 */
+	if (nfs_grace_is_member())
+		ceph_abort_conn(export->cmount);
+#endif
 }
 
 /**
@@ -486,23 +340,14 @@ static uint32_t fs_xattr_access_rights(struct fsal_export *export_pub)
 
 void export_ops_init(struct export_ops *ops)
 {
+	ops->prepare_unexport = ceph_prepare_unexport,
 	ops->release = release;
 	ops->lookup_path = lookup_path;
-	ops->extract_handle = extract_handle;
+	ops->wire_to_host = wire_to_host;
 	ops->create_handle = create_handle;
 	ops->get_fs_dynamic_info = get_fs_dynamic_info;
-	ops->fs_supports = fs_supports;
-	ops->fs_maxfilesize = fs_maxfilesize;
-	ops->fs_maxread = fs_maxread;
-	ops->fs_maxwrite = fs_maxwrite;
-	ops->fs_maxlink = fs_maxlink;
-	ops->fs_maxnamelen = fs_maxnamelen;
-	ops->fs_maxpathlen = fs_maxpathlen;
-	ops->fs_lease_time = fs_lease_time;
-	ops->fs_acl_support = fs_acl_support;
-	ops->fs_supported_attrs = fs_supported_attrs;
-	ops->fs_umask = fs_umask;
-	ops->fs_xattr_access_rights = fs_xattr_access_rights;
+	ops->alloc_state = ceph_alloc_state;
+	ops->free_state = ceph_free_state;
 #ifdef CEPH_PNFS
 	export_ops_pnfs(ops);
 #endif				/* CEPH_PNFS */

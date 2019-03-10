@@ -50,6 +50,7 @@ config_file_t config_ParseFile(char *file_path,
 	struct config_root *root;
 	int rc;
 
+	glist_init(&all_blocks);
 	memset(&st, 0, sizeof(struct parser_state));
 	st.err_type = err_type;
 	rc = ganeshun_yy_init_parser(file_path, &st);
@@ -68,6 +69,24 @@ config_file_t config_ParseFile(char *file_path,
 #endif
 	ganeshun_yy_cleanup_parser(&st);
 	return (config_file_t)root;
+}
+
+/**
+ *  Return the first node in the global config block list with
+ *  name == block_name
+ */
+void *config_GetBlockNode(const char *block_name)
+{
+	struct glist_head *glh;
+	struct config_node *node;
+
+	glist_for_each(glh, &all_blocks) {
+		node = glist_entry(glh, struct config_node, blocks);
+		if (!strcasecmp(node->u.nterm.name, block_name)) {
+			return node;
+		}
+	}
+	return NULL;
 }
 
 /**
@@ -127,7 +146,7 @@ char *err_type_str(struct config_error_type *err_type)
 		fputs("block init, ", fp);
 	if (err_type->fsal)
 		fputs("fsal load, ", fp);
-	if (err_type->export)
+	if (err_type->export_)
 		fputs("export create, ", fp);
 	if (err_type->resource)
 		fputs("resource alloc, ", fp);
@@ -568,12 +587,9 @@ static void convert_inet_addr(struct config_node *node,
 	struct addrinfo *res = NULL;
 	int rc;
 
-	if (node->u.term.type == TERM_V4ADDR ||
-	    node->u.term.type == TERM_V4_ANY)
-		hints.ai_family = AF_INET;
-	else if (node->u.term.type == TERM_V6ADDR)
-		hints.ai_family = AF_INET6;
-	else {
+	if (node->u.term.type != TERM_V4ADDR &&
+	    node->u.term.type != TERM_V4_ANY &&
+	    node->u.term.type != TERM_V6ADDR) {
 		config_proc_error(node, err_type,
 				  "Expected an IP address, got a %s",
 				  config_term_desc(node->u.term.type));
@@ -581,20 +597,24 @@ static void convert_inet_addr(struct config_node *node,
 		err_type->errors++;
 		return;
 	}
-	hints.ai_flags = AI_ADDRCONFIG;
+
+	/* Try IPv6 (with mapping) first.  If this fails, fall back on IPv4, if
+	 * a v4 address was given. */
+	hints.ai_family = AF_INET6;
+	hints.ai_flags = AI_ADDRCONFIG | AI_V4MAPPED;
 	hints.ai_socktype = 0;
 	hints.ai_protocol = 0;
 	rc = getaddrinfo(node->u.term.varvalue, NULL,
 			 &hints, &res);
+
+	if (rc != 0 && (node->u.term.type == TERM_V4ADDR ||
+			node->u.term.type == TERM_V4_ANY)) {
+		hints.ai_family = AF_INET;
+		rc = getaddrinfo(node->u.term.varvalue, NULL,
+				 &hints, &res);
+	}
 	if (rc == 0) {
 		memcpy(sock, res->ai_addr, res->ai_addrlen);
-		if (res->ai_next != NULL) {
-			config_proc_error(node, err_type,
-					  "Multiple addresses for %s",
-					  node->u.term.varvalue);
-			err_type->invalid = true;
-			err_type->errors++;
-		}
 	} else {
 		config_proc_error(node, err_type,
 				  "No IP address found for %s because:%s",
@@ -732,8 +752,6 @@ static const char *config_type_str(enum config_type type)
 		return "CONFIG_LIST";
 	case CONFIG_ENUM:
 		return "CONFIG_ENUM";
-	case CONFIG_ENUM_SET:
-		return "CONFIG_ENUM_SET";
 	case CONFIG_TOKEN:
 		return "CONFIG_TOKEN";
 	case CONFIG_BOOL:
@@ -742,8 +760,6 @@ static const char *config_type_str(enum config_type type)
 		return "CONFIG_BOOLBIT";
 	case CONFIG_IP_ADDR:
 		return "CONFIG_IP_ADDR";
-	case CONFIG_INET_PORT:
-		return "CONFIG_INET_PORT";
 	case CONFIG_BLOCK:
 		return "CONFIG_BLOCK";
 	case CONFIG_PROC:
@@ -760,6 +776,8 @@ static bool do_block_init(struct config_node *blk_node,
 	struct config_item *item;
 	void *param_addr;
 	sockaddr_t *sock;
+	struct addrinfo hints;
+	struct addrinfo *res = NULL;
 	int rc;
 	int errors = 0;
 
@@ -838,51 +856,38 @@ static bool do_block_init(struct config_node *blk_node,
 				     item->u.lst.mask, item->u.lst.def,
 				     *(uint32_t *)param_addr);
 			break;
-		case CONFIG_ENUM_SET:
-			*(uint32_t *)param_addr |= item->u.lst.def;
-			LogFullDebug(COMPONENT_CONFIG,
-				     "%p CONFIG_ENUM_SET %s mask=%08x def=%08x"
-				     " value=%08"PRIx32,
-				     param_addr,
-				     item->name,
-				     item->u.lst.mask, item->u.lst.def,
-				     *(uint32_t *)param_addr);
-			break;
 		case CONFIG_IP_ADDR:
 			sock = (sockaddr_t *)param_addr;
 			memset(sock, 0, sizeof(sockaddr_t));
 			errno = 0;
-			if (index(item->u.ip.def, ':') != NULL) {
-				sock->ss_family = AF_INET6;
-				rc = inet_pton(AF_INET6,
-					       item->u.ip.def,
-					       &((struct sockaddr_in6 *)sock)
-					       ->sin6_addr);
-			} else if (index(item->u.ip.def, '.') != NULL) {
-				sock->ss_family = AF_INET;
-				rc = inet_pton(AF_INET,
-					       item->u.ip.def,
-					       &((struct sockaddr_in *)sock)
-					       ->sin_addr);
-			} else {
-				config_proc_error(blk_node, err_type,
-						  "Bad default for %s: %s",
-						  item->name,
-						  item->u.ip.def);
-				errors++;
-				break;
+			/* Try IPv6 (with mapping) first.  If this fails, fall
+			 * back on IPv4, if a v4 address was given. */
+			memset(&hints, 0, sizeof(struct addrinfo));
+			hints.ai_family = AF_INET6;
+			hints.ai_flags = AI_PASSIVE;
+			hints.ai_socktype = 0;
+			hints.ai_protocol = 0;
+			/* We don't actually pass "0.0.0.0" to this, so that it
+			 * gets the correct address for each address family.
+			 * AI_PASSIVE assures this. */
+			rc = getaddrinfo(NULL, "0", &hints, &res);
+
+			if (rc != 0) {
+				hints.ai_family = AF_INET;
+				rc = getaddrinfo(NULL, "0", &hints, &res);
 			}
-			if (rc <= 0) {
+			if (rc == 0) {
+				memcpy(sock, res->ai_addr, res->ai_addrlen);
+			} else {
 				config_proc_error(blk_node, err_type,
 						  "Cannot set IP default for %s to %s because %s",
 						  item->name,
 						  item->u.ip.def,
-						  strerror(errno));
+						  gai_strerror(rc));
 				errors++;
 			}
-			break;
-		case CONFIG_INET_PORT:
-			*(uint16_t *)param_addr = htons(item->u.ui16.def);
+			if (res != NULL)
+				freeaddrinfo(res);
 			break;
 		case CONFIG_BLOCK:
 			(void) item->u.blk.init(NULL, param_addr);
@@ -978,12 +983,12 @@ static int do_block_load(struct config_node *blk,
 	for (item = params; item->name != NULL; item++) {
 		uint64_t num64;
 		bool bool_val;
-		uint32_t num32;
+		uint32_t num32 = 0;
 
 		node = lookup_node(&blk->u.nterm.sub_nodes, item->name);
 		if ((item->flags & CONFIG_MANDATORY) && (node == NULL)) {
 			err_type->missing = true;
-			err_type->errors++;
+			errors = ++err_type->errors;
 			config_proc_error(blk, err_type,
 					  "Mandatory field, %s is missing from block (%s)",
 					  item->name, blk->u.nterm.name);
@@ -998,7 +1003,7 @@ static int do_block_load(struct config_node *blk,
 						  "Parameter %s set more than once",
 						  next_node->u.nterm.name);
 				err_type->unique = true;
-				err_type->errors++;
+				errors = ++err_type->errors;
 				node = next_node;
 				continue;
 			}
@@ -1028,7 +1033,7 @@ static int do_block_load(struct config_node *blk,
 						  node->u.nterm.name,
 						  term_node->u.term.varvalue);
 				err_type->invalid = true;
-				err_type->errors++;
+				errors = ++err_type->errors;
 				node = next_node;
 				continue;
 			}
@@ -1072,8 +1077,18 @@ static int do_block_load(struct config_node *blk,
 				break;
 			case CONFIG_UINT64:
 				if (convert_number(term_node, item,
-						   &num64, err_type))
+						   &num64, err_type)) {
 					*(uint64_t *)param_addr = num64;
+					if (item->flags & CONFIG_MARK_SET) {
+						void *mask_addr;
+
+						mask_addr =
+						((char *)param_struct
+						 + item->u.ui64.set_off);
+						*(uint32_t *)mask_addr
+						|= item->u.ui64.bit;
+					}
+				}
 				break;
 			case CONFIG_ANON_ID:
 				if (convert_number(term_node, item,
@@ -1198,42 +1213,11 @@ static int do_block_load(struct config_node *blk,
 					     item->name,
 					     item->u.lst.mask, num32,
 					     *(uint32_t *)param_addr);
-			case CONFIG_ENUM_SET:
-				if (item->u.lst.def ==
-				   (*(uint32_t *)param_addr & item->u.lst.mask))
-					*(uint32_t *)param_addr &=
-							~item->u.lst.mask;
-				if (convert_enum(term_node, item, &num32,
-						 err_type)) {
-					*(uint32_t *)param_addr |= num32;
-					if (item->flags & CONFIG_MARK_SET) {
-						void *mask_addr;
-
-						mask_addr =
-							((char *)param_struct
-							+ item->u.lst.set_off);
-						*(uint32_t *)mask_addr
-							|= item->u.lst.bit;
-					}	
-				}
-				LogFullDebug(COMPONENT_CONFIG,
-					     "%p CONFIG_ENUM_SET %s mask=%08x flags=%08x"
-					     " value=%08"PRIx32,
-					     param_addr,
-					     item->name,
-					     item->u.lst.mask, num32,
-					     *(uint32_t *)param_addr);
 				break;
 			case CONFIG_IP_ADDR:
 				convert_inet_addr(term_node, item,
 						  (sockaddr_t *)param_addr,
 						  err_type);
-				break;
-			case CONFIG_INET_PORT:
-				if (convert_number(term_node, item,
-						   &num64, err_type))
-					*(uint16_t *)param_addr =
-						htons((uint16_t)num64);
 				break;
 			case CONFIG_BLOCK:
 				if (!proc_block(node, item, param_addr,
@@ -1250,7 +1234,7 @@ static int do_block_load(struct config_node *blk,
 						  "Cannot set value for type(%d) yet",
 						  item->type);
 				err_type->internal = true;
-				err_type->errors++;
+				errors = ++err_type->errors;
 				break;
 				}
 			node = next_node;
@@ -1388,10 +1372,21 @@ static bool proc_block(struct config_node *node,
 	}
 	if (item->u.blk.display != NULL)
 		item->u.blk.display("RESULT", node, link_mem, param_struct);
+
+	if (err_type->dispose) {
+		/* We had a config update case where this block must be
+		 * disposed of. Need to clear the flag so the next config
+		 * block processed gets a clear slate.
+		 */
+		(void)item->u.blk.init(link_mem, param_struct);
+		err_type->dispose = false;
+	}
+
 	return true;
 
 err_out:
 	(void)item->u.blk.init(link_mem, param_struct);
+	err_type->dispose = false;
 	return false;
 }
 
@@ -1565,8 +1560,6 @@ static char *parse_args(char *arg_str, struct expr_parse_arg **argp)
 	saved_char = *sp;
 	*sp = '\0';
 	arg = gsh_calloc(1, sizeof(struct expr_parse_arg));
-	if (arg == NULL)
-		return NULL;
 	arg->name = gsh_strdup(name);
 	arg->value = gsh_strdup(val);
 	*argp = arg;
@@ -1982,4 +1975,3 @@ int load_config_from_parse(config_file_t config,
 	}
 	return found;
 }
-

@@ -1,4 +1,7 @@
-/*-------------------------------------------------------------------------
+/**------------------------------------------------------------------------
+ * @file gpfsext.c
+ * @brief Use ioctl to call into the GPFS kernel module.
+ *
  * NAME:        gpfs_ganesha()
  *
  * FUNCTION:    Use ioctl to call into the GPFS kernel module.
@@ -14,7 +17,6 @@
  *-------------------------------------------------------------------------*/
 
 #include "config.h"
-
 #include <sys/errno.h>
 #include <sys/fcntl.h>
 #include <sys/ioctl.h>
@@ -27,8 +29,10 @@
 #include <sys/stat.h>
 #include "include/gpfs.h"
 #endif
+#include "fsal.h"
 
 #include "include/gpfs_nfs.h"
+#include "gsh_config.h"
 
 struct kxArgs {
 	signed long arg1;
@@ -59,16 +63,16 @@ static void valgrind_kganesha(struct kxArgs *args)
 	{
 		struct name_handle_arg *arg = (void *)args->arg2;
 
-		VALGRIND_MAKE_MEM_DEFINED(arg->handle->f_handle,
-					  arg->handle->handle_size);
+		VALGRIND_MAKE_MEM_DEFINED(arg->handle,
+					  sizeof(struct gpfs_file_handle));
 		break;
 	}
 	case OPENHANDLE_GET_HANDLE:
 	{
 		struct get_handle_arg *arg = (void *)args->arg2;
 
-		VALGRIND_MAKE_MEM_DEFINED(arg->out_fh->f_handle,
-					  arg->out_fh->handle_size);
+		VALGRIND_MAKE_MEM_DEFINED(arg->out_fh,
+					  sizeof(struct gpfs_file_handle));
 		break;
 	}
 	case OPENHANDLE_STAT_BY_NAME:
@@ -82,8 +86,8 @@ static void valgrind_kganesha(struct kxArgs *args)
 	{
 		struct create_name_arg *arg = (void *)args->arg2;
 
-		VALGRIND_MAKE_MEM_DEFINED(arg->new_fh->f_handle,
-					  arg->new_fh->handle_size);
+		VALGRIND_MAKE_MEM_DEFINED(arg->new_fh,
+					  sizeof(struct gpfs_file_handle));
 		break;
 	}
 	case OPENHANDLE_READLINK_BY_FH:
@@ -129,19 +133,50 @@ static void valgrind_kganesha(struct kxArgs *args)
 }
 #endif
 
+int gpfs_op2index(int op)
+{
+	if ((op < GPFS_MIN_OP) || (op > GPFS_MAX_OP) ||
+	    (op == 103 || op == 104 || op == 105))
+		return GPFS_STAT_PH_INDEX;
+	else
+		return (op - GPFS_MIN_OP);
+}
+
+/**
+ *  @param op Operation
+ *  @param *oarg Arguments
+ *
+ *  @return Result
+*/
 int gpfs_ganesha(int op, void *oarg)
 {
-	int rc;
-	static int gpfs_fd = -1;
+	int rc, idx;
+	static int gpfs_fd = -2;
 	struct kxArgs args;
+	struct timespec start_time;
+	struct timespec stop_time;
+	nsecs_elapsed_t resp_time;
 
 	if (gpfs_fd < 0) {
+		/* If we enable fsal_trace in the config, the following
+		 * LogFatal would call us here again for fsal tracing!
+		 * Since we can't log as we are unable to open the device,
+		 * just exit.
+		 *
+		 * Also, exit handler _dl_fini() will call gpfs_unload
+		 * which will call release_log_facility that tries to
+		 * acquire log_rwlock a second time! So do an immediate
+		 * exit.
+		 */
+		if (gpfs_fd == -1) /* failed in a prior invocation */
+			_exit(1);
+
+		assert(gpfs_fd == -2);
 		gpfs_fd = open(GPFS_DEVNAMEX, O_RDONLY);
-		if (gpfs_fd < 0) {
-			fprintf(stderr,
-				"Ganesha call to GPFS failed with ENOSYS\n");
-			return ENOSYS;
-		}
+		if (gpfs_fd == -1)
+			LogFatal(COMPONENT_FSAL,
+				"open of %s failed with errno %d",
+				GPFS_DEVNAMEX, errno);
 		(void)fcntl(gpfs_fd, F_SETFD, FD_CLOEXEC);
 	}
 
@@ -150,7 +185,26 @@ int gpfs_ganesha(int op, void *oarg)
 #ifdef _VALGRIND_MEMCHECK
 	valgrind_kganesha(&args);
 #endif
-	rc = ioctl(gpfs_fd, kGanesha, &args);
+	if (nfs_param.core_param.enable_FSALSTATS) {
+		/* Collect FSAL stats */
+		now(&start_time);
+		rc = ioctl(gpfs_fd, kGanesha, &args);
+		now(&stop_time);
+		resp_time = timespec_diff(&start_time, &stop_time);
 
+		/* record FSAL stats */
+		idx = gpfs_op2index(op);
+		(void)atomic_inc_uint64_t(&gpfs_stats.op_stats[idx].num_ops);
+		(void)atomic_add_uint64_t(&gpfs_stats.op_stats[idx].resp_time,
+				  resp_time);
+		if (gpfs_stats.op_stats[idx].resp_time_max < resp_time)
+			gpfs_stats.op_stats[idx].resp_time_max = resp_time;
+		if (gpfs_stats.op_stats[idx].resp_time_min == 0 ||
+		    gpfs_stats.op_stats[idx].resp_time_min > resp_time)
+			gpfs_stats.op_stats[idx].resp_time_min = resp_time;
+
+	} else {
+		rc = ioctl(gpfs_fd, kGanesha, &args);
+	}
 	return rc;
 }

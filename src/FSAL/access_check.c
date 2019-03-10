@@ -391,7 +391,7 @@ static void fsal_print_access_by_acl(int naces, int ace_number,
 				     bool is_dir,
 				     struct user_cred *creds)
 {
-	char str[LOG_BUFF_LEN];
+	char str[LOG_BUFF_LEN] = "\0";
 	struct display_buffer dspbuf = { sizeof(str), str, str };
 	int b_left;
 
@@ -474,7 +474,8 @@ static fsal_status_t fsal_check_access_acl(struct user_cred *creds,
 	gid = p_object_attributes->group;
 	pacl = p_object_attributes->acl;
 	is_dir = (p_object_attributes->type == DIRECTORY);
-	is_root = creds->caller_uid == 0;
+	is_root = op_ctx->fsal_export->exp_ops.is_superuser(
+						op_ctx->fsal_export, creds);
 
 	if (is_root) {
 		if (is_dir) {
@@ -504,7 +505,7 @@ static fsal_status_t fsal_check_access_acl(struct user_cred *creds,
 		     "file acl=%p, file uid=%u, file gid=%u, ", pacl, uid, gid);
 
 	if (isFullDebug(COMPONENT_NFS_V4_ACL)) {
-		char str[LOG_BUFF_LEN];
+		char str[LOG_BUFF_LEN] = "\0";
 		struct display_buffer dspbuf = { sizeof(str), str, str };
 
 		(void)display_fsal_v4mask(&dspbuf, v4mask,
@@ -721,7 +722,8 @@ fsal_check_access_no_acl(struct user_cred *creds,
 		     creds->caller_uid, creds->caller_gid,
 		     access_type);
 
-	if (creds->caller_uid == 0) {
+	if (op_ctx->fsal_export->exp_ops.is_superuser(op_ctx->fsal_export,
+						      creds)) {
 		if (p_object_attributes->type == DIRECTORY) {
 			if (allowed != NULL)
 				*allowed = access_type;
@@ -816,25 +818,50 @@ fsal_check_access_no_acl(struct user_cred *creds,
 fsal_status_t fsal_test_access(struct fsal_obj_handle *obj_hdl,
 			       fsal_accessflags_t access_type,
 			       fsal_accessflags_t *allowed,
-			       fsal_accessflags_t *denied)
+			       fsal_accessflags_t *denied,
+			       bool owner_skip)
 {
-	if (IS_FSAL_ACE4_REQ(access_type) ||
-	    (obj_hdl->attrs->acl && IS_FSAL_ACE4_MASK_VALID(access_type))) {
-		return fsal_check_access_acl(op_ctx->creds,
-					     FSAL_ACE4_MASK(access_type),
-					     allowed, denied, obj_hdl->attrs);
-	} else {		/* fall back to use mode to check access. */
-		return fsal_check_access_no_acl(op_ctx->creds,
-						FSAL_MODE_MASK(access_type),
-						allowed, denied,
-						obj_hdl->attrs);
+	struct attrlist attrs;
+	fsal_status_t status;
+
+	fsal_prepare_attrs(&attrs,
+			   op_ctx->fsal_export->exp_ops.fs_supported_attrs(
+							op_ctx->fsal_export)
+			   & (ATTRS_CREDS | ATTR_MODE | ATTR_ACL));
+
+	status = obj_hdl->obj_ops->getattrs(obj_hdl, &attrs);
+
+	if (FSAL_IS_ERROR(status))
+		goto out;
+
+	if (owner_skip && attrs.owner == op_ctx->creds->caller_uid) {
+		status = fsalstat(ERR_FSAL_NO_ERROR, 0);
+		goto out;
 	}
+
+	if (IS_FSAL_ACE4_REQ(access_type) ||
+	    (attrs.acl != NULL && IS_FSAL_ACE4_MASK_VALID(access_type))) {
+		status = fsal_check_access_acl(op_ctx->creds,
+					       FSAL_ACE4_MASK(access_type),
+					       allowed, denied, &attrs);
+	} else {		/* fall back to use mode to check access. */
+		status = fsal_check_access_no_acl(op_ctx->creds,
+						  FSAL_MODE_MASK(access_type),
+						  allowed, denied, &attrs);
+	}
+
+ out:
+
+	/* Done with the attrs */
+	fsal_release_attrs(&attrs);
+
+	return status;
 }
 
 uid_t ganesha_uid;
 gid_t ganesha_gid;
 int ganesha_ngroups;
-gid_t *ganesha_groups = NULL;
+gid_t *ganesha_groups;
 
 void fsal_set_credentials(const struct user_cred *creds)
 {
@@ -844,22 +871,27 @@ void fsal_set_credentials(const struct user_cred *creds)
 	setuser(creds->caller_uid);
 }
 
+bool fsal_set_credentials_only_one_user(const struct user_cred *creds)
+{
+	if (creds->caller_uid == ganesha_uid
+		    && creds->caller_gid == ganesha_gid)
+		return true;
+	else
+		return false;
+}
+
 void fsal_save_ganesha_credentials(void)
 {
 	int i;
 	char buffer[1024], *p = buffer;
 
-	ganesha_uid = setuser(0);
-	setuser(ganesha_uid);
-	ganesha_gid = setgroup(0);
-	setgroup(ganesha_gid);
+	ganesha_uid = getuser();
+	ganesha_gid = getgroup();
+
 	ganesha_ngroups = getgroups(0, NULL);
 	if (ganesha_ngroups > 0) {
 		ganesha_groups = gsh_malloc(ganesha_ngroups * sizeof(gid_t));
-		if (ganesha_groups == NULL) {
-			LogFatal(COMPONENT_FSAL,
-				 "Could not allocate memory for Ganesha group list");
-		}
+
 		if (getgroups(ganesha_ngroups, ganesha_groups) !=
 		    ganesha_ngroups) {
 			LogFatal(COMPONENT_FSAL,

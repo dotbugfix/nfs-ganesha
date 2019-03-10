@@ -99,11 +99,13 @@ static nfsstat4 ds_read(struct fsal_ds_handle *const ds_pub,
 	struct dsread_arg rarg;
 	unsigned int *fh;
 	int errsv = 0;
-
+	struct gpfs_fsal_export *exp = container_of(op_ctx->fsal_export,
+					struct gpfs_fsal_export, export);
+	int export_fd = exp->export_fd;
 
 	fh = (int *)&(gpfs_handle->f_handle);
 
-	rarg.mountdirfd = ds->gpfs_fs->root_fd;
+	rarg.mountdirfd = export_fd;
 	rarg.handle = gpfs_handle;
 	rarg.bufP = buffer;
 	rarg.offset = offset;
@@ -170,10 +172,13 @@ static nfsstat4 ds_read_plus(struct fsal_ds_handle *const ds_pub,
 	unsigned int *fh;
 	uint64_t filesize;
 	int errsv = 0;
+	struct gpfs_fsal_export *exp = container_of(op_ctx->fsal_export,
+					struct gpfs_fsal_export, export);
+	int export_fd = exp->export_fd;
 
 	fh = (int *)&(gpfs_handle->f_handle);
 
-	rarg.mountdirfd = ds->gpfs_fs->root_fd;
+	rarg.mountdirfd = export_fd;
 	rarg.handle = gpfs_handle;
 	rarg.bufP = buffer;
 	rarg.offset = offset;
@@ -262,12 +267,15 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
 	unsigned int *fh;
 	struct gsh_buffdesc key;
 	int errsv = 0;
+	struct gpfs_fsal_export *exp = container_of(op_ctx->fsal_export,
+					struct gpfs_fsal_export, export);
+	int export_fd = exp->export_fd;
 
 	fh = (int *)&(gpfs_handle->f_handle);
 
 	memset(writeverf, 0, NFS4_VERIFIER_SIZE);
 
-	warg.mountdirfd = ds->gpfs_fs->root_fd;
+	warg.mountdirfd = export_fd;
 	warg.handle = gpfs_handle;
 	warg.bufP = (char *)buffer;
 	warg.offset = offset;
@@ -296,11 +304,9 @@ static nfsstat4 ds_write(struct fsal_ds_handle *const ds_pub,
 
 	key.addr = gpfs_handle;
 	key.len = gpfs_handle->handle_key_size;
-	fsal_invalidate(req_ctx->fsal_export->fsal, &key,
-			CACHE_INODE_INVALIDATE_ATTRS |
-			CACHE_INODE_INVALIDATE_CONTENT);
-
-	set_gpfs_verifier(writeverf);
+	req_ctx->fsal_export->up_ops->invalidate(
+			req_ctx->fsal_export->up_ops, &key,
+			FSAL_UP_INVALIDATE_CACHE);
 
 	*written_length = amount_written;
 
@@ -350,12 +356,15 @@ static nfsstat4 ds_write_plus(struct fsal_ds_handle *const ds_pub,
 	unsigned int *fh;
 	struct gsh_buffdesc key;
 	int errsv = 0;
+	struct gpfs_fsal_export *exp = container_of(op_ctx->fsal_export,
+					struct gpfs_fsal_export, export);
+	int export_fd = exp->export_fd;
 
 	fh = (int *)&(gpfs_handle->f_handle);
 
 	memset(writeverf, 0, NFS4_VERIFIER_SIZE);
 
-	warg.mountdirfd = ds->gpfs_fs->root_fd;
+	warg.mountdirfd = export_fd;
 	warg.handle = gpfs_handle;
 	warg.bufP = (char *)buffer;
 	warg.offset = offset;
@@ -387,11 +396,9 @@ static nfsstat4 ds_write_plus(struct fsal_ds_handle *const ds_pub,
 
 	key.addr = gpfs_handle;
 	key.len = gpfs_handle->handle_key_size;
-	fsal_invalidate(req_ctx->fsal_export->fsal, &key,
-			CACHE_INODE_INVALIDATE_ATTRS |
-			CACHE_INODE_INVALIDATE_CONTENT);
-
-	set_gpfs_verifier(writeverf);
+	req_ctx->fsal_export->up_ops->invalidate(
+			req_ctx->fsal_export->up_ops, &key,
+			FSAL_UP_INVALIDATE_CACHE);
 
 	*written_length = amount_written;
 
@@ -463,7 +470,6 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
 	struct gpfs_ds *ds;		/* Handle to be created */
 	struct fsal_filesystem *fs;
 	struct fsal_fsid__ fsid;
-	enum fsid_type fsid_type;
 
 	*handle = NULL;
 
@@ -490,9 +496,9 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
 	   flags, fh->handle_size, fh->handle_type, fh->handle_version,
 	   fh->handle_key_size, fh->handle_fsid[0], fh->handle_fsid[1]);
 
-	gpfs_extract_fsid(fh, &fsid_type, &fsid);
+	gpfs_extract_fsid(fh, &fsid);
 
-	fs = lookup_fsid(&fsid, fsid_type);
+	fs = lookup_fsid(&fsid, GPFS_FSID_TYPE);
 	if (fs == NULL) {
 		LogInfo(COMPONENT_FSAL,
 			"Could not find filesystem for fsid=0x%016"PRIx64
@@ -509,9 +515,7 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
 		return NFS4ERR_STALE;
 	}
 
-	ds = gsh_calloc(sizeof(struct gpfs_ds), 1);
-	if (ds == NULL)
-		return NFS4ERR_SERVERFAULT;
+	ds = gsh_calloc(1, sizeof(struct gpfs_ds));
 
 	*handle = &ds->ds;
 	fsal_ds_handle_init(*handle, pds);
@@ -521,7 +525,7 @@ static nfsstat4 make_ds_handle(struct fsal_pnfs_ds *const pds,
 
 	ds->connected = false;
 
-	ds->gpfs_fs = fs->private;
+	ds->gpfs_fs = fs->private_data;
 
 	memcpy(&ds->wire, desc->addr, desc->len);
 	return NFS4_OK;
@@ -534,6 +538,9 @@ static nfsstat4 pds_permissions(struct fsal_pnfs_ds *const pds,
 	return nfs4_export_check_access(req);
 }
 
+/**
+ *  @param ops FSAL pNFS ds ops
+ */
 void pnfs_ds_ops_init(struct fsal_pnfs_ds_ops *ops)
 {
 	memcpy(ops, &def_pnfs_ds_ops, sizeof(struct fsal_pnfs_ds_ops));

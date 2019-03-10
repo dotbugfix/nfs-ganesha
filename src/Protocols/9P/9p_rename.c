@@ -39,7 +39,6 @@
 #include "nfs_core.h"
 #include "nfs_exports.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
@@ -55,8 +54,8 @@ int _9p_rename(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	struct _9p_fid *pfid = NULL;
 	struct _9p_fid *pdfid = NULL;
 
-	char newname[MAXNAMLEN];
-	cache_inode_status_t cache_status;
+	char newname[MAXNAMLEN+1];
+	fsal_status_t fsal_status;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -91,18 +90,32 @@ int _9p_rename(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 
 	/* Check that it is a valid fid */
 	if (pdfid == NULL || pdfid->pentry == NULL) {
-		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *fid);
+		LogDebug(COMPONENT_9P, "request on invalid fid=%u", *dfid);
 		return _9p_rerror(req9p, msgtag, EIO, plenout, preply);
 	}
 
-	snprintf(newname, MAXNAMLEN, "%.*s", *name_len, name_str);
+	/* Check that pfid and pdfid are in the same export. */
+	if (pfid->fid_export != NULL && pdfid->fid_export != NULL &&
+	    pfid->fid_export->export_id != pdfid->fid_export->export_id) {
+		LogDebug(COMPONENT_9P,
+			 "request on fid=%u and dfid=%u crosses exports",
+			 *fid, *dfid);
+		return _9p_rerror(req9p, msgtag, EXDEV, plenout, preply);
+	}
 
-	cache_status =
-	    cache_inode_rename(pfid->ppentry, pfid->name, pdfid->pentry,
-			       newname);
-	if (cache_status != CACHE_INODE_SUCCESS)
+	if (*name_len >= sizeof(newname)) {
+		LogDebug(COMPONENT_9P, "request with name too long (%u)",
+			 *name_len);
+		return _9p_rerror(req9p, msgtag, ENAMETOOLONG, plenout,
+				  preply);
+	}
+	snprintf(newname, sizeof(newname), "%.*s", *name_len, name_str);
+
+	fsal_status = fsal_rename(pfid->ppentry, pfid->name, pdfid->pentry,
+				  newname);
+	if (FSAL_IS_ERROR(fsal_status))
 		return _9p_rerror(req9p, msgtag,
-				  _9p_tools_errno(cache_status), plenout,
+				  _9p_tools_errno(fsal_status), plenout,
 				  preply);
 
 	/* Build the reply */

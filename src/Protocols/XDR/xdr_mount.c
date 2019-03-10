@@ -35,19 +35,11 @@ fhandle3 *objp;
 #else
 	register long __attribute__ ((__unused__)) * buf;
 #endif
-	if (xdrs->x_op == XDR_ENCODE) {
-		file_handle_v3_t *fh = (file_handle_v3_t *)objp->fhandle3_val;
-		fh->exportid = htons(fh->exportid);
-	}
 	if (!inline_xdr_bytes
 	    (xdrs, (char **)&objp->fhandle3_val, (u_int *) & objp->fhandle3_len,
 	     NFS3_FHSIZE))
 		return (false);
 
-	if (xdrs->x_op == XDR_DECODE) {
-		file_handle_v3_t *fh = (file_handle_v3_t *)objp->fhandle3_val;
-		fh->exportid = ntohs(fh->exportid);
-	}
 	return (true);
 }
 
@@ -94,9 +86,8 @@ groups *objp;
 	register long __attribute__ ((__unused__)) * buf;
 #endif
 
-	if (!xdr_pointer
-	    (xdrs, (char **)objp, sizeof(struct groupnode),
-	     (xdrproc_t) xdr_groupnode))
+	if (!xdr_pointer(xdrs, (void **)objp, sizeof(struct groupnode),
+			 (xdrproc_t) xdr_groupnode))
 		return (false);
 	return (true);
 }
@@ -130,9 +121,8 @@ exports *objp;
 	register long __attribute__ ((__unused__)) * buf;
 #endif
 
-	if (!xdr_pointer
-	    (xdrs, (char **)objp, sizeof(struct exportnode),
-	     (xdrproc_t) xdr_exportnode))
+	if (!xdr_pointer(xdrs, (void **)objp, sizeof(struct exportnode),
+			 (xdrproc_t) xdr_exportnode))
 		return (false);
 	return (true);
 }
@@ -168,9 +158,8 @@ mountlist *objp;
 	register long __attribute__ ((__unused__)) * buf;
 #endif
 
-	if (!xdr_pointer
-	    (xdrs, (char **)objp, sizeof(struct mountbody),
-	     (xdrproc_t) xdr_mountbody))
+	if (!xdr_pointer(xdrs, (void **)objp, sizeof(struct mountbody),
+			 (xdrproc_t) xdr_mountbody))
 		return (false);
 	return (true);
 }
@@ -210,8 +199,8 @@ mountres3_ok *objp;
 		return (false);
 	if (!xdr_array
 	    (xdrs, (char **)&objp->auth_flavors.auth_flavors_val,
-	     (u_int *) & objp->auth_flavors.auth_flavors_len, ~0, sizeof(int),
-	     (xdrproc_t) xdr_int))
+	     &objp->auth_flavors.auth_flavors_len, XDR_ARRAY_MAXLEN,
+	     sizeof(int), (xdrproc_t) xdr_int))
 		return (false);
 	return (true);
 }

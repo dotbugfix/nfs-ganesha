@@ -44,40 +44,12 @@
 #include "abstract_atomic.h"
 #include "gsh_intrinsic.h"
 
-struct _ganesha_health {
-	int old_enqueue;
-	int old_dequeue;
-	int enqueue_diff;
-	int dequeue_diff;
-};
-
-struct _ganesha_health healthstats;
-
-bool get_ganesha_health(struct _ganesha_health *hstats)
-{
-	int newenq, newdeq;
-
-	newenq = get_enqueue_count();
-	newdeq = get_dequeue_count();
-	hstats->enqueue_diff = newenq - hstats->old_enqueue;
-	hstats->dequeue_diff = newdeq - hstats->old_dequeue;
-	hstats->old_enqueue = newenq;
-	hstats->old_dequeue = newdeq;
-
-	/*
-	 * health state indicates if we are making progress draining the
-	 * request queue.
-	 */
-	return (hstats->enqueue_diff > 0 && hstats->dequeue_diff > 0) ||
-		(hstats->enqueue_diff == 0);
-}
-
 int dbus_heartbeat_cb(void *arg)
 {
 	SetNameFunction("dbus_heartbeat");
 	int err = 0;
 	int rc = BCAST_STATUS_OK;
-	dbus_bool_t ishealthy = get_ganesha_health(&healthstats);
+	dbus_bool_t ishealthy = nfs_health();
 
 	if (ishealthy) {
 		/* send the heartbeat pulse */
@@ -93,18 +65,13 @@ int dbus_heartbeat_cb(void *arg)
 				err);
 			rc = BCAST_STATUS_WARN;
 		}
-	} else
-		LogWarn(COMPONENT_DBUS,
-			"Health status is unhealthy.  Not sending heartbeat");
+	}
 
 	return rc;
 }
 
 void init_heartbeat(void)
 {
-	healthstats.old_enqueue = get_enqueue_count();
-	healthstats.old_dequeue = get_dequeue_count();
-
 	add_dbus_broadcast(&dbus_heartbeat_cb,
 			   NULL,
 			   nfs_param.core_param.heartbeat_freq*NS_PER_MSEC,

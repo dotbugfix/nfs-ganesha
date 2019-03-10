@@ -93,12 +93,7 @@ int fridgethr_init(struct fridgethr **frout, const char *s,
 	}
 
 	*frout = NULL;
-	if (frobj == NULL) {
-		LogMajor(COMPONENT_THREAD,
-			 "Unable to allocate thread fridge for %s", s);
-		rc = ENOMEM;
-		goto out;
-	}
+
 	frobj->p = *p;
 
 	frobj->s = NULL;
@@ -140,12 +135,6 @@ int fridgethr_init(struct fridgethr **frout, const char *s,
 	mutexinit = true;
 
 	frobj->s = gsh_strdup(s);
-	if (!frobj->s) {
-		LogMajor(COMPONENT_THREAD,
-			 "Unable to allocate memory in fridge %s", s);
-		rc = ENOMEM;
-		goto out;
-	}
 
 	frobj->command = fridgethr_comm_run;
 	frobj->transitioning = false;
@@ -460,7 +449,7 @@ static bool fridgethr_freeze(struct fridgethr *fr,
 		/* Nothing to do, loop around. */
 		if (fr->command != fridgethr_comm_stop
 		    && ((fr->command == fridgethr_comm_pause)
-			|| (!fridgethr_deferredwork(fr)))
+			|| fridgethr_deferredwork(fr))
 		    && (fr->p.flavor == fridgethr_flavor_worker)) {
 			PTHREAD_MUTEX_lock(&fe->ctx.mtx);
 			fe->frozen = true;
@@ -603,9 +592,7 @@ static int fridgethr_spawn(struct fridgethr *fr,
 	/* The condition variable has/not been initialized */
 	bool conditioned = false;
 
-	fe = gsh_calloc(sizeof(struct fridgethr_entry), 1);
-	if (fe == NULL)
-		goto create_err;
+	fe = gsh_calloc(1, sizeof(struct fridgethr_entry));
 
 	glist_init(&fe->thread_link);
 	fe->fr = fr;
@@ -662,8 +649,7 @@ static int fridgethr_spawn(struct fridgethr *fr,
 	if (mutexed)
 		PTHREAD_MUTEX_destroy(&fe->ctx.mtx);
 
-	if (fe != NULL)
-		gsh_free(fe);
+	gsh_free(fe);
 	PTHREAD_MUTEX_unlock(&fr->mtx);
 
 	return rc;
@@ -692,13 +678,7 @@ static int fridgethr_queue(struct fridgethr *fr,
 	assert(fr->p.deferment == fridgethr_defer_queue);
 
 	q = gsh_malloc(sizeof(struct fridgethr_work));
-	if (q == NULL) {
-		PTHREAD_MUTEX_unlock(&fr->mtx);
-		LogMajor(COMPONENT_THREAD,
-			 "Unable to allocate memory for work queue item in fridge %s",
-			 fr->s);
-		return ENOMEM;
-	}
+
 	glist_init(&q->link);
 	q->func = func;
 	q->arg = arg;
@@ -1332,10 +1312,15 @@ int fridgethr_sync_command(struct fridgethr *fr, fridgethr_comm_t command,
 			assert(rc == 0);
 		} else {
 			rc = pthread_cond_timedwait(&cv, &mtx, &ts);
-			if (rc == ETIMEDOUT)
+			if (rc == ETIMEDOUT) {
 				LogMajor(COMPONENT_THREAD,
 					"Sync command seems to be stalled");
-			else
+				/* we timed out and the callback
+				 * was not triggered, therefore,
+				 * we must exit the loop manually.
+				 */
+				break;
+			} else
 				assert(rc == 0);
 		}
 	}
@@ -1401,11 +1386,7 @@ int fridgethr_populate(struct fridgethr *fr,
 		struct fridgethr_entry *fe = NULL;
 		int rc = 0;
 
-		fe = gsh_calloc(sizeof(struct fridgethr_entry), 1);
-		if (fe == NULL) {
-			PTHREAD_MUTEX_unlock(&fr->mtx);
-			return ENOMEM;
-		}
+		fe = gsh_calloc(1, sizeof(struct fridgethr_entry));
 
 		/* Make a new thread */
 		++(fr->nthreads);

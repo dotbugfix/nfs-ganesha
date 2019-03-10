@@ -28,21 +28,17 @@
 #include "fsal_types.h"
 #include "fsal_api.h"
 #include "posix_acls.h"
+#include "FSAL/fsal_commonlib.h"
 #include <glusterfs/api/glfs.h>
 #include <glusterfs/api/glfs-handles.h>
+#include "nfs_exports.h"
 
 #define GLUSTER_VOLNAME_KEY  "volume"
 #define GLUSTER_HOSTNAME_KEY "hostname"
 #define GLUSTER_VOLPATH_KEY  "volpath"
 
 /* defined the set of attributes supported with POSIX */
-#define GLUSTERFS_SUPPORTED_ATTRIBUTES (	 \
-ATTR_TYPE     | ATTR_SIZE     |		  \
-ATTR_FSID     | ATTR_FILEID   |		  \
-ATTR_MODE     | ATTR_NUMLINKS | ATTR_OWNER     | \
-ATTR_GROUP    | ATTR_ATIME    | ATTR_RAWDEV    | \
-ATTR_CTIME    | ATTR_MTIME    | ATTR_SPACEUSED | \
-ATTR_CHGTIME  | ATTR_ACL)
+#define GLUSTERFS_SUPPORTED_ATTRIBUTES (ATTRS_POSIX | ATTR_ACL)
 
 /**
  * The attributes this FSAL can set.
@@ -82,7 +78,7 @@ ATTR_ACL)
 		GLAPI_UUID_LENGTH)
 
 /* Flags to determine if ACLs are supported */
-#define NFSv4_ACL_SUPPORT (glfs_export->acl_enable)
+#define NFSv4_ACL_SUPPORT (!op_ctx_export_has_option(EXPORT_OPTION_DISABLE_ACL))
 
 /* define flags for attr_valid */
 #define XATTR_STAT      (1 << 0) /* 01 */
@@ -96,7 +92,7 @@ typedef enum {
 	lat_lookup,
 	lat_create,
 	lat_getattrs,
-	lat_handle_digest,
+	lat_handle_to_wire,
 	lat_handle_to_key,
 	lat_extract_handle,
 	lat_create_handle,
@@ -107,10 +103,10 @@ typedef enum {
 	lat_file_unlink,
 	lat_file_open,
 	lat_file_read,
+	lat_file_seek,
 	lat_file_write,
 	lat_commit,
 	lat_file_close,
-	lat_lru_cleanup,
 	lat_makesymlink,
 	lat_readsymlink,
 	lat_linkfile,
@@ -127,32 +123,57 @@ struct latency_data {
 #endif
 
 struct glusterfs_fsal_module {
-	struct fsal_staticfsinfo_t fs_info;
 	struct fsal_module fsal;
+	struct fsal_obj_ops handle_ops;
+	struct glist_head  fs_obj; /* list of glusterfs_fs filesystem objects */
+	pthread_mutex_t   lock; /* lock to protect above list */
+};
+extern struct glusterfs_fsal_module GlusterFS;
+
+struct glusterfs_fs {
+	struct glist_head fs_obj; /* link to glusterfs_fs filesystem objects */
+	char      *volname;
+	glfs_t    *fs;
+	const struct fsal_up_vector *up_ops;    /*< Upcall operations */
+	int64_t    refcnt;
+	pthread_t  up_thread; /* upcall thread */
+	int8_t destroy_mode;
+	uint64_t up_poll_usec;
+	bool   enable_upcall;
 };
 
 struct glusterfs_export {
-	glfs_t *gl_fs;
+	struct glusterfs_fs *gl_fs;
 	char *mount_path;
 	char *export_path;
 	uid_t saveduid;
 	gid_t savedgid;
 	struct fsal_export export;
-	bool acl_enable;
 	bool pnfs_ds_enabled;
 	bool pnfs_mds_enabled;
-	int8_t destroy_mode;
-	pthread_t up_thread; /* upcall thread */
+};
+
+struct glusterfs_fd {
+	/** The open and share mode etc. This MUST be first in every
+	 *  file descriptor structure.
+	 */
+	fsal_openflags_t openflags;
+
+	/* rw lock to protect the file descriptor */
+	pthread_rwlock_t fdlock;
+
+	/** Gluster file descriptor. */
+	struct glfs_fd *glfd;
+	struct user_cred creds; /* user creds opening fd*/
 };
 
 struct glusterfs_handle {
 	struct glfs_object *glhandle;
 	unsigned char globjhdl[GLAPI_HANDLE_LENGTH];	/* handle descriptor,
 							   for wire handle */
-	struct glfs_fd *glfd;
-	fsal_openflags_t openflags;
+	struct glusterfs_fd globalfd;
 	struct fsal_obj_handle handle;	/* public FSAL handle */
-	struct attrlist attributes; /* Attributes of this Object. */
+	struct fsal_share share; /* share_reservations */
 
 	/* following added for pNFS support */
 	uint64_t rd_issued;
@@ -194,6 +215,23 @@ typedef struct fsal_xstat__ {
 	bool is_dir;
 } glusterfs_fsal_xstat_t;
 
+struct glusterfs_state_fd {
+	struct state_t state;
+	struct glusterfs_fd glusterfs_fd;
+};
+
+void setglustercreds(struct glusterfs_export *glfs_export, uid_t *uid,
+		     gid_t *gid, unsigned int ngrps, gid_t *groups,
+		     char *file, int line, char *function);
+
+#define SET_GLUSTER_CREDS(glfs_export, uid, gid, glen, garray) do {	\
+	int old_errno = errno;						\
+	((void) setglustercreds(glfs_export, uid, gid, glen,		\
+				garray, (char *) __FILE__,		\
+				__LINE__, (char *) __func__));		\
+	errno = old_errno;						\
+} while (0)
+
 #ifdef GLTIMING
 struct latency_data glfsal_latencies[LATENCY_SLOTS];
 
@@ -210,12 +248,15 @@ fsal_status_t gluster2fsal_error(const int gluster_errorcode);
 void stat2fsal_attributes(const struct stat *buffstat,
 			  struct attrlist *fsalattr);
 
-struct fsal_staticfsinfo_t *gluster_staticinfo(struct fsal_module *hdl);
+void construct_handle(struct glusterfs_export *glexport, const struct stat *st,
+		      struct glfs_object *glhandle, unsigned char *globjhdl,
+		      struct glusterfs_handle **obj, const char *vol_uuid);
 
-int construct_handle(struct glusterfs_export *glexport, const struct stat *st,
-		     struct glfs_object *glhandle, unsigned char *globjhdl,
-		     int len, struct glusterfs_handle **obj,
-		     const char *vol_uuid);
+fsal_status_t glfs2fsal_handle(struct glusterfs_export *glfs_export,
+			       struct glfs_object *glhandle,
+			       struct fsal_obj_handle **pub_handle,
+			       struct stat *sb,
+			       struct attrlist *attrs_out);
 
 fsal_status_t glusterfs_create_export(struct fsal_module *fsal_hdl,
 				      void *parse_node,
@@ -226,9 +267,6 @@ void gluster_cleanup_vars(struct glfs_object *glhandle);
 
 bool fs_specific_has(const char *fs_specific, const char *key, char *val,
 		     int *max_val_bytes);
-
-int setglustercreds(struct glusterfs_export *glfs_export, uid_t *uid,
-		    gid_t *gid, unsigned int ngrps, gid_t *groups);
 
 fsal_status_t glusterfs_get_acl(struct glusterfs_export *glfs_export,
 				 struct glfs_object *objhandle,
@@ -243,6 +281,8 @@ fsal_status_t glusterfs_process_acl(struct glfs *fs,
 				    struct glfs_object *object,
 				    struct attrlist *attrs,
 				    glusterfs_fsal_xstat_t *buffxstat);
+
+void glusterfs_free_fs(struct glusterfs_fs *gl_fs);
 
 /*
  * Following have been introduced for pNFS support
@@ -267,8 +307,10 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
 
 /* UP thread routines */
 void *GLUSTERFSAL_UP_Thread(void *Arg);
-int initiate_up_thread(struct glusterfs_export *glfsexport);
-int upcall_inode_invalidate(struct glusterfs_export *glfsexport,
+int initiate_up_thread(struct glusterfs_fs *gl_fs);
+int upcall_inode_invalidate(struct glusterfs_fs *gl_fs,
 			    struct glfs_object *object);
+void gluster_process_upcall(struct glfs_upcall *cbk, void *data);
 
+fsal_status_t glusterfs_close_my_fd(struct glusterfs_fd *my_fd);
 #endif				/* GLUSTER_INTERNAL */

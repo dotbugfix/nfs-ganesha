@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/python2
 #
 # ganesha_mgr_utils.py - commandline tool utils for managing nfs-ganesha.
 #
@@ -155,6 +155,16 @@ class ExportMgr():
 
         return True, "Done: "+msg
 
+    def UpdateExport(self, conf_path, exp_expr):
+        update_export_method = self.dbusobj.get_dbus_method("UpdateExport",
+                                                            self.dbus_interface)
+        try:
+           msg = update_export_method(conf_path, exp_expr)
+        except dbus.exceptions.DBusException as e:
+           return False, e
+
+        return True, "Done: "+msg
+
     def RemoveExport(self, exp_id):
         rm_export_method = self.dbusobj.get_dbus_method("RemoveExport",
                                                         self.dbus_interface)
@@ -246,8 +256,41 @@ class AdminInterface():
         msg = reply[1]
         return status, msg
 
+    def purge_netgroups(self):
+        method = self.dbusobj.get_dbus_method("purge_netgroups",
+                                              self.dbus_interface)
+        try:
+           reply = method()
+        except dbus.exceptions.DBusException as e:
+           return False, e
 
+        status = reply[0]
+        msg = reply[1]
+        return status, msg
 
+    def purge_idmap(self):
+        method = self.dbusobj.get_dbus_method("purge_idmapper_cache",
+                                              self.dbus_interface)
+        try:
+           reply = method()
+        except dbus.exceptions.DBusException as e:
+           return False, e
+
+        status = reply[0]
+        msg = reply[1]
+        return status, msg
+
+    def purge_gids(self):
+        method = self.dbusobj.get_dbus_method("purge_gids",
+                                              self.dbus_interface)
+        try:
+           reply = method()
+        except dbus.exceptions.DBusException as e:
+           return False, e
+
+        status = reply[0]
+        msg = reply[1]
+        return status, msg
 
 LOGGER_PROPS = 'org.ganesha.nfsd.log.component'
 

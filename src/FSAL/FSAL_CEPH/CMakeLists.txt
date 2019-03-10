@@ -10,16 +10,22 @@ SET(fsalceph_LIB_SRCS
    ds.c
    internal.c
    internal.h
+   statx_compat.h
 )
 
-if(CEPH_PREFIX)
-  include_directories("${CEPH_PREFIX}/include")
-  link_directories(${CEPH_PREFIX}/lib)
-endif(CEPH_PREFIX)
+if (NOT CEPH_FS_CEPH_STATX)
+  SET(fsalceph_LIB_SRCS
+	${fsalceph_LIB_SRCS}
+	statx_compat.c
+     )
+endif(NOT CEPH_FS_CEPH_STATX)
 
-add_library(fsalceph SHARED ${fsalceph_LIB_SRCS})
+include_directories(${CEPHFS_INCLUDE_DIR})
 
-target_link_libraries(fsalceph cephfs ${SYSTEM_LIBRARIES})
+add_library(fsalceph MODULE ${fsalceph_LIB_SRCS})
+add_sanitizers(fsalceph)
+
+target_link_libraries(fsalceph ${CEPHFS_LIBRARIES} ${SYSTEM_LIBRARIES})
 
 set_target_properties(fsalceph PROPERTIES VERSION 4.2.0 SOVERSION 4)
 install(TARGETS fsalceph COMPONENT fsal DESTINATION ${FSAL_DESTINATION} )

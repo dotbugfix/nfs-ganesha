@@ -193,7 +193,7 @@ snprintmem(char *target, size_t tgt_size, const void *source,
 	   size_t mem_size)
 {
 
-	const unsigned char *c = '\0';	/* the current char to be printed */
+	const unsigned char *c;	/* the current char to be printed */
 	char *str = target;	/* the current position in target buffer */
 	int wrote = 0;
 
@@ -328,8 +328,7 @@ static int init_db_thread_info(db_thread_info_t *p_thr_info,
 		return HANDLEMAP_SYSTEM_ERROR;
 
 	p_thr_info->dbop_pool =
-	    pool_init(NULL, sizeof(db_op_item_t), pool_basic_substrate, NULL,
-		      NULL, NULL);
+	    pool_basic_init("drop_pool", sizeof(db_op_item_t));
 
 	return HANDLEMAP_SUCCESS;
 }
@@ -619,7 +618,7 @@ static int dbop_push(flusher_queue_t *p_queue, db_op_item_t *p_op)
 
 	default:
 		LogCrit(COMPONENT_FSAL,
-			"ERROR in dbop_push: Invalid operation type %d",
+			"ERROR in dbop push: Invalid operation type %d",
 			p_op->op_type);
 	}
 
@@ -666,8 +665,8 @@ static void *database_worker_thread(void *arg)
 		       && p_info->work_queue.lowprio_first == NULL) {
 			to_be_done = NULL;
 			p_info->work_queue.status = IDLE;
-			pthread_cond_signal(&p_info->work_queue.
-					    work_done_condition);
+			pthread_cond_signal(
+				&p_info->work_queue.work_done_condition);
 
 			/* if termination is requested, exit */
 			if (do_terminate) {
@@ -678,9 +677,9 @@ static void *database_worker_thread(void *arg)
 			}
 
 			/* else, wait for something to do */
-			pthread_cond_wait(&p_info->work_queue.
-					  work_avail_condition,
-					  &p_info->work_queue.queues_mutex);
+			pthread_cond_wait(
+				&p_info->work_queue.work_avail_condition,
+				&p_info->work_queue.queues_mutex);
 
 		}
 
@@ -740,9 +739,9 @@ static void *database_worker_thread(void *arg)
 			break;
 
 		case DELETE:
-			db_delete_operation(p_info,
-					    &to_be_done->op_arg.fh_info.
-					    nfs23_digest);
+			db_delete_operation(
+				p_info,
+				&to_be_done->op_arg.fh_info.nfs23_digest);
 			break;
 
 		default:
@@ -769,9 +768,7 @@ static void *database_worker_thread(void *arg)
 int handlemap_db_count(const char *dir)
 {
 	DIR *dir_hdl;
-	struct dirent direntry;
-	struct dirent *cookie;
-	int rc;
+	struct dirent *direntry;
 	char db_pattern[MAXPATHLEN + 1];
 
 	unsigned int count = 0;
@@ -789,22 +786,24 @@ int handlemap_db_count(const char *dir)
 	}
 
 	do {
-		rc = readdir_r(dir_hdl, &direntry, &cookie);
+		errno = 0;
+		direntry = readdir(dir_hdl);
 
-		if (rc == 0 && cookie != NULL) {
+		if (direntry != NULL) {
 			/* go to the next loop if the entry is . or .. */
-			if (!strcmp(".", direntry.d_name)
-			    || !strcmp("..", direntry.d_name))
+			if (!strcmp(".", direntry->d_name)
+			    || !strcmp("..", direntry->d_name))
 				continue;
 
 			/* does it match the expected db pattern ? */
-			if (!fnmatch(db_pattern, direntry.d_name, FNM_PATHNAME))
+			if (!fnmatch(db_pattern, direntry->d_name,
+				     FNM_PATHNAME))
 				count++;
 
-		} else if (rc == 0 && cookie == NULL) {
+		} else if (errno == 0) {
 			/* end of dir */
 			end_of_dir = true;
-		} else if (errno != 0) {
+		} else {
 			/* error */
 			LogCrit(COMPONENT_FSAL,
 				"ERROR: error reading directory %s: %s", dir,
@@ -812,9 +811,6 @@ int handlemap_db_count(const char *dir)
 
 			closedir(dir_hdl);
 			return -HANDLEMAP_SYSTEM_ERROR;
-		} else {
-			/* end of dir */
-			end_of_dir = true;
 		}
 
 	} while (!end_of_dir);
@@ -918,12 +914,9 @@ int handlemap_db_reaload_all(hash_table_t *target_hash)
 		/* get a new db operation  */
 		PTHREAD_MUTEX_lock(&db_thread[i].pool_mutex);
 
-		new_task = pool_alloc(db_thread[i].dbop_pool, NULL);
+		new_task = pool_alloc(db_thread[i].dbop_pool);
 
 		PTHREAD_MUTEX_unlock(&db_thread[i].pool_mutex);
-
-		if (!new_task)
-			return HANDLEMAP_SYSTEM_ERROR;
 
 		/* can you fill it ? */
 		new_task->op_type = LOAD;
@@ -963,12 +956,9 @@ int handlemap_db_insert(nfs23_map_handle_t *p_in_nfs23_digest,
 		/* get a new db operation  */
 		PTHREAD_MUTEX_lock(&db_thread[i].pool_mutex);
 
-		new_task = pool_alloc(db_thread[i].dbop_pool, NULL);
+		new_task = pool_alloc(db_thread[i].dbop_pool);
 
 		PTHREAD_MUTEX_unlock(&db_thread[i].pool_mutex);
-
-		if (!new_task)
-			return HANDLEMAP_SYSTEM_ERROR;
 
 		/* fill the task info */
 		new_task->op_type = INSERT;
@@ -1005,12 +995,9 @@ int handlemap_db_delete(nfs23_map_handle_t *p_in_nfs23_digest)
 	/* get a new db operation  */
 	PTHREAD_MUTEX_lock(&db_thread[i].pool_mutex);
 
-	new_task = pool_alloc(db_thread[i].dbop_pool, NULL);
+	new_task = pool_alloc(db_thread[i].dbop_pool);
 
 	PTHREAD_MUTEX_unlock(&db_thread[i].pool_mutex);
-
-	if (!new_task)
-		return HANDLEMAP_SYSTEM_ERROR;
 
 	/* fill the task info */
 	new_task->op_type = DELETE;

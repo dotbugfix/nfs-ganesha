@@ -40,6 +40,7 @@
 #include "nfs4.h"
 #include "sal_functions.h"
 #include "nfs_proto_functions.h"
+#include "nfs_proto_tools.h"
 #include "nfs_core.h"
 
 hash_table_t *ht_nfs4_owner;
@@ -71,6 +72,8 @@ int display_nfs4_owner_key(struct gsh_buffdesc *buff, char *str)
 int display_nfs4_owner(struct display_buffer *dspbuf, state_owner_t *owner)
 {
 	int b_left;
+	time_t texpire;
+	struct state_nfs4_owner_t *nfs4_owner = &owner->so_owner.so_nfs4_owner;
 
 	if (owner == NULL)
 		return display_cat(dspbuf, "<NULL>");
@@ -87,8 +90,7 @@ int display_nfs4_owner(struct display_buffer *dspbuf, state_owner_t *owner)
 	if (b_left <= 0)
 		return b_left;
 
-	b_left = display_client_id_rec(dspbuf, owner->so_owner.so_nfs4_owner
-						.so_clientrec);
+	b_left = display_client_id_rec(dspbuf, nfs4_owner->so_clientrec);
 
 	if (b_left <= 0)
 		return b_left;
@@ -106,26 +108,36 @@ int display_nfs4_owner(struct display_buffer *dspbuf, state_owner_t *owner)
 		return b_left;
 
 	b_left = display_printf(dspbuf, " confirmed=%u seqid=%u",
-		    owner->so_owner.so_nfs4_owner.so_confirmed,
-		    owner->so_owner.so_nfs4_owner.so_seqid);
+				nfs4_owner->so_confirmed,
+				nfs4_owner->so_seqid);
 
 	if (b_left <= 0)
 		return b_left;
 
-	if (owner->so_owner.so_nfs4_owner.so_related_owner != NULL) {
+	if (nfs4_owner->so_related_owner != NULL) {
 		b_left = display_printf(dspbuf, " related_owner={");
 
 		if (b_left <= 0)
 			return b_left;
 
 		b_left =
-		    display_nfs4_owner(dspbuf, owner->so_owner
-					       .so_nfs4_owner.so_related_owner);
+		    display_nfs4_owner(dspbuf, nfs4_owner->so_related_owner);
 
 		if (b_left <= 0)
 			return b_left;
 
 		b_left = display_printf(dspbuf, "}");
+
+		if (b_left <= 0)
+			return b_left;
+	}
+
+	texpire = atomic_fetch_time_t(&nfs4_owner->so_cache_expire);
+
+	if (texpire != 0) {
+		b_left = display_printf(dspbuf,
+					" cached(expires in %d secs)",
+					texpire - time(NULL));
 
 		if (b_left <= 0)
 			return b_left;
@@ -163,8 +175,8 @@ int display_nfs4_owner_val(struct gsh_buffdesc *buff, char *str)
 int compare_nfs4_owner(state_owner_t *owner1, state_owner_t *owner2)
 {
 	if (isFullDebug(COMPONENT_STATE) && isDebug(COMPONENT_HASHTABLE)) {
-		char str1[LOG_BUFF_LEN / 2];
-		char str2[LOG_BUFF_LEN / 2];
+		char str1[LOG_BUFF_LEN / 2] = "\0";
+		char str2[LOG_BUFF_LEN / 2] = "\0";
 		struct display_buffer dspbuf1 = {sizeof(str1), str1, str1};
 		struct display_buffer dspbuf2 = {sizeof(str2), str2, str2};
 
@@ -209,8 +221,8 @@ int compare_nfs4_owner_key(struct gsh_buffdesc *buff1,
 	state_owner_t *pkey2 = buff2->addr;
 
 	if (isFullDebug(COMPONENT_STATE) && isDebug(COMPONENT_HASHTABLE)) {
-		char str1[LOG_BUFF_LEN / 2];
-		char str2[LOG_BUFF_LEN / 2];
+		char str1[LOG_BUFF_LEN / 2] = "\0";
+		char str2[LOG_BUFF_LEN / 2] = "\0";
 		struct display_buffer dspbuf1 = {sizeof(str1), str1, str1};
 		struct display_buffer dspbuf2 = {sizeof(str2), str2, str2};
 
@@ -312,23 +324,22 @@ uint64_t nfs4_owner_rbt_hash_func(hash_parameter_t *hparam,
 
 void free_nfs4_owner(state_owner_t *owner)
 {
-	if (owner->so_owner.so_nfs4_owner.so_related_owner != NULL)
-		dec_state_owner_ref(owner->so_owner.so_nfs4_owner.
-				    so_related_owner);
+	state_nfs4_owner_t *nfs4_owner = &owner->so_owner.so_nfs4_owner;
+
+	if (nfs4_owner->so_related_owner != NULL)
+		dec_state_owner_ref(nfs4_owner->so_related_owner);
 
 	/* Release the saved response. */
-	nfs4_Compound_FreeOne(&owner->so_owner.so_nfs4_owner.so_resp);
+	nfs4_Compound_FreeOne(&nfs4_owner->so_resp);
 
 	/* Remove the owner from the owners per clientid list. */
-	PTHREAD_MUTEX_lock(&owner->so_owner.so_nfs4_owner.so_clientrec
-			   ->cid_mutex);
+	PTHREAD_MUTEX_lock(&nfs4_owner->so_clientrec->cid_mutex);
 
-	glist_del(&owner->so_owner.so_nfs4_owner.so_perclient);
+	glist_del(&nfs4_owner->so_perclient);
 
-	PTHREAD_MUTEX_unlock(&owner->so_owner.so_nfs4_owner.so_clientrec
-			     ->cid_mutex);
+	PTHREAD_MUTEX_unlock(&nfs4_owner->so_clientrec->cid_mutex);
 
-	dec_client_id_ref(owner->so_owner.so_nfs4_owner.so_clientrec);
+	dec_client_id_ref(nfs4_owner->so_clientrec);
 }
 
 static hash_parameter_t nfs4_owner_param = {
@@ -367,33 +378,30 @@ int Init_nfs4_owner(void)
  */
 static void init_nfs4_owner(state_owner_t *owner)
 {
-	glist_init(&owner->so_owner.so_nfs4_owner.so_state_list);
+	state_nfs4_owner_t *nfs4_owner = &owner->so_owner.so_nfs4_owner;
+
+	glist_init(&nfs4_owner->so_state_list);
 
 	/* Increment refcount on related owner */
-	if (owner->so_owner.so_nfs4_owner.so_related_owner != NULL)
-		inc_state_owner_ref(owner->so_owner.so_nfs4_owner.
-				    so_related_owner);
+	if (nfs4_owner->so_related_owner != NULL)
+		inc_state_owner_ref(nfs4_owner->so_related_owner);
 
 	/* Increment reference count for clientid record */
-	inc_client_id_ref(owner->so_owner.so_nfs4_owner.so_clientrec);
+	inc_client_id_ref(nfs4_owner->so_clientrec);
 
-	PTHREAD_MUTEX_lock(&owner->so_owner.so_nfs4_owner.so_clientrec
-			   ->cid_mutex);
+	PTHREAD_MUTEX_lock(&nfs4_owner->so_clientrec->cid_mutex);
 
 	if (owner->so_type == STATE_OPEN_OWNER_NFSV4) {
 		/* If open owner, add to clientid lock owner list */
-		glist_add_tail(&owner->so_owner.so_nfs4_owner.so_clientrec->
-			       cid_openowners,
-			       &owner->so_owner.so_nfs4_owner.so_perclient);
+		glist_add_tail(&nfs4_owner->so_clientrec->cid_openowners,
+			       &nfs4_owner->so_perclient);
 	} else if (owner->so_type == STATE_LOCK_OWNER_NFSV4) {
 		/* If lock owner, add to clientid open owner list */
-		glist_add_tail(&owner->so_owner.so_nfs4_owner.so_clientrec->
-			       cid_lockowners,
-			       &owner->so_owner.so_nfs4_owner.so_perclient);
+		glist_add_tail(&nfs4_owner->so_clientrec->cid_lockowners,
+			       &nfs4_owner->so_perclient);
 	}
 
-	PTHREAD_MUTEX_unlock(&owner->so_owner.so_nfs4_owner.so_clientrec
-			     ->cid_mutex);
+	PTHREAD_MUTEX_unlock(&nfs4_owner->so_clientrec->cid_mutex);
 }
 
 /**
@@ -414,6 +422,7 @@ void nfs4_owner_PrintAll(void)
  * @param[in]  init_seqid    The starting seqid (for NFSv4.0)
  * @param[out] pisnew        Whether the owner actually is new
  * @param[in]  care          Care flag (to unify v3/v4 owners?)
+ * @param[in]  confirm       Create with it already confirmed?
  *
  * @return A new state owner or NULL.
  */
@@ -422,7 +431,7 @@ state_owner_t *create_nfs4_owner(state_nfs4_owner_name_t *name,
 				 state_owner_type_t type,
 				 state_owner_t *related_owner,
 				 unsigned int init_seqid, bool_t *pisnew,
-				 care_t care)
+				 care_t care, bool_t confirm)
 {
 	state_owner_t key;
 	state_owner_t *owner;
@@ -441,15 +450,10 @@ state_owner_t *create_nfs4_owner(state_nfs4_owner_name_t *name,
 	key.so_owner.so_nfs4_owner.so_resp.resop = NFS4_OP_ILLEGAL;
 	key.so_owner.so_nfs4_owner.so_args.argop = NFS4_OP_ILLEGAL;
 	key.so_refcount = 1;
-#if 0
-	/* WAITING FOR COMMUNITY FIX */
-	/* setting lock owner confirmed */
-	if (type == STATE_LOCK_OWNER_NFSV4)
-		key.so_owner.so_nfs4_owner.so_confirmed = 1;
-#endif
+	key.so_owner.so_nfs4_owner.so_confirmed = confirm;
 
 	if (isFullDebug(COMPONENT_STATE)) {
-		char str[LOG_BUFF_LEN];
+		char str[LOG_BUFF_LEN] = "\0";
 		struct display_buffer dspbuf = {sizeof(str), str, str};
 
 		display_owner(&dspbuf, &key);
@@ -468,8 +472,8 @@ state_owner_t *create_nfs4_owner(state_nfs4_owner_name_t *name,
 			    related_owner;
 		} else if (owner->so_owner.so_nfs4_owner.so_related_owner !=
 			   related_owner) {
-			char str1[LOG_BUFF_LEN / 2];
-			char str2[LOG_BUFF_LEN / 2];
+			char str1[LOG_BUFF_LEN / 2] = "\0";
+			char str2[LOG_BUFF_LEN / 2] = "\0";
 			struct display_buffer dspbuf1 = {
 						sizeof(str1), str1, str1};
 			struct display_buffer dspbuf2 = {
@@ -493,7 +497,7 @@ state_owner_t *create_nfs4_owner(state_nfs4_owner_name_t *name,
 
 	if (!isnew && owner != NULL && pisnew != NULL) {
 		if (isDebug(COMPONENT_STATE)) {
-			char str[LOG_BUFF_LEN];
+			char str[LOG_BUFF_LEN] = "\0";
 			struct display_buffer dspbuf = {sizeof(str), str, str};
 
 			display_owner(&dspbuf, owner);
@@ -516,11 +520,36 @@ state_owner_t *create_nfs4_owner(state_nfs4_owner_name_t *name,
  * @param[out] denied   NFSv4 LOCK4denied structure
  * @param[in]  holder   Holder of the conflicting lock
  * @param[in]  conflict The conflicting lock
+ * @param[in]  data     The nfsv4 compound data
  */
 
-void Process_nfs4_conflict(LOCK4denied *denied, state_owner_t *holder,
-			   fsal_lock_param_t *conflict)
+#define BASE_RESP_SIZE (sizeof(nfsstat4) + sizeof(offset4) + sizeof(length4) + \
+			sizeof(nfs_lock_type4) + sizeof(clientid4) + \
+			sizeof(uint32_t))
+
+nfsstat4 Process_nfs4_conflict(LOCK4denied *denied, state_owner_t *holder,
+			       fsal_lock_param_t *conflict,
+			       compound_data_t *data)
 {
+	nfsstat4 status;
+	size_t owner_len;
+
+	if (holder != NULL && holder->so_owner_len != 0)
+		owner_len = holder->so_owner_len;
+	else
+		owner_len = unknown_owner.so_owner_len;
+
+	/* First check if the response will fit, this is a response to a
+	 * LOCK or LOCKT operation.
+	 */
+	status = check_resp_room(data, BASE_RESP_SIZE + owner_len);
+
+	if (status != NFS4_OK)
+		return status;
+
+	/* Now set the op_resp_size. */
+	data->op_resp_size = BASE_RESP_SIZE + owner_len;
+
 	/* A  conflicting lock from a different lock_owner,
 	 * returns NFS4ERR_DENIED
 	 */
@@ -532,16 +561,10 @@ void Process_nfs4_conflict(LOCK4denied *denied, state_owner_t *holder,
 	else
 		denied->locktype = WRITE_LT;
 
-	if (holder != NULL && holder->so_owner_len != 0)
+	if (holder != NULL && holder->so_owner_len != 0) {
 		denied->owner.owner.owner_val =
 		    gsh_malloc(holder->so_owner_len);
-	else
-		denied->owner.owner.owner_val = NULL;
 
-	LogFullDebug(COMPONENT_STATE, "denied->owner.owner.owner_val = %p",
-		     denied->owner.owner.owner_val);
-
-	if (denied->owner.owner.owner_val != NULL) {
 		denied->owner.owner.owner_len = holder->so_owner_len;
 
 		memcpy(denied->owner.owner.owner_val, holder->so_owner_val,
@@ -550,6 +573,9 @@ void Process_nfs4_conflict(LOCK4denied *denied, state_owner_t *holder,
 		denied->owner.owner.owner_len = unknown_owner.so_owner_len;
 		denied->owner.owner.owner_val = unknown_owner.so_owner_val;
 	}
+
+	LogFullDebug(COMPONENT_STATE, "denied->owner.owner.owner_val = %p",
+		     denied->owner.owner.owner_val);
 
 	if (holder != NULL && holder->so_type == STATE_LOCK_OWNER_NFSV4)
 		denied->owner.clientid =
@@ -560,6 +586,8 @@ void Process_nfs4_conflict(LOCK4denied *denied, state_owner_t *holder,
 	/* Release any lock owner reference passed back from SAL */
 	if (holder != NULL)
 		dec_state_owner_ref(holder);
+
+	return NFS4ERR_DENIED;
 }
 
 /**
@@ -569,9 +597,10 @@ void Process_nfs4_conflict(LOCK4denied *denied, state_owner_t *holder,
  */
 void Release_nfs4_denied(LOCK4denied *denied)
 {
-	if (denied->owner.owner.owner_val != unknown_owner.so_owner_val
-	    && denied->owner.owner.owner_val != NULL)
+	if (denied->owner.owner.owner_val != unknown_owner.so_owner_val) {
 		gsh_free(denied->owner.owner.owner_val);
+		denied->owner.owner.owner_val = NULL;
+	}
 }
 
 /**
@@ -591,10 +620,9 @@ void Copy_nfs4_denied(LOCK4denied *denied_dst, LOCK4denied *denied_src)
 		LogFullDebug(COMPONENT_STATE,
 			     "denied_dst->owner.owner.owner_val = %p",
 			     denied_dst->owner.owner.owner_val);
-		if (denied_dst->owner.owner.owner_val)
-			memcpy(denied_dst->owner.owner.owner_val,
-			       denied_src->owner.owner.owner_val,
-			       denied_src->owner.owner.owner_len);
+		memcpy(denied_dst->owner.owner.owner_val,
+		       denied_src->owner.owner.owner_val,
+		       denied_src->owner.owner.owner_len);
 	}
 
 	if (denied_dst->owner.owner.owner_val == NULL) {
@@ -617,7 +645,7 @@ void Copy_nfs4_denied(LOCK4denied *denied_dst, LOCK4denied *denied_src)
  * @param[in]     tag   Arbitrary string for logging/debugging
  */
 void Copy_nfs4_state_req(state_owner_t *owner, seqid4 seqid, nfs_argop4 *args,
-			 cache_entry_t *entry, nfs_resop4 *resp,
+			 struct fsal_obj_handle *obj, nfs_resop4 *resp,
 			 const char *tag)
 {
 	/* Simplify use of this function when we may not be keeping any data
@@ -647,7 +675,7 @@ void Copy_nfs4_state_req(state_owner_t *owner, seqid4 seqid, nfs_argop4 *args,
 	/* Copy new file, note we don't take any reference, so this entry
 	 * might not remain valid, but the pointer value suffices here.
 	 */
-	owner->so_owner.so_nfs4_owner.so_last_entry = entry;
+	owner->so_owner.so_nfs4_owner.so_last_entry = obj;
 
 	/** @todo Deep copy OPEN args?
 	 * if (args->argop == NFS4_OP_OPEN)
@@ -658,7 +686,8 @@ void Copy_nfs4_state_req(state_owner_t *owner, seqid4 seqid, nfs_argop4 *args,
 }
 
 /**
- * @brief Check NFS4 request for valid seqid for replay, next request, or BAD_SEQID.
+ * @brief Check NFS4 request for valid seqid for replay, next request, or
+ *        BAD_SEQID.
  *
  * Returns true if the request is the next seqid.  If the request is a
  * replay, copies the saved response and returns false.  Otherwise,
@@ -678,10 +707,11 @@ void Copy_nfs4_state_req(state_owner_t *owner, seqid4 seqid, nfs_argop4 *args,
  * @retval false if the caller should immediately return the provides response.
  */
 bool Check_nfs4_seqid(state_owner_t *owner, seqid4 seqid, nfs_argop4 *args,
-		      cache_entry_t *entry, nfs_resop4 *resp, const char *tag)
+		      struct fsal_obj_handle *obj, nfs_resop4 *resp,
+		      const char *tag)
 {
 	seqid4 next;
-	char str[LOG_BUFF_LEN];
+	char str[LOG_BUFF_LEN] = "\0";
 	struct display_buffer dspbuf = {sizeof(str), str, str};
 	bool str_valid = false;
 
@@ -740,7 +770,7 @@ bool Check_nfs4_seqid(state_owner_t *owner, seqid4 seqid, nfs_argop4 *args,
 		return false;
 	}
 
-	if (owner->so_owner.so_nfs4_owner.so_last_entry != entry) {
+	if (owner->so_owner.so_nfs4_owner.so_last_entry != obj) {
 		if (str_valid)
 			LogDebug(COMPONENT_STATE,
 				 "%s: Invalid seqid %u in request (not replay - wrong file), expected seqid for {%s}, returning NFS4ERR_BAD_SEQID",

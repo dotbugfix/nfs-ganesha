@@ -39,11 +39,44 @@
 #include <sys/stat.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 #include "server_stats.h"
 #include "client_mgr.h"
+
+struct _9p_read_data {
+	struct gsh_client *client;	/**< Client for stats */
+	fsal_status_t ret;		/**< Return from read */
+};
+
+/**
+ * @brief Callback for NFS3 read done
+ *
+ * @param[in] obj		Object being acted on
+ * @param[in] ret		Return status of call
+ * @param[in] read_data		Data for read call
+ * @param[in] caller_data	Data for caller
+ */
+static void _9p_read_cb(struct fsal_obj_handle *obj, fsal_status_t ret,
+			  void *read_data, void *caller_data)
+{
+	struct _9p_read_data *data = caller_data;
+	struct fsal_io_arg *read_arg = read_data;
+
+	/* Fixup FSAL_SHARE_DENIED status */
+	if (ret.major == ERR_FSAL_SHARE_DENIED)
+		ret = fsalstat(ERR_FSAL_LOCKED, 0);
+
+	data->ret = ret;
+
+	if (data->client) {
+		op_ctx->client = data->client;
+
+		server_stats_io_done(read_arg->iov[0].iov_len,
+				     read_arg->io_amount, FSAL_IS_ERROR(ret),
+				     false);
+	}
+}
 
 int _9p_read(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 {
@@ -59,10 +92,6 @@ int _9p_read(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	struct _9p_fid *pfid = NULL;
 
 	size_t read_size = 0;
-	bool eof_met;
-	cache_inode_status_t cache_status = CACHE_INODE_SUCCESS;
-	/* uint64_t stable_flag = CACHE_INODE_SAFE_WRITE_TO_FS; */
-	bool sync = false;
 
 	/* Get data */
 	_9p_getptr(cursor, msgtag, u16);
@@ -98,42 +127,48 @@ int _9p_read(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	databuffer = _9p_getbuffertofill(cursor);
 
 	/* Do the job */
-	if (pfid->specdata.xattr.xattr_content != NULL) {
+	if (pfid->xattr != NULL) {
 		/* Copy the value cached during xattrwalk */
-		memcpy(databuffer, pfid->specdata.xattr.xattr_content + *offset,
-		       *count);
-		pfid->specdata.xattr.xattr_write = false;
+		if (*offset > pfid->xattr->xattr_size)
+			return _9p_rerror(req9p, msgtag, EINVAL, plenout,
+					  preply);
+		if (pfid->xattr->xattr_write != _9P_XATTR_READ_ONLY)
+			return _9p_rerror(req9p, msgtag, EINVAL, plenout,
+					  preply);
 
-		outcount = (u32) *count;
+		read_size = MIN(*count,
+				pfid->xattr->xattr_size - *offset);
+		memcpy(databuffer,
+		       pfid->xattr->xattr_content + *offset,
+		       read_size);
+
+		outcount = read_size;
 	} else {
-		cache_status = cache_inode_rdwr(pfid->pentry, CACHE_INODE_READ,
-						*offset, *count, &read_size,
-						databuffer, &eof_met, &sync,
-						NULL);
+		struct _9p_read_data read_data;
+		struct fsal_io_arg *read_arg = alloca(sizeof(*read_arg) +
+							sizeof(struct iovec));
 
-		/* Get the handle, for stats */
-		struct gsh_client *client = req9p->pconn->client;
+		read_arg->info = NULL;
+		read_arg->state = pfid->state;
+		read_arg->offset = *offset;
+		read_arg->iov_count = 1;
+		read_arg->iov[0].iov_len = *count;
+		read_arg->iov[0].iov_base = databuffer;
+		read_arg->io_amount = 0;
+		read_arg->end_of_file = false;
 
-		if (client == NULL) {
-			LogDebug(COMPONENT_9P,
-				 "Cannot get client block for 9P request");
-		} else {
-			op_ctx->client = client;
+		read_data.client = req9p->pconn->client;
 
-			server_stats_io_done(*count,
-					     read_size,
-					     (cache_status ==
-					      CACHE_INODE_SUCCESS) ?
-					      true : false,
-					     false);
-		}
+		/* Do the actual read */
+		pfid->pentry->obj_ops->read2(pfid->pentry, true, _9p_read_cb,
+					    read_arg, &read_data);
 
-		if (cache_status != CACHE_INODE_SUCCESS)
+		if (FSAL_IS_ERROR(read_data.ret))
 			return _9p_rerror(req9p, msgtag,
-					  _9p_tools_errno(cache_status),
+					  _9p_tools_errno(read_data.ret),
 					  plenout, preply);
 
-		outcount = (u32) read_size;
+		outcount = (u32) read_arg->io_amount;
 	}
 	_9p_setfilledbuffer(cursor, outcount);
 

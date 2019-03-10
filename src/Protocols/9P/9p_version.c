@@ -39,7 +39,6 @@
 #include <pthread.h>
 #include "nfs_core.h"
 #include "log.h"
-#include "cache_inode.h"
 #include "fsal.h"
 #include "9p.h"
 
@@ -61,7 +60,8 @@ int _9p_version(struct _9p_request_data *req9p, u32 *plenout, char *preply)
 	LogDebug(COMPONENT_9P, "TVERSION: tag=%u msize=%u version='%.*s'",
 		 (u32) *msgtag, *msize, (int)*version_len, version_str);
 
-	if (strncmp(version_str, version_9p200l, *version_len)) {
+	if (*version_len < sizeof(version_9p200l)-1 ||
+	    strncmp(version_str, version_9p200l, *version_len)) {
 		LogEvent(COMPONENT_9P, "RVERSION: BAD VERSION");
 		return _9p_rerror(req9p, msgtag, ENOENT, plenout, preply);
 	}

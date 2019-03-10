@@ -55,21 +55,21 @@ static bool proc_export(struct gsh_export *export, void *arg)
 	struct glist_head *glist_item;
 	exportlist_client_entry_t *client;
 	struct groupnode *group, *grp_tail = NULL;
-	const char *grp_name;
-	char addr_buf[INET6_ADDRSTRLEN + 1];
+	char *grp_name;
+	bool free_grp_name;
 
 	state->retval = 0;
 
 	/* If client does not have any access to the export,
 	 * don't add it to the list
 	 */
-	op_ctx->export = export;
+	op_ctx->ctx_export = export;
 	op_ctx->fsal_export = export->fsal_export;
 	export_check_access();
-	if (op_ctx->export_perms->options == 0) {
+	if (!(op_ctx->export_perms->options & EXPORT_OPTION_ACCESS_MASK)) {
 		LogFullDebug(COMPONENT_NFSPROTO,
 			     "Client is not allowed to access Export_Id %d %s",
-			     export->export_id, export->fullpath);
+			     export->export_id, export_path(export));
 
 		return true;
 	}
@@ -77,25 +77,21 @@ static bool proc_export(struct gsh_export *export, void *arg)
 	if (!(op_ctx->export_perms->options & EXPORT_OPTION_NFSV3)) {
 		LogFullDebug(COMPONENT_NFSPROTO,
 			     "Not exported for NFSv3, Export_Id %d %s",
-			     export->export_id, export->fullpath);
+			     export->export_id, export_path(export));
 
 		return true;
 	}
 
 	new_expnode = gsh_calloc(1, sizeof(struct exportnode));
-	if (new_expnode == NULL)
-		goto nomem;
-	new_expnode->ex_dir = gsh_strdup(export->fullpath);
-	if (new_expnode->ex_dir == NULL)
-		goto nomem;
+	new_expnode->ex_dir = gsh_strdup(export_path(export));
+
+	PTHREAD_RWLOCK_rdlock(&op_ctx->ctx_export->lock);
+
 	glist_for_each(glist_item, &export->clients) {
 		client =
 		    glist_entry(glist_item, exportlist_client_entry_t,
 				cle_list);
 		group = gsh_calloc(1, sizeof(struct groupnode));
-
-		if (group == NULL)
-			goto nomem;
 
 		if (grp_tail == NULL)
 			new_expnode->ex_groups = group;
@@ -103,24 +99,16 @@ static bool proc_export(struct gsh_export *export, void *arg)
 			grp_tail->gr_next = group;
 
 		grp_tail = group;
+		free_grp_name = false;
 		switch (client->type) {
-		case HOSTIF_CLIENT:
-			grp_name =
-			    inet_ntop(AF_INET,
-				      &client->client.hostif.clientaddr,
-				      addr_buf, INET6_ADDRSTRLEN);
-			if (grp_name == NULL) {
-				state->retval = errno;
-				grp_name = "Invalid Host Address";
-			}
-			break;
 		case NETWORK_CLIENT:
-			grp_name =
-			    inet_ntop(AF_INET, &client->client.network.netaddr,
-				      addr_buf, INET6_ADDRSTRLEN);
+			grp_name = cidr_to_str(client->client.network.cidr,
+						CIDR_NOFLAGS);
 			if (grp_name == NULL) {
 				state->retval = errno;
 				grp_name = "Invalid Network Address";
+			} else {
+				free_grp_name = true;
 			}
 			break;
 		case NETGROUP_CLIENT:
@@ -135,26 +123,18 @@ static bool proc_export(struct gsh_export *export, void *arg)
 		case WILDCARDHOST_CLIENT:
 			grp_name = client->client.wildcard.wildcard;
 			break;
-		case HOSTIF_CLIENT_V6:
-			grp_name =
-			    inet_ntop(AF_INET6,
-				      &client->client.hostif.clientaddr6,
-				      addr_buf, INET6_ADDRSTRLEN);
-			if (grp_name == NULL) {
-				state->retval = errno;
-				grp_name = "Invalid Host Address";
-			}
-			break;
 		default:
 			grp_name = "<unknown>";
 		}
 		LogFullDebug(COMPONENT_NFSPROTO,
 			     "Export %s client %s",
-			     export->fullpath, grp_name);
+			     export_path(export), grp_name);
 		group->gr_name = gsh_strdup(grp_name);
-		if (group->gr_name == NULL)
-			goto nomem;
+		if (free_grp_name)
+			gsh_free(grp_name);
 	}
+
+	PTHREAD_RWLOCK_unlock(&op_ctx->ctx_export->lock);
 
 	if (state->head == NULL)
 		state->head = new_expnode;
@@ -162,24 +142,8 @@ static bool proc_export(struct gsh_export *export, void *arg)
 		state->tail->ex_next = new_expnode;
 
 	state->tail = new_expnode;
-	return true;
 
- nomem:
-	if (new_expnode != NULL) {
-		if (new_expnode->ex_dir != NULL)
-			gsh_free(new_expnode->ex_dir);
-		for (group = new_expnode->ex_groups;
-		     group != NULL;
-		     group = grp_tail) {
-			grp_tail = group->gr_next;
-			if (group->gr_name != NULL)
-				gsh_free(group->gr_name);
-			gsh_free(group);
-		}
-		gsh_free(new_expnode);
-	}
-	state->retval = errno;
-	return false;
+	return true;
 }
 
 /**
@@ -201,13 +165,13 @@ int mnt_Export(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 	memset(res, 0, sizeof(nfs_res_t));
 	memset(&proc_state, 0, sizeof(proc_state));
 
-	(void)foreach_gsh_export(proc_export, &proc_state);
+	(void)foreach_gsh_export(proc_export, false, &proc_state);
 	if (proc_state.retval != 0) {
 		LogCrit(COMPONENT_NFSPROTO,
 			"Processing exports failed. error = \"%s\" (%d)",
 			strerror(proc_state.retval), proc_state.retval);
 	}
-	op_ctx->export = NULL;
+	op_ctx->ctx_export = NULL;
 	op_ctx->fsal_export = NULL;
 	res->res_mntexport = proc_state.head;
 	return NFS_REQ_OK;

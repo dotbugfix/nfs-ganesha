@@ -263,6 +263,9 @@ int nfs4_op_illegal(struct nfs_argop4 *, compound_data_t *data,
 int nfs4_op_notsupp(struct nfs_argop4 *, compound_data_t *data,
 		    struct nfs_resop4 *);
 
+int nfs4_op_bind_conn(struct nfs_argop4 *op, compound_data_t *data,
+		      struct nfs_resop4 *resp);
+
 int nfs4_op_exchange_id(struct nfs_argop4 *, compound_data_t *,
 			struct nfs_resop4 *);
 
@@ -347,6 +350,27 @@ int nfs4_op_layoutstats(struct nfs_argop4 *, compound_data_t *,
 		      struct nfs_resop4 *);
 
 void nfs4_op_layoutstats_Free(nfs_resop4 *resp);
+
+/* NFSv4.3 */
+int nfs4_op_getxattr(struct nfs_argop4 *, compound_data_t *,
+		      struct nfs_resop4 *);
+
+void nfs4_op_getxattr_Free(nfs_resop4 *resp);
+
+int nfs4_op_setxattr(struct nfs_argop4 *, compound_data_t *,
+		      struct nfs_resop4 *);
+
+void nfs4_op_setxattr_Free(nfs_resop4 *resp);
+
+int nfs4_op_listxattr(struct nfs_argop4 *, compound_data_t *,
+		      struct nfs_resop4 *);
+
+void nfs4_op_listxattr_Free(nfs_resop4 *resp);
+
+int nfs4_op_removexattr(struct nfs_argop4 *, compound_data_t *,
+		      struct nfs_resop4 *);
+
+void nfs4_op_removexattr_Free(nfs_resop4 *resp);
 
 /* @}
  * -- End of NFS protocols functions. --
@@ -463,6 +487,7 @@ void nfs4_op_open_confirm_CopyRes(OPEN_CONFIRM4res *,
 void nfs4_op_open_downgrade_CopyRes(OPEN_DOWNGRADE4res *,
 				    OPEN_DOWNGRADE4res *);
 
+void nfs4_op_nfs4_op_bind_conn_Free(nfs_resop4 *resp);
 void nfs4_op_exchange_id_Free(nfs_resop4 *);
 void nfs4_op_close_Free(nfs_resop4 *);
 void nfs4_op_create_session_Free(nfs_resop4 *);

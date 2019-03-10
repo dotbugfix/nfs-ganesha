@@ -83,6 +83,8 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 	int rc;
 	/* stateid if available matching owner and entry */
 	state_t *state;
+	uint64_t maxfilesize =
+	    op_ctx->fsal_export->exp_ops.fs_maxfilesize(op_ctx->fsal_export);
 
 	LogDebug(COMPONENT_NFS_V4_LOCK,
 		 "Entering NFS v4 LOCKT handler ----------------------------");
@@ -140,6 +142,24 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 	if (lock_desc.lock_length >
 	    (STATE_LOCK_OFFSET_EOF - lock_desc.lock_start)) {
 		res_LOCKT4->status = NFS4ERR_INVAL;
+		LogDebug(COMPONENT_NFS_V4_LOCK,
+			 "LOCK failed length overflow start %"PRIx64
+			 " length %"PRIx64,
+			 lock_desc.lock_start, lock_desc.lock_length);
+		return res_LOCKT4->status;
+	}
+
+	/* Check for range overflow past maxfilesize.  Comparing beyond 2^64 is
+	 * not possible in 64 bits precision, but off+len > maxfilesize is
+	 * equivalent to len > maxfilesize - off
+	 */
+	if (lock_desc.lock_length > (maxfilesize - lock_desc.lock_start)) {
+		res_LOCKT4->status = NFS4ERR_BAD_RANGE;
+		LogDebug(COMPONENT_NFS_V4_LOCK,
+			 "LOCK failed past maxfilesize %"PRIx64" start %"PRIx64
+			 " length %"PRIx64,
+			 maxfilesize,
+			 lock_desc.lock_start, lock_desc.lock_length);
 		return res_LOCKT4->status;
 	}
 
@@ -175,7 +195,7 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 				       NULL,
 				       0,
 				       NULL,
-				       CARE_ALWAYS);
+				       CARE_ALWAYS, true);
 
 	LogStateOwner("Lock: ", lock_owner);
 
@@ -187,7 +207,7 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	LogLock(COMPONENT_NFS_V4_LOCK, NIV_FULL_DEBUG, "LOCKT",
-		data->current_entry, lock_owner, &lock_desc);
+		data->current_obj, lock_owner, &lock_desc);
 
 	if (data->minorversion == 0) {
 		op_ctx->clientid =
@@ -195,13 +215,13 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 	}
 
 	/* Get the stateid, if any, related to this entry and owner */
-	state = nfs4_State_Get_Entry(data->current_entry, lock_owner);
+	state = nfs4_State_Get_Obj(data->current_obj, lock_owner);
 
 	/* Now we have a lock owner and a stateid.  Go ahead and test
 	 * the lock in SAL (and FSAL).
 	 */
 
-	state_status = state_test(data->current_entry,
+	state_status = state_test(data->current_obj,
 				  state,
 				  lock_owner,
 				  &lock_desc,
@@ -214,9 +234,17 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 		 */
 		LogStateOwner("Conflict: ", conflict_owner);
 
-		Process_nfs4_conflict(&res_LOCKT4->LOCKT4res_u.denied,
-				      conflict_owner,
-				      &conflict_desc);
+		res_LOCKT4->status = Process_nfs4_conflict(
+						&res_LOCKT4->LOCKT4res_u.denied,
+						conflict_owner,
+						&conflict_desc,
+						data);
+	} else {
+		/* Return result */
+		res_LOCKT4->status = nfs4_Errno_state(state_status);
+
+		/* response is just nfsstat4 */
+		data->op_resp_size = sizeof(nfsstat4);
 	}
 
 	if (data->minorversion == 0)
@@ -228,9 +256,6 @@ int nfs4_op_lockt(struct nfs_argop4 *op, compound_data_t *data,
 	/* Release stateid reference */
 	if (state != NULL)
 		dec_state_t_ref(state);
-
-	/* Return result */
-	res_LOCKT4->status = nfs4_Errno_state(state_status);
 
  out:
 

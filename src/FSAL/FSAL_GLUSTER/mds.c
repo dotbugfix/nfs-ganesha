@@ -27,6 +27,7 @@
 #include "fsal_types.h"
 #include "fsal_api.h"
 #include "fsal_up.h"
+#include "gsh_rpc.h"
 #include "gluster_internal.h"
 #include "FSAL/fsal_commonlib.h"
 #include "FSAL/fsal_config.h"
@@ -36,6 +37,9 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <netdb.h>
+
+#define get16bits(d) (*((const uint16_t *) (d)))
+#define MAX_DS_COUNT 100
 
 /**
  * @brief Get layout types supported by export
@@ -189,7 +193,8 @@ static nfsstat4 pnfs_layout_get(struct fsal_obj_handle          *obj_pub,
 
 	util |= file_layout.stripe_type | file_layout.stripe_length;
 
-	rc = glfs_get_ds_addr(export->gl_fs, handle->glhandle,
+	/* @todo need to handle IPv6 here */
+	rc = glfs_get_ds_addr(export->gl_fs->fs, handle->glhandle,
 				&deviceid.device_id4);
 
 	if (rc) {
@@ -197,7 +202,7 @@ static nfsstat4 pnfs_layout_get(struct fsal_obj_handle          *obj_pub,
 		return NFS4ERR_INVAL;
 	}
 
-	/* TODO: When more than one client tries access the same layout
+	/** @todo: When more than one client tries access the same layout
 	 *       for the write operation, then last write will overwrite
 	 *       for the write operation, then last write will overwrite
 	 *       the previous ones, the MDS should intelligently deal
@@ -214,15 +219,16 @@ static nfsstat4 pnfs_layout_get(struct fsal_obj_handle          *obj_pub,
 	rc = glfs_h_extract_handle(handle->glhandle, ds_wire.gfid,
 				   GFAPI_HANDLE_LENGTH);
 	if (rc < 0) {
+		rc = errno;
 		LogMajor(COMPONENT_PNFS, "Invalid glfs_object");
-		return posix2nfs4_error(-rc);
+		return posix2nfs4_error(rc);
 	}
 
 	ds_wire.layout   = file_layout;
 	ds_desc.addr     = &ds_wire;
 	ds_desc.len      = sizeof(struct glfs_ds_wire);
 	nfs_status = FSAL_encode_file_layout(loc_body, &deviceid, util, 0, 0,
-					     &req_ctx->export->export_id, 1,
+					     &req_ctx->ctx_export->export_id, 1,
 					     &ds_desc);
 	if (nfs_status) {
 		LogMajor(COMPONENT_PNFS,
@@ -303,6 +309,7 @@ static nfsstat4 pnfs_layout_commit(struct fsal_obj_handle *obj_pub,
 	/* Mask to determine exactly what gets set */
 	int   mask                           = 0;
 	int   rc                             = 0;
+	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
 
 	if (arg->type != LAYOUT4_NFSV4_1_FILES) {
 		LogMajor(COMPONENT_PNFS, "Unsupported layout type: %x",
@@ -311,7 +318,7 @@ static nfsstat4 pnfs_layout_commit(struct fsal_obj_handle *obj_pub,
 	}
 
 	/* Gets previous status of file in the MDS */
-	rc = glfs_h_stat(glfs_export->gl_fs,
+	rc = glfs_h_stat(glfs_export->gl_fs->fs,
 			 objhandle->glhandle, &old_stat);
 
 	if (rc != 0) {
@@ -326,7 +333,7 @@ static nfsstat4 pnfs_layout_commit(struct fsal_obj_handle *obj_pub,
 			new_stat.st_size = arg->last_write + 1;
 			res->size_supplied = true;
 			res->new_size = arg->last_write + 1;
-			rc = glfs_h_truncate(glfs_export->gl_fs,
+			rc = glfs_h_truncate(glfs_export->gl_fs->fs,
 					     objhandle->glhandle,
 					     res->new_size);
 			if (rc != 0) {
@@ -346,11 +353,19 @@ static nfsstat4 pnfs_layout_commit(struct fsal_obj_handle *obj_pub,
 
 	mask |= GLAPI_SET_ATTR_MTIME;
 
-	rc = glfs_h_setattrs(glfs_export->gl_fs,
+	SET_GLUSTER_CREDS(glfs_export, &op_ctx->creds->caller_uid,
+			  &op_ctx->creds->caller_gid,
+			  op_ctx->creds->caller_glen,
+			  op_ctx->creds->caller_garray);
+
+	rc = glfs_h_setattrs(glfs_export->gl_fs->fs,
 			     objhandle->glhandle,
 			     &new_stat,
 			     mask);
-	if (rc != 0) {
+
+	SET_GLUSTER_CREDS(glfs_export, NULL, NULL, 0, NULL);
+
+	if ((rc != 0) || (status.major != ERR_FSAL_NO_ERROR)) {
 		LogMajor(COMPONENT_PNFS,
 			 "commit layout, setattr unsucessflly completed");
 		return NFS4ERR_INVAL;
@@ -382,9 +397,9 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
 	 * And whole file is provided to the DS, so the starting
 	 * index for that file is zero
 	 */
-	unsigned num_ds                  = 1;
-	uint32_t stripes                 = 1;
-	uint32_t stripe_ind              = 0;
+	unsigned int num_ds = 1;
+	uint32_t stripes = 1;
+	uint32_t stripe_ind = 0;
 
 
 	if (type != LAYOUT4_NFSV4_1_FILES) {
@@ -424,7 +439,7 @@ nfsstat4 getdeviceinfo(struct fsal_module *fsal_hdl,
 	return nfs_status;
 	}
 
-	/* TODO : Here information about Data-Server where file resides
+	/** @todo: Here information about Data-Server where file resides
 	 *        is only send from MDS.If that Data-Server is down then
 	 *        read or write will performed through MDS.
 	 *        Instead should we send the information about all
@@ -480,34 +495,121 @@ void export_ops_pnfs(struct export_ops *ops)
 	ops->fs_loc_body_size           = fs_loc_body_size;
 }
 
+/* *
+ * Calculates  a hash value for a given string buffer
+ */
+uint32_t superfasthash(const unsigned char *data, uint32_t len)
+{
+	uint32_t hash = len, tmp;
+	int32_t rem;
+
+	rem = len & 3;
+	len >>= 2;
+
+	/* Main loop */
+	for (; len > 0; len--) {
+		hash  += get16bits(data);
+		tmp    = (get16bits(data+2) << 11) ^ hash;
+		hash   = (hash << 16) ^ tmp;
+		data  += 2*sizeof(uint16_t);
+		hash  += hash >> 11;
+	}
+
+	/* Handle end cases */
+	switch (rem) {
+	case 3:
+		hash += get16bits(data);
+		hash ^= hash << 16;
+		hash ^= data[sizeof(uint16_t)] << 18;
+		hash += hash >> 11;
+		break;
+	case 2:
+		hash += get16bits(data);
+		hash ^= hash << 11;
+		hash += hash >> 17;
+		break;
+	case 1:
+		hash += *data;
+		hash ^= hash << 10;
+		hash += hash >> 1;
+	}
+
+	/* Force "avalanching" of final 127 bits */
+	hash ^= hash << 3;
+	hash += hash >> 5;
+	hash ^= hash << 4;
+	hash += hash >> 17;
+	hash ^= hash << 25;
+	hash += hash >> 6;
+
+	return hash;
+}
 /**
  * It will extract hostname from pathinfo.PATH_INFO_KEYS gives
  * details about all the servers and path in that server where
  * file resides.
- * With the help of some basic string manipulations we can find
- * hostname from the pathinfo
+ * First it selects the DS based on distributed hashing, then
+ * with the help of some basic string manipulations, the hostname
+ * can be fetched from the pathinfo
  *
  * Returns zero and valid hostname on success
  */
 
 int
-get_pathinfo_host(char *pathinfo, char *hostname, size_t size)
+select_ds(struct glfs_object *object, char *pathinfo, char *hostname,
+	  size_t size)
 {
+	/* Represents starting of each server in the list*/
 	const char posix[10]    = "POSIX";
+	/* Array of pathinfo of available dses */
+	char	*ds_path_info[MAX_DS_COUNT];
+	/* Key for hashing */
+	unsigned char key[16];
 	/* Starting of first brick path in the pathinfo */
-	char *first_brick_path_beg    = NULL;
+	char	*tmp		= NULL;
 	/* Stores starting of hostname */
 	char    *start          = NULL;
 	/* Stores ending of hostname */
 	char    *end            = NULL;
 	int     ret             = -1;
 	int     i               = 0;
+	/* counts no of available ds */
+	int	no_of_ds	= 0;
 
 	if (!pathinfo || !size)
 		goto out;
 
-	first_brick_path_beg = strstr(pathinfo, posix);
-	start = strchr(first_brick_path_beg, ':');
+	tmp = pathinfo;
+	while ((tmp = strstr(tmp, posix))) {
+		ds_path_info[no_of_ds] = tmp;
+		tmp++;
+		no_of_ds++;
+		/* *
+		 * If no of dses reaches maxmium count, then
+		 * perform load balance on current list
+		 */
+		if (no_of_ds == MAX_DS_COUNT)
+			break;
+	}
+
+	if (no_of_ds == 0) {
+		LogCrit(COMPONENT_PNFS,
+			"Invalid pathinfo(%s) attribute found while selecting DS.",
+			pathinfo);
+		goto out;
+	}
+
+	ret = glfs_h_extract_handle(object, key, GFAPI_HANDLE_LENGTH);
+	if (ret < 0)
+		goto out;
+
+	/* Pick DS from the list */
+	if (no_of_ds == 1)
+		ret = 0;
+	else
+		ret = superfasthash(key, 16) % no_of_ds;
+
+	start = strchr(ds_path_info[ret], ':');
 	if (!start)
 		goto out;
 	end = start + 1;
@@ -520,9 +622,9 @@ get_pathinfo_host(char *pathinfo, char *hostname, size_t size)
 	while (++start != end)
 		hostname[i++] = *start;
 	ret = 0;
+	LogDebug(COMPONENT_PNFS, "hostname %s", hostname);
 
 out:
-	LogDebug(COMPONENT_PNFS, "hostname %s", hostname);
 	return ret;
 }
 
@@ -540,40 +642,38 @@ out:
 int
 glfs_get_ds_addr(struct glfs *fs, struct glfs_object *object, uint32_t *ds_addr)
 {
-	int             ret                  = 0;
-	char            pathinfo[1024]       = {0, };
-	char            hostname[1024]       = {0, };
-	struct addrinfo hints, *res;
-	struct in_addr  addr                 = {0, };
-	const char      *pathinfokey         = "trusted.glusterfs.pathinfo";
+	int             ret                    = 0;
+	char            pathinfo[1024]         = {0, };
+	char            hostname[256]          = {0, };
+	char		scratch[SOCK_NAME_MAX] = {0, };
+	struct addrinfo hints                  = {0, };
+	struct addrinfo *res                   = NULL;
+	const char      *pathinfokey           = "trusted.glusterfs.pathinfo";
 
-
-	ret = glfs_h_getxattrs(fs, object, pathinfokey, pathinfo, 1024);
+	ret = glfs_h_getxattrs(fs, object, pathinfokey, pathinfo,
+			       sizeof(pathinfo));
 
 	LogDebug(COMPONENT_PNFS, "pathinfo %s", pathinfo);
 
-	ret = get_pathinfo_host(pathinfo, hostname, sizeof(hostname));
+	ret = select_ds(object, pathinfo, hostname, sizeof(hostname));
 	if (ret) {
-		LogMajor(COMPONENT_PNFS, "cannot get hostname");
+		LogMajor(COMPONENT_PNFS, "No DS found");
 		goto out;
 	}
 
-	memset(&hints, 0, sizeof(hints));
 	hints.ai_socktype = SOCK_STREAM;
 	hints.ai_family = AF_INET;
 	ret = getaddrinfo(hostname, NULL, &hints, &res);
+	/* we trust getaddrinfo() never returns EAI_AGAIN! */
 	if (ret != 0) {
-		LogMajor(COMPONENT_PNFS, "error %d\n", ret);
+		*ds_addr = 0;
+		LogMajor(COMPONENT_PNFS, "error %s\n", gai_strerror(ret));
 		goto out;
 	}
-
-	addr.s_addr = ((struct sockaddr_in *)(res->ai_addr))->sin_addr.s_addr;
-
-	LogDebug(COMPONENT_PNFS, "ip address : %s", inet_ntoa(addr));
-
-	freeaddrinfo(res);
+	sprint_sockip((sockaddr_t *)res->ai_addr, scratch, sizeof(scratch));
+	LogDebug(COMPONENT_PNFS, "ip address : %s", scratch);
+	*ds_addr = ((struct sockaddr_in *)(res->ai_addr))->sin_addr.s_addr;
 out:
-
-	*ds_addr = addr.s_addr;
+	freeaddrinfo(res);
 	return ret;
 }

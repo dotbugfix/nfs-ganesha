@@ -60,12 +60,13 @@
 #include "nfs_file_handle.h"
 #include "sal_functions.h"
 #include "nfs_proto_tools.h"
+#include "city.h"
 
 /**
  * @brief Hash table for stateids.
  */
 hash_table_t *ht_state_id;
-hash_table_t *ht_state_entry;
+hash_table_t *ht_state_obj;
 
 /**
  * @brief All-zeroes stateid4.other
@@ -182,14 +183,10 @@ const char *str_state_type(state_t *state)
 int display_stateid(struct display_buffer *dspbuf, state_t *state)
 {
 	int b_left;
-	cache_entry_t *entry;
 
 	if (state == NULL)
 		return display_cat(dspbuf, "STATE <NULL>");
 
-	PTHREAD_MUTEX_lock(&state->state_mutex);
-	entry = state->state_entry;
-	PTHREAD_MUTEX_unlock(&state->state_mutex);
 
 	b_left = display_printf(dspbuf,
 				"STATE %p ",
@@ -204,8 +201,8 @@ int display_stateid(struct display_buffer *dspbuf, state_t *state)
 		return b_left;
 
 	b_left = display_printf(dspbuf,
-				" entry=%p type=%s seqid=%"PRIu32" owner={",
-				entry,
+				" obj=%p type=%s seqid=%"PRIu32" owner={",
+				&state->state_obj,
 				str_state_type(state),
 				state->state_seqid);
 
@@ -250,8 +247,8 @@ int display_state_id_val(struct gsh_buffdesc *buff, char *str)
 int compare_state_id(struct gsh_buffdesc *buff1, struct gsh_buffdesc *buff2)
 {
 	if (isFullDebug(COMPONENT_STATE)) {
-		char str1[DISPLAY_STATEID_OTHER_SIZE];
-		char str2[DISPLAY_STATEID_OTHER_SIZE];
+		char str1[DISPLAY_STATEID_OTHER_SIZE] = "\0";
+		char str2[DISPLAY_STATEID_OTHER_SIZE] = "\0";
 		struct display_buffer dspbuf1 = {sizeof(str1), str1, str1};
 		struct display_buffer dspbuf2 = {sizeof(str2), str2, str2};
 
@@ -324,6 +321,7 @@ static hash_parameter_t state_id_param = {
 	.val_to_str = display_state_id_val,
 	.flags = HT_FLAG_CACHE,
 	.ht_log_component = COMPONENT_STATE,
+	.ht_name = "State ID Table"
 };
 
 /**
@@ -335,7 +333,7 @@ static hash_parameter_t state_id_param = {
  * @retval 0 if equal.
  * @retval 1 if not equal.
  */
-int compare_state_entry(struct gsh_buffdesc *buff1, struct gsh_buffdesc *buff2)
+int compare_state_obj(struct gsh_buffdesc *buff1, struct gsh_buffdesc *buff2)
 {
 	state_t *state1 = buff1->addr;
 	state_t *state2 = buff2->addr;
@@ -343,8 +341,10 @@ int compare_state_entry(struct gsh_buffdesc *buff1, struct gsh_buffdesc *buff2)
 	if (state1 == NULL || state2 == NULL)
 		return 1;
 
-	return state1->state_entry != state2->state_entry ||
-	       compare_nfs4_owner(state1->state_owner, state2->state_owner);
+	if (state1->state_obj != state2->state_obj)
+		return 1;
+
+	return compare_nfs4_owner(state1->state_owner, state2->state_owner);
 }
 
 /**
@@ -355,15 +355,18 @@ int compare_state_entry(struct gsh_buffdesc *buff1, struct gsh_buffdesc *buff2)
  *
  * @return The hash index.
  */
-uint32_t state_entry_value_hash_func(hash_parameter_t *hparam,
-				     struct gsh_buffdesc *key)
+uint32_t state_obj_value_hash_func(hash_parameter_t *hparam,
+				   struct gsh_buffdesc *key)
 {
 	unsigned int sum = 0;
 	unsigned int i = 0;
 	unsigned char c = 0;
 	uint32_t res = 0;
 
+	struct gsh_buffdesc fh_desc;
 	state_t *pkey = key->addr;
+
+	pkey->state_obj->obj_ops->handle_to_key(pkey->state_obj, &fh_desc);
 
 	/* Compute the sum of all the characters */
 	for (i = 0; i < pkey->state_owner->so_owner_len; i++) {
@@ -374,7 +377,8 @@ uint32_t state_entry_value_hash_func(hash_parameter_t *hparam,
 	res = ((uint32_t) pkey->state_owner->so_owner.so_nfs4_owner.so_clientid
 	      + (uint32_t) sum + pkey->state_owner->so_owner_len
 	      + (uint32_t) pkey->state_owner->so_type
-	      + (uintptr_t) pkey->state_entry) % (uint32_t) hparam->index_size;
+	      + (uint64_t) CityHash64WithSeed(fh_desc.addr, fh_desc.len, 557))
+	      % (uint32_t) hparam->index_size;
 
 	if (isDebug(COMPONENT_HASHTABLE))
 		LogFullDebug(COMPONENT_STATE, "value = %" PRIu32, res);
@@ -390,15 +394,18 @@ uint32_t state_entry_value_hash_func(hash_parameter_t *hparam,
  *
  * @return The RBT hash.
  */
-uint64_t state_entry_rbt_hash_func(hash_parameter_t *hparam,
-				   struct gsh_buffdesc *key)
+uint64_t state_obj_rbt_hash_func(hash_parameter_t *hparam,
+				 struct gsh_buffdesc *key)
 {
 	state_t *pkey = key->addr;
+	struct gsh_buffdesc fh_desc;
 
 	unsigned int sum = 0;
 	unsigned int i = 0;
 	unsigned char c = 0;
 	uint64_t res = 0;
+
+	pkey->state_obj->obj_ops->handle_to_key(pkey->state_obj, &fh_desc);
 
 	/* Compute the sum of all the characters */
 	for (i = 0; i < pkey->state_owner->so_owner_len; i++) {
@@ -409,7 +416,7 @@ uint64_t state_entry_rbt_hash_func(hash_parameter_t *hparam,
 	res = (uint64_t) pkey->state_owner->so_owner.so_nfs4_owner.so_clientid
 	      + (uint64_t) sum + pkey->state_owner->so_owner_len
 	      + (uint64_t) pkey->state_owner->so_type
-	      + (uintptr_t) pkey->state_entry;
+	      + (uint64_t) CityHash64WithSeed(fh_desc.addr, fh_desc.len, 557);
 
 	if (isDebug(COMPONENT_HASHTABLE))
 		LogFullDebug(COMPONENT_STATE, "rbt = %" PRIu64, res);
@@ -417,15 +424,16 @@ uint64_t state_entry_rbt_hash_func(hash_parameter_t *hparam,
 	return res;
 }
 
-static hash_parameter_t state_entry_param = {
+static hash_parameter_t state_obj_param = {
 	.index_size = PRIME_STATE,
-	.hash_func_key = state_entry_value_hash_func,
-	.hash_func_rbt = state_entry_rbt_hash_func,
-	.compare_key = compare_state_entry,
+	.hash_func_key = state_obj_value_hash_func,
+	.hash_func_rbt = state_obj_rbt_hash_func,
+	.compare_key = compare_state_obj,
 	.key_to_str = display_state_id_val,
 	.val_to_str = display_state_id_val,
 	.flags = HT_FLAG_CACHE,
 	.ht_log_component = COMPONENT_STATE,
+	.ht_name = "State Obj Table"
 };
 
 /**
@@ -447,9 +455,9 @@ int nfs4_Init_state_id(void)
 		return -1;
 	}
 
-	ht_state_entry = hashtable_init(&state_entry_param);
+	ht_state_obj = hashtable_init(&state_obj_param);
 
-	if (ht_state_entry == NULL) {
+	if (ht_state_obj == NULL) {
 		LogCrit(COMPONENT_STATE, "Cannot init State Entry cache");
 		return -1;
 	}
@@ -486,7 +494,7 @@ void nfs4_BuildStateId_Other(nfs_client_id_t *clientid, char *other)
  */
 void dec_nfs4_state_ref(struct state_t *state)
 {
-	char str[LOG_BUFF_LEN];
+	char str[LOG_BUFF_LEN] = "\0";
 	struct display_buffer dspbuf = {sizeof(str), str, str};
 	bool str_valid = false;
 	int32_t refcount;
@@ -509,7 +517,7 @@ void dec_nfs4_state_ref(struct state_t *state)
 
 	PTHREAD_MUTEX_destroy(&state->state_mutex);
 
-	pool_free(state_v4_pool, state);
+	state->state_exp->exp_ops.free_state(state->state_exp, state);
 
 	if (str_valid)
 		LogFullDebug(COMPONENT_STATE, "Deleted %s", str);
@@ -521,10 +529,10 @@ void dec_nfs4_state_ref(struct state_t *state)
  * @param[in] other stateid4.other
  * @param[in] state The state to add
  *
- * @retval 1 if ok.
- * @retval 0 if not ok.
+ * @retval STATE_SUCCESS if able to insert the new state.
+ * @retval STATE_ENTRY_EXISTS if state is already there.
  */
-int nfs4_State_Set(state_t *state)
+state_status_t nfs4_State_Set(state_t *state)
 {
 	struct gsh_buffdesc buffkey;
 	struct gsh_buffdesc buffval;
@@ -541,17 +549,20 @@ int nfs4_State_Set(state_t *state)
 				     &buffval,
 				     HASHTABLE_SET_HOW_SET_NO_OVERWRITE);
 
-	if (err != HASHTABLE_SUCCESS) {
+	switch (err) {
+	case HASHTABLE_SUCCESS:
+		break;
+	default:
 		LogCrit(COMPONENT_STATE,
-			"hashtable_test_and_set failed %s for key %p",
+			"ht_state_id hashtable_test_and_set failed %s for key %p",
 			hash_table_err_to_str(err), buffkey.addr);
-		return 0;
+		return STATE_ENTRY_EXISTS; /* likely reason */
 	}
 
 	/* If stateid is a LOCK or SHARE state, we also index by entry/owner */
 	if (state->state_type != STATE_TYPE_LOCK &&
 	    state->state_type != STATE_TYPE_SHARE)
-		return 1;
+		return STATE_SUCCESS;
 
 	buffkey.addr = state;
 	buffkey.len = sizeof(state_t);
@@ -559,30 +570,30 @@ int nfs4_State_Set(state_t *state)
 	buffval.addr = state;
 	buffval.len = sizeof(state_t);
 
-	err = hashtable_test_and_set(ht_state_entry,
+	err = hashtable_test_and_set(ht_state_obj,
 				     &buffkey,
 				     &buffval,
 				     HASHTABLE_SET_HOW_SET_NO_OVERWRITE);
 
-	if (err != HASHTABLE_SUCCESS) {
-		struct gsh_buffdesc buffkey, old_key, old_value;
+	switch (err) {
+	case HASHTABLE_SUCCESS:
+		return STATE_SUCCESS;
 
-		buffkey.addr = state->stateid_other;
-		buffkey.len = OTHERSIZE;
-
+	case HASHTABLE_ERROR_KEY_ALREADY_EXISTS: /* buggy client? */
+	default: /* error case */
 		LogCrit(COMPONENT_STATE,
-			"hashtable_test_and_set failed %s for key %p",
+			"ht_state_obj hashtable_test_and_set failed %s for key %p",
 			hash_table_err_to_str(err), buffkey.addr);
 
 		if (isFullDebug(COMPONENT_STATE)) {
-			char str[LOG_BUFF_LEN];
+			char str[LOG_BUFF_LEN] = "\0";
 			struct display_buffer dspbuf = {sizeof(str), str, str};
 			state_t *state2;
 
 			display_stateid(&dspbuf, state);
 			LogCrit(COMPONENT_STATE, "State %s", str);
-			state2 = nfs4_State_Get_Entry(state->state_entry,
-						      state->state_owner);
+			state2 = nfs4_State_Get_Obj(state->state_obj,
+						    state->state_owner);
 			if (state2 != NULL) {
 				display_reset_buffer(&dspbuf);
 				display_stateid(&dspbuf, state2);
@@ -593,18 +604,17 @@ int nfs4_State_Set(state_t *state)
 			}
 		}
 
-		err = HashTable_Del(ht_state_id, &buffkey,
-				    &old_key, &old_value);
+		buffkey.addr = state->stateid_other;
+		buffkey.len = OTHERSIZE;
+		err = HashTable_Del(ht_state_id, &buffkey, NULL, NULL);
 
 		if (err != HASHTABLE_SUCCESS) {
-			LogDebug(COMPONENT_STATE,
+			LogCrit(COMPONENT_STATE,
 				 "Failure to delete stateid %s",
 				 hash_table_err_to_str(err));
 		}
-		return 0;
+		return STATE_ENTRY_EXISTS; /* likely reason */
 	}
-
-	return 1;
 }
 
 /**
@@ -648,12 +658,13 @@ struct state_t *nfs4_State_Get_Pointer(char *other)
 /**
  * @brief Get the state from the stateid by entry/owner
  *
- * @param[in]  other      stateid4.other
+ * @param[in]  obj	Object containing state
+ * @param[in]  owner	Owner for state
  *
  * @returns The found state_t or NULL if not found.
  */
-struct state_t *nfs4_State_Get_Entry(cache_entry_t *entry,
-				     state_owner_t *owner)
+struct state_t *nfs4_State_Get_Obj(struct fsal_obj_handle *obj,
+				   state_owner_t *owner)
 {
 	state_t state_key;
 	struct gsh_buffdesc buffkey;
@@ -668,9 +679,9 @@ struct state_t *nfs4_State_Get_Entry(cache_entry_t *entry,
 	buffkey.len = sizeof(state_key);
 
 	state_key.state_owner = owner;
-	state_key.state_entry = entry;
+	state_key.state_obj = obj;
 
-	rc = hashtable_getlatch(ht_state_entry,
+	rc = hashtable_getlatch(ht_state_obj,
 				&buffkey,
 				&buffval,
 				true,
@@ -678,7 +689,7 @@ struct state_t *nfs4_State_Get_Entry(cache_entry_t *entry,
 
 	if (rc != HASHTABLE_SUCCESS) {
 		if (rc == HASHTABLE_ERROR_NO_SUCH_KEY)
-			hashtable_releaselatched(ht_state_entry, &latch);
+			hashtable_releaselatched(ht_state_obj, &latch);
 		LogDebug(COMPONENT_STATE, "HashTable_Get returned %d", rc);
 		return NULL;
 	}
@@ -689,7 +700,7 @@ struct state_t *nfs4_State_Get_Entry(cache_entry_t *entry,
 	inc_state_t_ref(state);
 
 	/* Release latch */
-	hashtable_releaselatched(ht_state_entry, &latch);
+	hashtable_releaselatched(ht_state_obj, &latch);
 
 	return state;
 }
@@ -705,6 +716,7 @@ struct state_t *nfs4_State_Get_Entry(cache_entry_t *entry,
 bool nfs4_State_Del(state_t *state)
 {
 	struct gsh_buffdesc buffkey, old_key, old_value;
+	struct hash_latch latch;
 	hash_error_t err;
 
 	buffkey.addr = state->stateid_other;
@@ -712,8 +724,11 @@ bool nfs4_State_Del(state_t *state)
 
 	err = HashTable_Del(ht_state_id, &buffkey, &old_key, &old_value);
 
-	if (err != HASHTABLE_SUCCESS) {
-		char str[LOG_BUFF_LEN];
+	if (err == HASHTABLE_ERROR_NO_SUCH_KEY) {
+		/* Already gone */
+		return false;
+	} else if (err != HASHTABLE_SUCCESS) {
+		char str[LOG_BUFF_LEN] = "\0";
 		struct display_buffer dspbuf = {sizeof(str), str, str};
 
 		display_stateid(&dspbuf, state);
@@ -740,15 +755,27 @@ bool nfs4_State_Del(state_t *state)
 	buffkey.addr = old_value.addr;
 	buffkey.len = old_value.len;
 
-	err = HashTable_Del(ht_state_entry, &buffkey, &old_key, &old_value);
-
+	/* Get latch: we need to check we're deleting the right state */
+	err = hashtable_getlatch(ht_state_obj, &buffkey, &old_value, true,
+				 &latch);
 	if (err != HASHTABLE_SUCCESS) {
-		LogDebug(COMPONENT_STATE,
-			 "Failure to delete stateid %s",
-			 hash_table_err_to_str(err));
+		if (err == HASHTABLE_ERROR_NO_SUCH_KEY)
+			hashtable_releaselatched(ht_state_obj, &latch);
+
+		LogCrit(COMPONENT_STATE, "hashtable get latch failed: %d",
+			err);
+		return false;
 	}
 
-	return err == HASHTABLE_SUCCESS;
+	if (old_value.addr != state) {
+		/* state obj had already been swapped out */
+		hashtable_releaselatched(ht_state_obj, &latch);
+		return false;
+	}
+
+	hashtable_deletelatched(ht_state_obj, &buffkey, &latch, NULL, NULL);
+	hashtable_releaselatched(ht_state_obj, &latch);
+	return true;
 }
 
 /**
@@ -757,7 +784,7 @@ bool nfs4_State_Del(state_t *state)
  * This function yields the state for the stateid if it is valid.
  *
  * @param[in]  stateid     Stateid to look up
- * @param[in]  entry       Associated file (if any)
+ * @param[in]  fsal_obj    Associated file (if any)
  * @param[out] state       Found state
  * @param[in]  data        Compound data
  * @param[in]  flags       Flags governing special stateids
@@ -767,17 +794,17 @@ bool nfs4_State_Del(state_t *state)
  *
  * @return NFSv4 status codes
  */
-nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, cache_entry_t *entry,
+nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, struct fsal_obj_handle *fsal_obj,
 			    state_t **state, compound_data_t *data, int flags,
 			    seqid4 owner_seqid, bool check_seqid,
 			    const char *tag)
 {
 	uint32_t epoch = 0;
-	uint64_t epoch_low = ServerEpoch & 0xFFFFFFFF;
+	uint64_t epoch_low = nfs_ServerEpoch & 0xFFFFFFFF;
 	state_t *state2 = NULL;
-	cache_entry_t *entry2 = NULL;
+	struct fsal_obj_handle *obj2 = NULL;
 	state_owner_t *owner2 = NULL;
-	char str[DISPLAY_STATEID4_SIZE];
+	char str[DISPLAY_STATEID4_SIZE] = "\0";
 	struct display_buffer dspbuf = {sizeof(str), str, str};
 	bool str_valid = false;
 	int32_t diff;
@@ -791,13 +818,12 @@ nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, cache_entry_t *entry,
 		str_valid = true;
 	}
 
-	LogFullDebug(COMPONENT_STATE, "Check %s stateid flags%s%s%s%s%s%s%s",
+	LogFullDebug(COMPONENT_STATE, "Check %s stateid flags%s%s%s%s%s%s",
 		     tag, flags & STATEID_SPECIAL_ALL_0 ? " ALL_0" : "",
 		     flags & STATEID_SPECIAL_ALL_1 ? " ALL_1" : "",
 		     flags & STATEID_SPECIAL_CURRENT ? " CURRENT" : "",
 		     flags & STATEID_SPECIAL_CLOSE_40 ? " CLOSE_40" : "",
 		     flags & STATEID_SPECIAL_CLOSE_41 ? " CLOSE_41" : "",
-		     flags & STATEID_SPECIAL_FREE ? " FREE" : "",
 		     flags == 0 ? " NONE" : "");
 
 	/* Test for OTHER is all zeros */
@@ -886,13 +912,13 @@ nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, cache_entry_t *entry,
 	/* Try to get the related state */
 	state2 = nfs4_State_Get_Pointer(stateid->other);
 
-	/* We also need a reference to the state_entry and state_owner.
+	/* We also need a reference to the state_obj and state_owner.
 	 * If we can't get them, we will check below for lease invalidity.
-	 * Note that calling get_state_entry_export_owner_refs with a NULL
+	 * Note that calling get_state_obj_export_owner_refs with a NULL
 	 * state2 returns false.
 	 */
-	if (!get_state_entry_export_owner_refs(state2,
-					       &entry2,
+	if (!get_state_obj_export_owner_refs(state2,
+					       &obj2,
 					       NULL,
 					       &owner2)) {
 		/* We matched this server's epoch, but could not find the
@@ -1048,7 +1074,7 @@ nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, cache_entry_t *entry,
 	}
 
 	/* Sanity check : Is this the right file ? */
-	if ((entry != NULL) && (entry2 != entry)) {
+	if (fsal_obj && !fsal_obj->obj_ops->handle_cmp(fsal_obj, obj2)) {
 		if (str_valid)
 			LogDebug(COMPONENT_STATE,
 				 "Check %s stateid found stateid %s has wrong file",
@@ -1121,41 +1147,6 @@ nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, cache_entry_t *entry,
 		}
 	}
 
-	if ((flags & STATEID_SPECIAL_FREE) != 0) {
-		switch (state2->state_type) {
-		case STATE_TYPE_LOCK:
-			PTHREAD_RWLOCK_rdlock(&entry2->state_lock);
-			if (glist_empty
-			    (&state2->state_data.lock.state_locklist)) {
-				if (str_valid)
-					LogFullDebug(COMPONENT_STATE,
-						     "Check %s stateid %s has no locks, ok to free",
-						     tag, str);
-				PTHREAD_RWLOCK_unlock(&entry2->state_lock);
-				break;
-			}
-			PTHREAD_RWLOCK_unlock(&entry2->state_lock);
-			/* Fall through for failure */
-
-		case STATE_TYPE_NLM_LOCK:
-		case STATE_TYPE_NLM_SHARE:
-		case STATE_TYPE_9P_FID:
-			/* Fall through - don't expect these types */
-
-		case STATE_TYPE_NONE:
-		case STATE_TYPE_SHARE:
-		case STATE_TYPE_DELEG:
-		case STATE_TYPE_LAYOUT:
-			if (str_valid)
-				LogDebug(COMPONENT_STATE,
-					 "Check %s stateid found stateid %s with locks held",
-					 tag, str);
-
-			status = NFS4ERR_LOCKS_HELD;
-			goto failure;
-		}
-	}
-
 	data->current_stateid_valid = true;
 
 	if (str_valid)
@@ -1169,8 +1160,8 @@ nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, cache_entry_t *entry,
 
  success:
 
-	if (entry2 != NULL) {
-		cache_inode_lru_unref(entry2, LRU_FLAG_NONE);
+	if (obj2 != NULL) {
+		obj2->obj_ops->put_ref(obj2);
 		dec_state_owner_ref(owner2);
 	}
 
@@ -1186,8 +1177,8 @@ nfsstat4 nfs4_Check_Stateid(stateid4 *stateid, cache_entry_t *entry,
 
  replay:
 
-	if (entry2 != NULL) {
-		cache_inode_lru_unref(entry2, LRU_FLAG_NONE);
+	if (obj2 != NULL) {
+		obj2->obj_ops->put_ref(obj2);
 		dec_state_owner_ref(owner2);
 	}
 
@@ -1235,7 +1226,7 @@ void update_stateid(state_t *state, stateid4 *resp, compound_data_t *data,
 	COPY_STATEID(resp, state);
 
 	if (isFullDebug(COMPONENT_STATE)) {
-		char str[DISPLAY_STATEID4_SIZE];
+		char str[DISPLAY_STATEID4_SIZE] = "\0";
 		struct display_buffer dspbuf = {sizeof(str), str, str};
 
 		display_stateid4(&dspbuf, resp);

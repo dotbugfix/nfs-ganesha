@@ -30,8 +30,17 @@
 #include "internal.h"
 #include "nfs_exports.h"
 #include "FSAL/fsal_commonlib.h"
+#include "statx_compat.h"
 
 #ifdef CEPH_PNFS
+
+/**
+ * Linux supports a stripe pattern with no more than 4096 stripes, but
+ * for now we stick to 1024 to keep them da_addrs from being too
+ * gigantic.
+ */
+
+static const size_t BIGGEST_PATTERN = 1024;
 
 /**
  * @file   FSAL_CEPH/mds.c
@@ -48,7 +57,7 @@
 static bool initiate_recall(vinodeno_t vi, bool write, void *opaque)
 {
 	/* The private 'full' object handle */
-	struct handle *handle = (struct handle *)opaque;
+	struct ceph_handle *handle = (struct ceph_handle *)opaque;
 	/* Return code from upcall operation */
 	state_status_t status = STATE_SUCCESS;
 	struct gsh_buffdesc key = {
@@ -89,9 +98,10 @@ static nfsstat4 getdeviceinfo(struct fsal_export *export_pub,
 			      const struct pnfs_deviceid *deviceid)
 {
 	/* Full 'private' export */
-	struct export *export = container_of(export_pub, struct export, export);
+	struct ceph_export *export =
+		container_of(export_pub, struct ceph_export, export);
 	/* The number of Ceph OSDs in the cluster */
-	unsigned num_osds = ceph_ll_num_osds(export->cmount);
+	unsigned int num_osds = ceph_ll_num_osds(export->cmount);
 	/* Minimal information needed to get layout info */
 	vinodeno_t vinode;
 	/* Structure containing the storage parameters of the file within
@@ -324,10 +334,11 @@ static nfsstat4 layoutget(struct fsal_obj_handle *obj_pub,
 			  struct fsal_layoutget_res *res)
 {
 	/* The private 'full' export */
-	struct export *export =
-	    container_of(req_ctx->fsal_export, struct export, export);
+	struct ceph_export *export =
+		container_of(req_ctx->fsal_export, struct ceph_export, export);
 	/* The private 'full' object handle */
-	struct handle *handle = container_of(obj_pub, struct handle, handle);
+	struct ceph_handle *handle =
+		container_of(obj_pub, struct ceph_handle, handle);
 	/* Structure containing the storage parameters of the file within
 	   the Ceph cluster. */
 	struct ceph_file_layout file_layout;
@@ -418,7 +429,7 @@ static nfsstat4 layoutget(struct fsal_obj_handle *obj_pub,
 	/* If we have a cached capbility, use that.  Otherwise, call
 	   in to Ceph. */
 
-	PTHREAD_RWLOCK_wrlock(&handle->handle.lock);
+	PTHREAD_RWLOCK_wrlock(&handle->handle.obj_lock);
 	if (res->segment.io_mode == LAYOUTIOMODE4_READ) {
 		int32_t r = 0;
 
@@ -430,7 +441,7 @@ static nfsstat4 layoutget(struct fsal_obj_handle *obj_pub,
 					    &handle->rd_serial, NULL);
 #endif
 			if (r < 0) {
-				PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+				PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 				return posix2nfs4_error(-r);
 			}
 		}
@@ -446,14 +457,14 @@ static nfsstat4 layoutget(struct fsal_obj_handle *obj_pub,
 					    &handle->rw_max_len);
 #endif
 			if (r < 0) {
-				PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+				PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 				return posix2nfs4_error(-r);
 			}
 		}
 		forbidden_area.offset = handle->rw_max_len;
 		if (pnfs_segments_overlap
 		    (&smallest_acceptable, &forbidden_area)) {
-			PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+			PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 			return NFS4ERR_BADLAYOUT;
 		}
 #if CLIENTS_WILL_ACCEPT_SEGMENTED_LAYOUTS	/* sigh */
@@ -462,7 +473,7 @@ static nfsstat4 layoutget(struct fsal_obj_handle *obj_pub,
 #endif
 		++handle->rw_issued;
 	}
-	PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+	PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 
 	/* For now, just make the low quad of the deviceid be the
 	   inode number.  With the span of the layouts constrained
@@ -501,27 +512,27 @@ static nfsstat4 layoutget(struct fsal_obj_handle *obj_pub,
 	/* If we failed in encoding the lo_content, relinquish what we
 	   reserved for it. */
 
-	PTHREAD_RWLOCK_wrlock(&handle->handle.lock);
+	PTHREAD_RWLOCK_wrlock(&handle->handle.obj_lock);
 	if (res->segment.io_mode == LAYOUTIOMODE4_READ) {
 		if (--handle->rd_issued != 0) {
-			PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+			PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 			return nfs_status;
 		}
 	} else {
 		if (--handle->rd_issued != 0) {
-			PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+			PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 			return nfs_status;
 		}
 	}
 
 #if 0
 	ceph_ll_return_rw(export->cmount, handle->wire.vi,
-			  res->segment.io_mode ==
-			  LAYOUTIOMODE4_READ ? handle->rd_serial : handle->
-			  rw_serial);
+			  res->segment.io_mode == LAYOUTIOMODE4_READ
+				? handle->rd_serial
+				: handle->rw_serial);
 #endif
 
-	PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+	PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 
 	return nfs_status;
 }
@@ -545,10 +556,11 @@ static nfsstat4 layoutreturn(struct fsal_obj_handle *obj_pub,
 			     const struct fsal_layoutreturn_arg *arg)
 {
 	/* The private 'full' export */
-	struct export *export =
-	    container_of(req_ctx->fsal_export, struct export, export);
+	struct ceph_export *export =
+		container_of(req_ctx->fsal_export, struct ceph_export, export);
 	/* The private 'full' object handle */
-	struct handle *handle = container_of(obj_pub, struct handle, handle);
+	struct ceph_handle *handle =
+		container_of(obj_pub, struct ceph_handle, handle);
 
 	/* Sanity check on type */
 	if (arg->lo_type != LAYOUT4_NFSV4_1_FILES) {
@@ -558,27 +570,27 @@ static nfsstat4 layoutreturn(struct fsal_obj_handle *obj_pub,
 	}
 
 	if (arg->dispose) {
-		PTHREAD_RWLOCK_wrlock(&handle->handle.lock);
+		PTHREAD_RWLOCK_wrlock(&handle->handle.obj_lock);
 		if (arg->cur_segment.io_mode == LAYOUTIOMODE4_READ) {
 			if (--handle->rd_issued != 0) {
-				PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+				PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 				return NFS4_OK;
 			}
 		} else {
 			if (--handle->rd_issued != 0) {
-				PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+				PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 				return NFS4_OK;
 			}
 		}
 
 #if 0
 		ceph_ll_return_rw(export->cmount, handle->wire.vi,
-				  arg->cur_segment.io_mode ==
-				  LAYOUTIOMODE4_READ ? handle->
-				  rd_serial : handle->rw_serial);
+				  arg->cur_segment.io_mode == LAYOUTIOMODE4_READ
+					? handle->rd_serial
+					: handle->rw_serial);
 #endif
 
-		PTHREAD_RWLOCK_unlock(&handle->handle.lock);
+		PTHREAD_RWLOCK_unlock(&handle->handle.obj_lock);
 	}
 
 	return NFS4_OK;
@@ -606,14 +618,15 @@ static nfsstat4 layoutcommit(struct fsal_obj_handle *obj_pub,
 			     struct fsal_layoutcommit_res *res)
 {
 	/* The private 'full' export */
-	struct export *export =
-	    container_of(req_ctx->fsal_export, struct export, export);
+	struct ceph_export *export =
+		container_of(req_ctx->fsal_export, struct ceph_export, export);
 	/* The private 'full' object handle */
-	struct handle *handle = container_of(obj_pub, struct handle, handle);
+	struct ceph_handle *handle =
+		container_of(obj_pub, struct ceph_handle, handle);
 	/* Old stat, so we don't truncate file or reverse time */
-	struct stat stold;
+	struct ceph_statx stxold;
 	/* new stat to set time and size */
-	struct stat stnew;
+	struct ceph_statx stxnew;
 	/* Mask to determine exactly what gets set */
 	int attrmask = 0;
 	/* Error returns from Ceph */
@@ -629,10 +642,9 @@ static nfsstat4 layoutcommit(struct fsal_obj_handle *obj_pub,
 	/* A more proper and robust implementation of this would use
 	   Ceph caps, but we need to hack at the client to expose
 	   those before it can work. */
-
-	memset(&stold, 0, sizeof(struct stat));
-	ceph_status = ceph_ll_getattr(export->cmount, handle->wire.vi,
-				      &stold, 0, 0);
+	ceph_status = fsal_ceph_ll_getattr(export->cmount, handle->wire.vi,
+			&stxold, CEPH_STATX_SIZE|CEPH_STATX_MTIME,
+			op_ctx->creds);
 	if (ceph_status < 0) {
 		LogCrit(COMPONENT_PNFS,
 			"Error %d in attempt to get attributes of file %"
@@ -640,26 +652,36 @@ static nfsstat4 layoutcommit(struct fsal_obj_handle *obj_pub,
 		return posix2nfs4_error(-ceph_status);
 	}
 
-	memset(&stnew, 0, sizeof(struct stat));
+	stxnew->stx_mask = 0;
 	if (arg->new_offset) {
-		if (stold.st_size < arg->last_write + 1) {
+		if (stxold.stx_size < arg->last_write + 1) {
 			attrmask |= CEPH_SETATTR_SIZE;
-			stnew.st_size = arg->last_write + 1;
+			stxnew.stx_size = arg->last_write + 1;
 			res->size_supplied = true;
 			res->new_size = arg->last_write + 1;
 		}
 	}
 
-	if ((arg->time_changed) &&
-	    (arg->new_time.seconds > stold.st_mtime))
-		stnew.st_mtime = arg->new_time.seconds;
-	else
-		stnew.st_mtime = time(NULL);
+	if (arg->time_changed &&
+	    (arg->new_time.seconds > stxold.stx_mtime ||
+	     (arg->new_time.seconds == stxold.stx_mtime &&
+	      arg->new_time.nseconds > stxold.stx_mtime_ns))) {
+		stxnew.stx_mtime = arg->new_time.seconds;
+		stxnew.stx_mtime_ns = arg->new_time.nseconds;
+	} else {
+		struct timespec now;
+
+		ceph_status = clock_gettime(CLOCK_REALTIME, &now);
+		if (ceph_status != 0)
+			return posix2nfs4_error(errno);
+		stxnew.stx_mtime = now.tv_sec;
+		stxnew.stx_mtime_ns = now.tv_nsec;
+	}
 
 	attrmask |= CEPH_SETATTR_MTIME;
 
-	ceph_status = ceph_ll_setattr(export->cmount, handle->wire.vi,
-				      &stnew, attrmask, 0, 0);
+	ceph_status = fsal_ceph_ll_setattr(export->cmount, handle->wire.vi,
+					&stxnew, attrmask, op_ctx->creds);
 	if (ceph_status < 0) {
 		LogCrit(COMPONENT_PNFS,
 			"Error %d in attempt to get attributes of file %"

@@ -46,41 +46,57 @@
 #include "abstract_mem.h"
 #include "nfs_exports.h"
 #include "export_mgr.h"
-
-/**
- * Ceph global module object.
- */
-struct ceph_fsal_module CephFSM;
+#include "statx_compat.h"
+#include "nfs_core.h"
 
 /**
  * The name of this module.
  */
 static const char *module_name = "Ceph";
 
-static fsal_staticfsinfo_t default_ceph_info = {
-	/* settable */
-#if 0
-	.umask = 0,
-	.xattr_access_rights = 0,
-#endif
-	/* fixed */
-	.symlink_support = true,
-	.link_support = true,
-	.cansettime = true,
-	.no_trunc = true,
-	.chown_restricted = true,
-	.case_preserving = true,
-	.unique_handles = true,
-	.homogenous = true,
+/**
+ * Ceph global module object.
+ */
+struct ceph_fsal_module CephFSM = {
+	.fsal = {
+		.fs_info = {
+		#if 0
+			.umask = 0,
+		#endif
+			/* fixed */
+			.symlink_support = true,
+			.link_support = true,
+			.cansettime = true,
+			.no_trunc = true,
+			.chown_restricted = true,
+			.case_preserving = true,
+			.maxfilesize = INT64_MAX,
+			.maxread = FSAL_MAXIOSIZE,
+			.maxwrite = FSAL_MAXIOSIZE,
+			.maxlink = 1024,
+			.maxnamelen = NAME_MAX,
+			.maxpathlen = PATH_MAX,
+			.acl_support = 0,
+			.supported_attrs = CEPH_SUPPORTED_ATTRS,
+		#ifdef USE_FSAL_CEPH_SETLK
+			.lock_support = true,
+			.lock_support_async_block = false,
+		#endif
+			.unique_handles = true,
+			.homogenous = true,
+		#ifdef USE_FSAL_CEPH_LL_DELEGATION
+			.delegations = FSAL_OPTION_FILE_READ_DELEG,
+		#endif
+			.readdir_plus = true,
+		}
+	}
 };
 
 static struct config_item ceph_items[] = {
 	CONF_ITEM_PATH("ceph_conf", 1, MAXPATHLEN, NULL,
 		ceph_fsal_module, conf_path),
 	CONF_ITEM_MODE("umask", 0,
-			ceph_fsal_module, fs_info.umask),
-	CONF_ITEM_MODE("xattr_access_rights", 0,
-			ceph_fsal_module, fs_info.xattr_access_rights),
+			ceph_fsal_module, fsal.fs_info.umask),
 	CONFIG_EOL
 };
 
@@ -110,7 +126,6 @@ static fsal_status_t init_config(struct fsal_module *module_in,
 	LogDebug(COMPONENT_FSAL,
 		 "Ceph module setup.");
 
-	myself->fs_info = default_ceph_info;
 	(void) load_config_from_parse(config_struct,
 				      &ceph_block,
 				      myself,
@@ -119,8 +134,80 @@ static fsal_status_t init_config(struct fsal_module *module_in,
 	if (!config_error_is_harmless(err_type))
 		return fsalstat(ERR_FSAL_INVAL, 0);
 
+	display_fsinfo(&myself->fsal);
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 }
+
+#ifdef USE_FSAL_CEPH_LL_LOOKUP_ROOT
+static fsal_status_t find_cephfs_root(struct ceph_mount_info *cmount,
+					Inode **pi)
+{
+	return ceph2fsal_error(ceph_ll_lookup_root(cmount, pi));
+}
+#else /* USE_FSAL_CEPH_LL_LOOKUP_ROOT */
+static fsal_status_t find_cephfs_root(struct ceph_mount_info *cmount,
+					Inode **pi)
+{
+	struct stat st;
+
+	return ceph2fsal_error(ceph_ll_walk(cmount, "/", pi, &st));
+}
+#endif /* USE_FSAL_CEPH_LL_LOOKUP_ROOT */
+
+static struct config_item export_params[] = {
+	CONF_ITEM_NOOP("name"),
+	CONF_ITEM_STR("user_id", 0, MAXUIDLEN, NULL, ceph_export, user_id),
+	CONF_ITEM_STR("secret_access_key", 0, MAXSECRETLEN, NULL, ceph_export,
+			secret_key),
+	CONFIG_EOL
+};
+
+static struct config_block export_param_block = {
+	.dbus_interface_name = "org.ganesha.nfsd.config.fsal.ceph-export%d",
+	.blk_desc.name = "FSAL",
+	.blk_desc.type = CONFIG_BLOCK,
+	.blk_desc.u.blk.init = noop_conf_init,
+	.blk_desc.u.blk.params = export_params,
+	.blk_desc.u.blk.commit = noop_conf_commit
+};
+
+#ifdef USE_FSAL_CEPH_LL_DELEGATION
+static void enable_delegations(struct ceph_export *export)
+{
+	struct export_perms *export_perms = &op_ctx->ctx_export->export_perms;
+
+	if (export_perms->options & EXPORT_OPTION_DELEGATIONS) {
+		/*
+		 * Ganesha will time out delegations when the recall fails
+		 * for two lease periods. We add just a little bit above that
+		 * as a scheduling fudge-factor.
+		 *
+		 * The idea here is to make this long enough to give ganesha
+		 * a chance to kick out a misbehaving client, but shorter
+		 * than ceph cluster-wide MDS session timeout.
+		 *
+		 * Exceeding the MDS session timeout may result in the client
+		 * (ganesha) being blacklisted in the cluster. Fixing that can
+		 * require a long wait and/or administrative intervention.
+		 */
+		unsigned int dt = nfs_param.nfsv4_param.lease_lifetime * 2 + 5;
+		int ceph_status;
+
+		LogDebug(COMPONENT_FSAL, "Setting deleg timeout to %u", dt);
+		ceph_status = ceph_set_deleg_timeout(export->cmount, dt);
+		if (ceph_status != 0) {
+			export_perms->options &= ~EXPORT_OPTION_DELEGATIONS;
+			LogWarn(COMPONENT_FSAL,
+				"Unable to set delegation timeout for %s. Disabling delegation support: %d",
+				op_ctx->ctx_export->fullpath, ceph_status);
+		}
+	}
+}
+#else /* !USE_FSAL_CEPH_LL_DELEGATION */
+static inline void enable_delegations(struct ceph_export *export)
+{
+}
+#endif /* USE_FSAL_CEPH_LL_DELEGATION */
 
 /**
  * @brief Create a new export under this FSAL
@@ -150,52 +237,42 @@ static fsal_status_t create_export(struct fsal_module *module_in,
 {
 	/* The status code to return */
 	fsal_status_t status = { ERR_FSAL_NO_ERROR, 0 };
-	/* A fake argument list for Ceph */
-	const char *argv[] = { "FSAL_CEPH", op_ctx->export->fullpath };
 	/* The internal export object */
-	struct export *export = gsh_calloc(1, sizeof(struct export));
+	struct ceph_export *export = gsh_calloc(1, sizeof(struct ceph_export));
 	/* The 'private' root handle */
-	struct handle *handle = NULL;
+	struct ceph_handle *handle = NULL;
 	/* Root inode */
 	struct Inode *i = NULL;
-	/* Root vinode */
-	vinodeno_t root;
 	/* Stat for root */
-	struct stat st;
+	struct ceph_statx stx;
 	/* Return code */
 	int rc;
 	/* Return code from Ceph calls */
 	int ceph_status;
-	/* True if we have called fsal_export_init */
-	bool initialized = false;
 
-	if (export == NULL) {
-		status.major = ERR_FSAL_NOMEM;
-		LogCrit(COMPONENT_FSAL,
-			"Unable to allocate export object for %s.",
-			op_ctx->export->fullpath);
-		goto error;
-	}
-
-	if (fsal_export_init(&export->export) != 0) {
-		status.major = ERR_FSAL_NOMEM;
-		LogCrit(COMPONENT_FSAL,
-			"Unable to allocate export ops vectors for %s.",
-			op_ctx->export->fullpath);
-		goto error;
-	}
+	fsal_export_init(&export->export);
 	export_ops_init(&export->export.exp_ops);
-	export->export.up_ops = up_ops;
 
-	initialized = true;
+	/* get params for this export, if any */
+	if (parse_node) {
+		rc = load_config_from_node(parse_node,
+					   &export_param_block,
+					   export,
+					   true,
+					   err_type);
+		if (rc != 0) {
+			gsh_free(export);
+			return fsalstat(ERR_FSAL_INVAL, 0);
+		}
+	}
 
 	/* allocates ceph_mount_info */
-	ceph_status = ceph_create(&export->cmount, NULL);
+	ceph_status = ceph_create(&export->cmount, export->user_id);
 	if (ceph_status != 0) {
 		status.major = ERR_FSAL_SERVERFAULT;
 		LogCrit(COMPONENT_FSAL,
 			"Unable to create Ceph handle for %s.",
-			op_ctx->export->fullpath);
+			op_ctx->ctx_export->fullpath);
 		goto error;
 	}
 
@@ -204,66 +281,78 @@ static fsal_status_t create_export(struct fsal_module *module_in,
 		status.major = ERR_FSAL_SERVERFAULT;
 		LogCrit(COMPONENT_FSAL,
 			"Unable to read Ceph configuration for %s.",
-			op_ctx->export->fullpath);
+			op_ctx->ctx_export->fullpath);
 		goto error;
 	}
 
-	ceph_status = ceph_conf_parse_argv(export->cmount, 2, argv);
-	if (ceph_status != 0) {
-		status.major = ERR_FSAL_SERVERFAULT;
+	if (export->secret_key) {
+		ceph_status = ceph_conf_set(export->cmount, "key",
+					    export->secret_key);
+		if (ceph_status) {
+			status.major = ERR_FSAL_INVAL;
+			LogCrit(COMPONENT_FSAL,
+				"Unable to set Ceph secret key for %s: %d",
+				op_ctx->ctx_export->fullpath, ceph_status);
+			goto error;
+		}
+	}
+
+	/*
+	 * Workaround for broken libcephfs that doesn't handle the path
+	 * given in ceph_mount properly. Should be harmless for fixed
+	 * libcephfs as well (see http://tracker.ceph.com/issues/18254).
+	 */
+	ceph_status = ceph_conf_set(export->cmount, "client_mountpoint",
+				    op_ctx->ctx_export->fullpath);
+	if (ceph_status) {
+		status.major = ERR_FSAL_INVAL;
 		LogCrit(COMPONENT_FSAL,
-			"Unable to parse Ceph configuration for %s.",
-			op_ctx->export->fullpath);
+			"Unable to set Ceph client_mountpoint for %s: %d",
+			op_ctx->ctx_export->fullpath, ceph_status);
 		goto error;
 	}
 
-	ceph_status = ceph_mount(export->cmount, NULL);
+	ceph_status = ceph_mount(export->cmount, op_ctx->ctx_export->fullpath);
 	if (ceph_status != 0) {
 		status.major = ERR_FSAL_SERVERFAULT;
 		LogCrit(COMPONENT_FSAL,
 			"Unable to mount Ceph cluster for %s.",
-			op_ctx->export->fullpath);
+			op_ctx->ctx_export->fullpath);
 		goto error;
 	}
+
+	enable_delegations(export);
 
 	if (fsal_attach_export(module_in, &export->export.exports) != 0) {
 		status.major = ERR_FSAL_SERVERFAULT;
 		LogCrit(COMPONENT_FSAL,
 			"Unable to attach export for %s.",
-			op_ctx->export->fullpath);
+			op_ctx->ctx_export->fullpath);
 		goto error;
 	}
 
 	export->export.fsal = module_in;
+	export->export.up_ops = up_ops;
 
-	LogDebug(COMPONENT_FSAL,
-		 "Ceph module export %s.",
-		 op_ctx->export->fullpath);
+	LogDebug(COMPONENT_FSAL, "Ceph module export %s.",
+		 op_ctx->ctx_export->fullpath);
 
-	root.ino.val = CEPH_INO_ROOT;
-#ifdef CEPH_NOSNAP
-	root.snapid.val = CEPH_NOSNAP;
-#endif /* CEPH_NOSNAP */
-	i = ceph_ll_get_inode(export->cmount, root);
-	if (!i) {
-		status.major = ERR_FSAL_SERVERFAULT;
+	status = find_cephfs_root(export->cmount, &i);
+	if (FSAL_IS_ERROR(status))
 		goto error;
-	}
 
-	rc = ceph_ll_getattr(export->cmount, i, &st, 0, 0);
+	rc = fsal_ceph_ll_getattr(export->cmount, i, &stx,
+				CEPH_STATX_HANDLE_MASK, op_ctx->creds);
 	if (rc < 0) {
 		status = ceph2fsal_error(rc);
 		goto error;
 	}
 
-	rc = construct_handle(&st, i, export, &handle);
-	if (rc < 0) {
-		status = ceph2fsal_error(rc);
-		goto error;
-	}
+	construct_handle(&stx, i, export, &handle);
 
 	export->root = handle;
 	op_ctx->fsal_export = &export->export;
+
 	return status;
 
  error:
@@ -275,10 +364,6 @@ static fsal_status_t create_export(struct fsal_module *module_in,
 			ceph_shutdown(export->cmount);
 		gsh_free(export);
 	}
-
-	if (initialized)
-		initialized = false;
-
 	return status;
 }
 
@@ -298,9 +383,6 @@ MODULE_INIT void init(void)
 	LogDebug(COMPONENT_FSAL,
 		 "Ceph module registering.");
 
-	/* register_fsal seems to expect zeroed memory. */
-	memset(myself, 0, sizeof(*myself));
-
 	if (register_fsal(myself, module_name, FSAL_MAJOR_VERSION,
 			  FSAL_MINOR_VERSION, FSAL_ID_CEPH) != 0) {
 		/* The register_fsal function prints its own log
@@ -315,6 +397,9 @@ MODULE_INIT void init(void)
 #endif				/* CEPH_PNFS */
 	myself->m_ops.create_export = create_export;
 	myself->m_ops.init_config = init_config;
+
+	/* Initialize the fsal_obj_handle ops for FSAL CEPH */
+	handle_ops_init(&CephFSM.handle_ops);
 }
 
 /**

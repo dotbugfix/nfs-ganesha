@@ -31,6 +31,10 @@
 
 #include "config.h"
 #include <stdio.h>
+#include <sys/socket.h>
+#ifdef RPC_VSOCK
+#include <linux/vm_sockets.h>
+#endif /* VSOCK */
 #include <sys/types.h>
 #include <ctype.h> /* for having isalnum */
 #include <stdlib.h> /* for having atoi */
@@ -54,6 +58,9 @@
 #include "nfs_exports.h"
 #include "nfs_file_handle.h"
 #include "nfs_dupreq.h"
+
+/* XXX doesn't ntirpc have an equivalent for all of the following?
+ */
 
 const char *str_sock_type(int st)
 {
@@ -96,6 +103,10 @@ const char *str_af(int af)
 		return "AF_INET ";
 	case AF_INET6:
 		return "AF_INET6";
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+		return "AF_VSOCK";
+#endif /* VSOCK */
 	}
 	sprintf(buf, "%d", af);
 	return buf;
@@ -106,16 +117,28 @@ const char *xprt_type_to_str(xprt_type_t type)
 	switch (type) {
 	case XPRT_UNKNOWN:
 		return "UNKNOWN";
+	case XPRT_NON_RENDEZVOUS:
+		return "UNUSED";
 	case XPRT_UDP:
 		return "udp";
+	case XPRT_UDP_RENDEZVOUS:
+		return "udp rendezvous";
 	case XPRT_TCP:
 		return "tcp";
 	case XPRT_TCP_RENDEZVOUS:
 		return "tcp rendezvous";
 	case XPRT_SCTP:
 		return "sctp";
+	case XPRT_SCTP_RENDEZVOUS:
+		return "sctp rendezvous";
 	case XPRT_RDMA:
 		return "rdma";
+	case XPRT_RDMA_RENDEZVOUS:
+		return "rdma rendezvous";
+	case XPRT_VSOCK:
+		return "vsock";
+	case XPRT_VSOCK_RENDEZVOUS:
+		return "vsock rendezvous";
 	}
 	return "INVALID";
 }
@@ -146,6 +169,8 @@ bool copy_xprt_addr(sockaddr_t *addr, SVCXPRT *xprt)
  * This creates a native pointer size (unsigned long int) hash value
  * from the sockaddr_t structure. It supports both IPv4 and IPv6,
  * other types can be added in time.
+ *
+ * XXX is this hash...good?
  *
  * @param[in] addr        sockaddr_t address to hash
  * @param[in] ignore_port Whether to ignore the port
@@ -184,6 +209,17 @@ uint64_t hash_sockaddr(sockaddr_t *addr, bool ignore_port)
 			}
 			break;
 		}
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+	{
+		struct sockaddr_vm *svm; /* XXX checkpatch horror */
+
+		svm = (struct sockaddr_vm *) addr;
+		addr_hash = svm->svm_cid;
+		if (!ignore_port)
+			addr_hash ^= svm->svm_port;
+	}
+#endif /* VSOCK */
 	default:
 		break;
 	}
@@ -195,7 +231,7 @@ int display_sockaddr(struct display_buffer *dspbuf, sockaddr_t *addr)
 {
 	const char *name = NULL;
 	char ipname[SOCK_NAME_MAX];
-	int port;
+	int port = 0;
 	int b_left = display_start(dspbuf);
 
 	if (b_left <= 0)
@@ -382,32 +418,14 @@ int get_port(sockaddr_t *addr)
 		return ntohs(((struct sockaddr_in *)addr)->sin_port);
 	case AF_INET6:
 		return ntohs(((struct sockaddr_in6 *)addr)->sin6_port);
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+		return ((struct sockaddr_vm *)addr)->svm_port;
+#endif /* VSOCK */
 	default:
 		return -1;
 	}
 }
-
-void socket_setoptions(int socketFd)
-{
-	unsigned int SbMax = (1 << 30);	/* 1GB */
-
-	while (SbMax > 1048576) {
-		if ((setsockopt
-		     (socketFd, SOL_SOCKET, SO_SNDBUF, (char *)&SbMax,
-		      sizeof(SbMax)) < 0)
-		    ||
-		    (setsockopt
-		     (socketFd, SOL_SOCKET, SO_RCVBUF, (char *)&SbMax,
-		      sizeof(SbMax)) < 0)) {
-			SbMax >>= 1;	/* SbMax = SbMax/2 */
-			continue;
-		}
-
-		break;
-	}
-}
-
-#define SIZE_AI_ADDR sizeof(struct sockaddr)
 
 int ipstring_to_sockaddr(const char *str, sockaddr_t *addr)
 {
@@ -452,33 +470,4 @@ int ipstring_to_sockaddr(const char *str, sockaddr_t *addr)
 		}
 	}
 	return rc;
-}
-
-pthread_mutex_t clnt_create_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-/*
- * TI-RPC's clnt_create hierarchy probably isn't re-entrant.  While we
- * -will- make it so, serialize these for now.
- */
-CLIENT *gsh_clnt_create(char *host, unsigned long prog, unsigned long vers,
-			char *proto)
-{
-	CLIENT *clnt;
-
-	PTHREAD_MUTEX_lock(&clnt_create_mutex);
-	clnt = clnt_create(host, prog, vers, proto);
-	if (clnt == NULL) {
-		const char *err = clnt_spcreateerror("clnt_create failed");
-
-		LogDebug(COMPONENT_RPC, "%s", err);
-	}
-	PTHREAD_MUTEX_unlock(&clnt_create_mutex);
-	return clnt;
-}
-
-void gsh_clnt_destroy(CLIENT *clnt)
-{
-	PTHREAD_MUTEX_lock(&clnt_create_mutex);
-	clnt_destroy(clnt);
-	PTHREAD_MUTEX_unlock(&clnt_create_mutex);
 }

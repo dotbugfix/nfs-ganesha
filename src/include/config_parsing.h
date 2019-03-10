@@ -29,8 +29,7 @@
 #include <stdio.h>
 #include <sys/types.h>
 
-/* opaque type */
-typedef caddr_t config_file_t;
+typedef struct config_root *config_file_t;
 
 typedef enum { CONFIG_ITEM_BLOCK = 1, CONFIG_ITEM_VAR } config_item_type;
 
@@ -73,12 +72,10 @@ enum config_type {
 	CONFIG_PATH,
 	CONFIG_LIST,
 	CONFIG_ENUM,
-	CONFIG_ENUM_SET,
 	CONFIG_TOKEN,
 	CONFIG_BOOL,
 	CONFIG_BOOLBIT,
 	CONFIG_IP_ADDR,
-	CONFIG_INET_PORT,
 	CONFIG_BLOCK,
 	CONFIG_PROC
 };
@@ -106,7 +103,7 @@ struct config_error_type {
 	bool parse:1;		/*< parser rules */
 	bool init:1;		/*< block initialization */
 	bool fsal:1;		/*< fsal load failure */
-	bool export:1;		/*< export create failure */
+	bool export_:1;		/*< export create failure */
 	bool resource:1;	/*< system resource */
 	bool unique:1;		/*< unique block/param */
 	bool invalid:1;		/*< invalid param value */
@@ -115,6 +112,8 @@ struct config_error_type {
 	bool exists:1;		/*< block already exists */
 	bool internal:1;        /*< internal error */
 	bool bogus:1;		/*< bogus (deprecated?) param */
+	bool dispose:1;		/*< Not actually an error, but we need to
+				    dispose of the config item anyway. */
 	uint32_t errors;	/*< cumulative error count for parse+proc */
 	char *diag_buf;		/*< buffer for scan+parse+processing msgs */
 	size_t diag_buf_size;	/*< size of diag buffer used by memstream */
@@ -141,7 +140,7 @@ static inline bool config_error_is_fatal(struct config_error_type *err_type)
 static inline bool config_error_is_crit(struct config_error_type *err_type)
 {
 	return config_error_is_fatal(err_type) || err_type->internal ||
-		err_type->invalid || err_type->export || err_type->missing;
+		err_type->invalid || err_type->export_ || err_type->missing;
 }
 
 /**
@@ -151,7 +150,7 @@ static inline bool config_error_is_crit(struct config_error_type *err_type)
 static inline bool config_error_is_harmless(struct config_error_type *err_type)
 {
 	return !(config_error_is_crit(err_type) ||
-		 err_type->unique || err_type->exists);
+		 err_type->unique || err_type->exists || err_type->dispose);
 }
 
 /**
@@ -319,6 +318,8 @@ struct config_item {
 			uint64_t minval;
 			uint64_t maxval;
 			uint64_t def;
+			uint32_t bit;
+			size_t set_off;
 		} ui64;
 		struct { /* CONFIG_FSID */
 			int64_t def_maj;
@@ -331,7 +332,6 @@ struct config_item {
 			uint32_t def;
 			uint32_t mask;
 			struct config_item_list *tokens;
-			uint32_t bit;
 			size_t set_off;
 		} lst;
 		struct { /* CONFIG_BOOLBIT */
@@ -532,26 +532,10 @@ struct config_item {
 	  .off = offsetof(struct _struct_, _mem_)   \
 	}
 
-#define CONF_ITEM_ENUM(_name_, _def_, _tokens_, _struct_, _mem_) \
-	{ .name = _name_,			    \
-	  .type = CONFIG_ENUM,			    \
-	  .u.lst.def = _def_,			    \
-	  .u.lst.tokens = _tokens_,		    \
-	  .off = offsetof(struct _struct_, _mem_)   \
-	}
-
-#define CONF_ITEM_ENUM_SET(_name_, _def_, _tokens_, _struct_, _mem_, \
-			   _bit_, _set_)		   \
-	{ .name = _name_,			    \
-	  .type = CONFIG_ENUM_SET,		    \
-	  .flags = CONFIG_MARK_SET,			\
-	  .u.lst.def = _def_,			    \
-	  .u.lst.mask = UINT32_MAX,		    \
-	  .u.lst.tokens = _tokens_,		    \
-	  .u.lst.bit = _bit_,			    \
-	  .u.lst.set_off = offsetof(struct _struct_, _set_),   \
-	  .off = offsetof(struct _struct_, _mem_)   \
-	}
+/* Use CONF_ITEM_TOKEN for a variable that is set to a single enum
+ * value. The CONF_ITEM_ENUM_* macros are for setting one or more
+ * bits within a field (I know, a bit confusing...).
+ */
 
 #define CONF_ITEM_ENUM_BITS(_name_, _def_, _mask_, _tokens_, _struct_, _mem_) \
 	{ .name = _name_,			    \
@@ -570,15 +554,6 @@ struct config_item {
 	  .u.lst.def = _def_,			    \
 	  .u.lst.mask = _mask_,			    \
 	  .u.lst.set_off = offsetof(struct _struct_, _set_),   \
-	  .u.lst.tokens = _tokens_,		    \
-	  .off = offsetof(struct _struct_, _mem_)   \
-	}
-
-#define CONF_UNIQ_ENUM(_name_, _def_, _tokens_, _struct_, _mem_) \
-	{ .name = _name_,			    \
-	  .type = CONFIG_ENUM,		    \
-	  .flags = CONFIG_UNIQUE,		    \
-	  .u.lst.def = _def_,			    \
 	  .u.lst.tokens = _tokens_,		    \
 	  .off = offsetof(struct _struct_, _mem_)   \
 	}
@@ -660,25 +635,6 @@ struct config_item {
 	  .type = CONFIG_IP_ADDR,		    \
 	  .flags = CONFIG_UNIQUE|CONFIG_MANDATORY,  \
 	  .u.ip.def = _def_,			    \
-	  .off = offsetof(struct _struct_, _mem_)   \
-	}
-
-#define CONF_ITEM_INET_PORT(_name_, _min_, _max_, _def_, _struct_, _mem_) \
-	{ .name = _name_,			    \
-	  .type = CONFIG_INET_PORT,		    \
-	  .u.i16.minval = _min_,		    \
-	  .u.i16.maxval = _max_,		    \
-	  .u.i16.def = _def_,			    \
-	  .off = offsetof(struct _struct_, _mem_)   \
-	}
-
-#define CONF_MAND_INET_PORT(_name_, _min_, _max_, _def_, _struct_, _mem_) \
-	{ .name = _name_,			    \
-	  .type = CONFIG_INET_PORT,		    \
-	  .flags = CONFIG_UNIQUE|CONFIG_MANDATORY,  \
-	  .u.i16.minval = _min_,		    \
-	  .u.i16.maxval = _max_,		    \
-	  .u.i16.def = _def_,			    \
 	  .off = offsetof(struct _struct_, _mem_)   \
 	}
 
@@ -792,6 +748,19 @@ struct config_item {
 	  .off = offsetof(struct _struct_, _mem_)   \
 	}
 
+#define CONF_ITEM_UI64_SET(_name_, _min_, _max_, _def_, _struct_, \
+			  _mem_, _bit_, _set_)       \
+	{ .name = _name_,			    \
+	  .type = CONFIG_UINT64,		    \
+	  .flags = CONFIG_MARK_SET,		    \
+	  .u.ui64.minval = _min_,		    \
+	  .u.ui64.maxval = _max_,		    \
+	  .u.ui64.def = _def_,			    \
+	  .u.ui64.bit = _bit_,			    \
+	  .u.ui64.set_off = offsetof(struct _struct_, _set_),   \
+	  .off = offsetof(struct _struct_, _mem_)   \
+	}
+
 #define CONFIG_EOL {.name = NULL, .type = CONFIG_NULL}
 
 /**
@@ -846,6 +815,12 @@ static inline bool is_prime(int v)
  */
 config_file_t config_ParseFile(char *file_path,
 			       struct config_error_type *err_type);
+
+/**
+ *  Return the first node in the global config block list with
+ *  name == block_name
+ */
+void *config_GetBlockNode(const char *block_name);
 
 /**
  * config_Print:

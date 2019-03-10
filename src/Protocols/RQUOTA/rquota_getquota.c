@@ -32,7 +32,6 @@
 #include "nfs23.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_exports.h"
 #include "mount.h"
 #include <os/quota.h>		/* For USRQUOTA */
@@ -53,34 +52,68 @@ int rquota_getquota(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 	fsal_status_t fsal_status;
 	fsal_quota_t fsal_quota;
 	int quota_type = USRQUOTA;
-	struct gsh_export *exp;
+	struct gsh_export *exp = NULL;
 	char *quota_path;
 	getquota_rslt *qres = &res->res_rquota_getquota;
+	char path[MAXPATHLEN];
+	int quota_id;
 
 	LogFullDebug(COMPONENT_NFSPROTO,
-		     "REQUEST PROCESSING: Calling rquota_getquota");
+		     "REQUEST PROCESSING: Calling RQUOTA_GETQUOTA");
 
-	if (req->rq_vers == EXT_RQUOTAVERS)
+	if (req->rq_msg.cb_vers == EXT_RQUOTAVERS) {
 		quota_type = arg->arg_ext_rquota_getquota.gqa_type;
+		quota_id = arg->arg_ext_rquota_getquota.gqa_id;
+	} else {
+		quota_id = arg->arg_rquota_getquota.gqa_uid;
+	}
 	qres->status = Q_EPERM;
 
-	if (arg->arg_rquota_getquota.gqa_pathp[0] == '/') {
-		exp = get_gsh_export_by_path(arg->arg_rquota_getquota.gqa_pathp,
-					     false);
-		if (exp == NULL)
-			goto out;
-		quota_path = arg->arg_rquota_getquota.gqa_pathp;
+	quota_path = check_handle_lead_slash(arg->arg_rquota_getquota.gqa_pathp,
+					     path, MAXPATHLEN);
+	if (quota_path == NULL)
+		goto out;
+
+	/*  Find the export for the dirname (using as well Path, Pseudo, or Tag)
+	 */
+	if (quota_path[0] != '/') {
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "Searching for export by tag for %s",
+			     quota_path);
+		exp = get_gsh_export_by_tag(quota_path);
+		if (exp != NULL) {
+			/* By Tag must use fullpath for actual request. */
+			quota_path = exp->fullpath;
+		}
+	} else if (nfs_param.core_param.mount_path_pseudo) {
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "Searching for export by pseudo for %s",
+			     quota_path);
+		exp = get_gsh_export_by_pseudo(quota_path, false);
+		if (exp != NULL) {
+			/* By Pseudo must use fullpath for actual request. */
+			quota_path = exp->fullpath;
+		}
 	} else {
-		exp =
-		    get_gsh_export_by_tag(arg->arg_rquota_getquota.gqa_pathp);
-		if (exp == NULL)
-			goto out;
-		quota_path = exp->fullpath;
+		LogFullDebug(COMPONENT_NFSPROTO,
+			     "Searching for export by path for %s",
+			     quota_path);
+		exp = get_gsh_export_by_path(quota_path, false);
 	}
+
+	if (exp == NULL) {
+		/* No export found, return ACCESS error. */
+		LogEvent(COMPONENT_NFSPROTO,
+			 "Export entry for %s not found", quota_path);
+
+		/* entry not found. */
+		goto out;
+	}
+
 	fsal_status =
 	    exp->fsal_export->exp_ops.get_quota(exp->fsal_export,
 					     quota_path, quota_type,
-					     &fsal_quota);
+					     quota_id, &fsal_quota);
 	if (FSAL_IS_ERROR(fsal_status)) {
 		if (fsal_status.major == ERR_FSAL_NO_QUOTA)
 			qres->status = Q_NOQUOTA;
@@ -102,6 +135,10 @@ int rquota_getquota(nfs_arg_t *arg, struct svc_req *req, nfs_res_t *res)
 	qres->status = Q_OK;
 
  out:
+
+	if (exp != NULL)
+		put_gsh_export(exp);
+
 	return NFS_REQ_OK;
 }				/* rquota_getquota */
 

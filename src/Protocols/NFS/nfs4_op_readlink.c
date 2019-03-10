@@ -34,7 +34,6 @@
 #include "log.h"
 #include "nfs4.h"
 #include "nfs_core.h"
-#include "cache_inode.h"
 #include "nfs_proto_functions.h"
 #include "nfs_proto_tools.h"
 #include "nfs_convert.h"
@@ -60,10 +59,11 @@ int nfs4_op_readlink(struct nfs_argop4 *op, compound_data_t *data,
 		     struct nfs_resop4 *resp)
 {
 	READLINK4res * const res_READLINK4 = &resp->nfs_resop4_u.opreadlink;
-	cache_inode_status_t cache_status;
+	fsal_status_t fsal_status = {0, 0};
 	struct gsh_buffdesc link_buffer = {.addr = NULL,
 		.len = 0
 	};
+	uint32_t resp_size;
 
 	resp->resop = NFS4_OP_READLINK;
 	res_READLINK4->status = NFS4_OK;
@@ -78,11 +78,9 @@ int nfs4_op_readlink(struct nfs_argop4 *op, compound_data_t *data,
 	if (res_READLINK4->status != NFS4_OK)
 		return res_READLINK4->status;
 
-	/* Using cache_inode_readlink */
-	cache_status = cache_inode_readlink(data->current_entry, &link_buffer);
-
-	if (cache_status != CACHE_INODE_SUCCESS) {
-		res_READLINK4->status = nfs4_Errno(cache_status);
+	fsal_status = fsal_readlink(data->current_obj, &link_buffer);
+	if (FSAL_IS_ERROR(fsal_status)) {
+		res_READLINK4->status = nfs4_Errno_status(fsal_status);
 		return res_READLINK4->status;
 	}
 
@@ -93,7 +91,21 @@ int nfs4_op_readlink(struct nfs_argop4 *op, compound_data_t *data,
 	res_READLINK4->READLINK4res_u.resok4.link.utf8string_len =
 	    link_buffer.len - 1;
 
-	res_READLINK4->status = NFS4_OK;
+	/* Response size is space for nfsstat4, length, pointer, and the
+	 * link itself.
+	 */
+	resp_size = RNDUP(link_buffer.len) + 3 * sizeof(uint32_t);
+
+	res_READLINK4->status = check_resp_room(data, resp_size);
+
+	if (res_READLINK4->status != NFS4_OK) {
+		/* No room for response, free link. */
+		gsh_free(
+		    res_READLINK4->READLINK4res_u.resok4.link.utf8string_val);
+	}
+
+	data->op_resp_size = resp_size;
+
 	return res_READLINK4->status;
 }				/* nfs4_op_readlink */
 
@@ -109,7 +121,6 @@ void nfs4_op_readlink_Free(nfs_resop4 *res)
 {
 	READLINK4res *resp = &res->nfs_resop4_u.opreadlink;
 
-	if (resp->status == NFS4_OK
-	    && resp->READLINK4res_u.resok4.link.utf8string_val)
+	if (resp->status == NFS4_OK)
 		gsh_free(resp->READLINK4res_u.resok4.link.utf8string_val);
 }

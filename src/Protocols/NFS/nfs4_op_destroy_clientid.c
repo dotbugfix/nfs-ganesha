@@ -67,7 +67,7 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 	clientid = arg_DESTROY_CLIENTID4->dca_clientid;
 
 	if (isDebug(COMPONENT_CLIENTID)) {
-		char str[LOG_BUFF_LEN];
+		char str[LOG_BUFF_LEN] = "\0";
 		struct display_buffer dspbuf = {sizeof(str), str, str};
 
 		display_clientid(&dspbuf, clientid);
@@ -118,7 +118,7 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 	PTHREAD_MUTEX_lock(&client_record->cr_mutex);
 
 	if (isFullDebug(COMPONENT_CLIENTID)) {
-		char str[LOG_BUFF_LEN];
+		char str[LOG_BUFF_LEN] = "\0";
 		struct display_buffer dspbuf = {sizeof(str), str, str};
 
 		display_client_record(&dspbuf, client_record);
@@ -161,7 +161,7 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 		 * with this clientid record.
 		 */
 		if (isFullDebug(COMPONENT_CLIENTID)) {
-			char str[LOG_BUFF_LEN];
+			char str[LOG_BUFF_LEN] = "\0";
 			struct display_buffer dspbuf = {sizeof(str), str, str};
 
 			display_client_id_rec(&dspbuf, conf);
@@ -169,6 +169,9 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 			LogDebug(COMPONENT_CLIENTID,
 				 "Removing confirmed clientid %s", str);
 		}
+
+		/* remove stable-storage record (if any) */
+		nfs4_rm_clid(conf);
 
 		/* unhash the clientid record */
 		(void)remove_confirmed_client_id(conf);
@@ -180,7 +183,7 @@ int nfs4_op_destroy_clientid(struct nfs_argop4 *op, compound_data_t *data,
 		 * with this clientid record.
 		 */
 		if (isFullDebug(COMPONENT_CLIENTID)) {
-			char str[LOG_BUFF_LEN];
+			char str[LOG_BUFF_LEN] = "\0";
 			struct display_buffer dspbuf = {sizeof(str), str, str};
 
 			display_client_id_rec(&dspbuf, unconf);

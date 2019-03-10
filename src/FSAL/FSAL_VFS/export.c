@@ -51,11 +51,10 @@
 #include "nfs_exports.h"
 #include "export_mgr.h"
 #include "subfsal.h"
+#include "gsh_config.h"
 
 /* helpers to/from other VFS objects
  */
-
-struct fsal_staticfsinfo_t *vfs_staticinfo(struct fsal_module *hdl);
 
 int vfs_get_root_fd(struct fsal_export *exp_hdl)
 {
@@ -63,7 +62,7 @@ int vfs_get_root_fd(struct fsal_export *exp_hdl)
 	struct vfs_filesystem *my_root_fs;
 
 	myself = EXPORT_VFS_FROM_FSAL(exp_hdl);
-	my_root_fs = myself->root_fs->private;
+	my_root_fs = myself->root_fs->private_data;
 	return my_root_fs->root_fd;
 }
 
@@ -75,6 +74,18 @@ static void release(struct fsal_export *exp_hdl)
 	struct vfs_fsal_export *myself;
 
 	myself = EXPORT_VFS_FROM_FSAL(exp_hdl);
+
+	if (op_ctx != NULL && op_ctx->ctx_export != NULL) {
+		LogDebug(COMPONENT_FSAL, "Releasing VFS export %"PRIu16
+			 " for %s",
+			 exp_hdl->export_id,
+			 export_path(op_ctx->ctx_export));
+	} else {
+		LogDebug(COMPONENT_FSAL, "Releasing VFS export %"PRIu16
+			 " on filesystem %s",
+			 exp_hdl->export_id,
+			 myself->root_fs->path);
+	}
 
 	vfs_sub_fini(myself);
 
@@ -124,103 +135,6 @@ static fsal_status_t get_dynamic_info(struct fsal_export *exp_hdl,
 	return fsalstat(fsal_error, retval);
 }
 
-static bool fs_supports(struct fsal_export *exp_hdl,
-			fsal_fsinfo_options_t option)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_supports(info, option);
-}
-
-static uint64_t fs_maxfilesize(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_maxfilesize(info);
-}
-
-static uint32_t fs_maxread(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_maxread(info);
-}
-
-static uint32_t fs_maxwrite(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_maxwrite(info);
-}
-
-static uint32_t fs_maxlink(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_maxlink(info);
-}
-
-static uint32_t fs_maxnamelen(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_maxnamelen(info);
-}
-
-static uint32_t fs_maxpathlen(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_maxpathlen(info);
-}
-
-static struct timespec fs_lease_time(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_lease_time(info);
-}
-
-static fsal_aclsupp_t fs_acl_support(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_acl_support(info);
-}
-
-static attrmask_t fs_supported_attrs(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_supported_attrs(info);
-}
-
-static uint32_t fs_umask(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_umask(info);
-}
-
-static uint32_t fs_xattr_access_rights(struct fsal_export *exp_hdl)
-{
-	struct fsal_staticfsinfo_t *info;
-
-	info = vfs_staticinfo(exp_hdl->fsal);
-	return fsal_xattr_access_rights(info);
-}
-
 /* get_quota
  * return quotas for this export.
  * path could cross a lower mount boundary which could
@@ -232,13 +146,14 @@ static uint32_t fs_xattr_access_rights(struct fsal_export *exp_hdl)
 
 static fsal_status_t get_quota(struct fsal_export *exp_hdl,
 			       const char *filepath, int quota_type,
+			       int quota_id,
 			       fsal_quota_t *pquota)
 {
 	struct vfs_fsal_export *myself;
 	struct dqblk fs_quota;
-	uid_t id;
 	fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
 	int retval;
+	int errsv;
 
 	myself = EXPORT_VFS_FROM_FSAL(exp_hdl);
 
@@ -249,18 +164,23 @@ static fsal_status_t get_quota(struct fsal_export *exp_hdl,
 	 *		by this export.
 	 */
 
-	id = (quota_type ==
-	      USRQUOTA) ? op_ctx->creds->caller_uid : op_ctx->creds->
-	    caller_gid;
 	memset((char *)&fs_quota, 0, sizeof(struct dqblk));
+
+	if (!vfs_set_credentials(op_ctx->creds, exp_hdl->fsal)) {
+		fsal_error = ERR_FSAL_PERM;
+		retval = EPERM;
+		goto out;
+	}
 
 	/** @todo need to get the right file system... */
 	retval = QUOTACTL(QCMD(Q_GETQUOTA, quota_type), myself->root_fs->device,
-			  id, (caddr_t) &fs_quota);
+			  quota_id, (caddr_t) &fs_quota);
+	errsv = errno;
+	vfs_restore_ganesha_credentials(exp_hdl->fsal);
 
 	if (retval < 0) {
-		fsal_error = posix2fsal_error(errno);
-		retval = errno;
+		fsal_error = posix2fsal_error(errsv);
+		retval = errsv;
 		goto out;
 	}
 	pquota->bhardlimit = fs_quota.dqb_bhardlimit;
@@ -283,13 +203,14 @@ static fsal_status_t get_quota(struct fsal_export *exp_hdl,
 
 static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 			       const char *filepath, int quota_type,
+			       int quota_id,
 			       fsal_quota_t *pquota, fsal_quota_t *presquota)
 {
 	struct vfs_fsal_export *myself;
 	struct dqblk fs_quota;
-	uid_t id;
 	fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
 	int retval;
+	int errsv;
 
 	myself = EXPORT_VFS_FROM_FSAL(exp_hdl);
 
@@ -300,9 +221,6 @@ static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 	 *		by this export.
 	 */
 
-	id = (quota_type ==
-	      USRQUOTA) ? op_ctx->creds->caller_uid : op_ctx->creds->
-	    caller_gid;
 	memset((char *)&fs_quota, 0, sizeof(struct dqblk));
 	if (pquota->bhardlimit != 0)
 		fs_quota.dqb_bhardlimit = pquota->bhardlimit;
@@ -329,18 +247,26 @@ static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 		fs_quota.dqb_valid |= QIF_ITIME;
 #endif
 
+	if (!vfs_set_credentials(op_ctx->creds, exp_hdl->fsal)) {
+		fsal_error = ERR_FSAL_PERM;
+		retval = EPERM;
+		goto err;
+	}
+
 	/** @todo need to get the right file system... */
 	retval = QUOTACTL(QCMD(Q_SETQUOTA, quota_type), myself->root_fs->device,
-			  id, (caddr_t) &fs_quota);
+			  quota_id, (caddr_t) &fs_quota);
+	errsv = errno;
+	vfs_restore_ganesha_credentials(exp_hdl->fsal);
 
 	if (retval < 0) {
-		fsal_error = posix2fsal_error(errno);
-		retval = errno;
+		fsal_error = posix2fsal_error(errsv);
+		retval = errsv;
 		goto err;
 	}
 	if (presquota != NULL)
 		return get_quota(exp_hdl, filepath, quota_type,
-				 presquota);
+				 quota_id, presquota);
 
  err:
 	return fsalstat(fsal_error, retval);
@@ -349,22 +275,20 @@ static fsal_status_t set_quota(struct fsal_export *exp_hdl,
 /* extract a file handle from a buffer.
  * do verification checks and flag any and all suspicious bits.
  * Return an updated fh_desc into whatever was passed.  The most
- * common behavior, done here is to just reset the length.  There
- * is the option to also adjust the start pointer.
+ * common behavior, done here is to just reset the length.
  *
- * So, adjust the start pointer, check.  But setting the length
- * to sizeof(vfs_file_handle_t) coerces all handles to a value
- * too large for some applications (e.g., ESXi), and much larger
- * than necessary.  (On my Linux system, I'm seeing 12 byte file
- * handles (EXT4).  Since this routine has no idea what the
- * internal length was, it should not set the value (the length
- * comes from us anyway, it's up to us to get it right elsewhere).
+ * Setting the length to sizeof(vfs_file_handle_t) coerces all handles
+ * to a value too large for some applications (e.g., ESXi), and much
+ * larger than necessary.  (On my Linux system, I'm seeing 12 byte file
+ * handles (EXT4).  Since this routine has no idea what the internal
+ * length was, it should not set the value (the length comes from us
+ * anyway, it's up to us to get it right elsewhere).
  */
 
-static fsal_status_t extract_handle(struct fsal_export *exp_hdl,
-				    fsal_digesttype_t in_type,
-				    struct gsh_buffdesc *fh_desc,
-				    int flags)
+static fsal_status_t wire_to_host(struct fsal_export *exp_hdl,
+				  fsal_digesttype_t in_type,
+				  struct gsh_buffdesc *fh_desc,
+				  int flags)
 {
 	struct fsal_filesystem *fs;
 	bool dummy;
@@ -383,23 +307,13 @@ void vfs_export_ops_init(struct export_ops *ops)
 {
 	ops->release = release;
 	ops->lookup_path = vfs_lookup_path;
-	ops->extract_handle = extract_handle;
+	ops->wire_to_host = wire_to_host;
 	ops->create_handle = vfs_create_handle;
 	ops->get_fs_dynamic_info = get_dynamic_info;
-	ops->fs_supports = fs_supports;
-	ops->fs_maxfilesize = fs_maxfilesize;
-	ops->fs_maxread = fs_maxread;
-	ops->fs_maxwrite = fs_maxwrite;
-	ops->fs_maxlink = fs_maxlink;
-	ops->fs_maxnamelen = fs_maxnamelen;
-	ops->fs_maxpathlen = fs_maxpathlen;
-	ops->fs_lease_time = fs_lease_time;
-	ops->fs_acl_support = fs_acl_support;
-	ops->fs_supported_attrs = fs_supported_attrs;
-	ops->fs_umask = fs_umask;
-	ops->fs_xattr_access_rights = fs_xattr_access_rights;
 	ops->get_quota = get_quota;
 	ops->set_quota = set_quota;
+	ops->alloc_state = vfs_alloc_state;
+	ops->free_state = vfs_free_state;
 }
 
 void free_vfs_filesystem(struct vfs_filesystem *vfs_fs)
@@ -411,7 +325,7 @@ void free_vfs_filesystem(struct vfs_filesystem *vfs_fs)
 
 int vfs_claim_filesystem(struct fsal_filesystem *fs, struct fsal_export *exp)
 {
-	struct vfs_filesystem *vfs_fs = fs->private;
+	struct vfs_filesystem *vfs_fs = fs->private_data;
 	int retval;
 	struct vfs_fsal_export *myself;
 	struct vfs_filesystem_export_map *map;
@@ -420,16 +334,8 @@ int vfs_claim_filesystem(struct fsal_filesystem *fs, struct fsal_export *exp)
 
 	map = gsh_calloc(1, sizeof(*map));
 
-	if (map == NULL) {
-		LogCrit(COMPONENT_FSAL,
-			"Out of memory to claim file system %s",
-			fs->path);
-		retval = ENOMEM;
-		goto errout;
-	}
-
 	if (fs->fsal != NULL) {
-		vfs_fs = fs->private;
+		vfs_fs = fs->private_data;
 		if (vfs_fs == NULL) {
 			LogCrit(COMPONENT_FSAL,
 				"Something wrong with export, fs %s appears already claimed but doesn't have private data",
@@ -442,14 +348,6 @@ int vfs_claim_filesystem(struct fsal_filesystem *fs, struct fsal_export *exp)
 	}
 
 	vfs_fs = gsh_calloc(1, sizeof(*vfs_fs));
-
-	if (vfs_fs == NULL) {
-		LogCrit(COMPONENT_FSAL,
-			"Out of memory to claim file system %s",
-			fs->path);
-		retval = ENOMEM;
-		goto errout;
-	}
 
 	glist_init(&vfs_fs->exports);
 	vfs_fs->root_fd = -1;
@@ -468,7 +366,7 @@ int vfs_claim_filesystem(struct fsal_filesystem *fs, struct fsal_export *exp)
 		goto errout;
 	}
 
-	fs->private = vfs_fs;
+	fs->private_data = vfs_fs;
 
 already_claimed:
 
@@ -482,8 +380,7 @@ already_claimed:
 
 errout:
 
-	if (map != NULL)
-		gsh_free(map);
+	gsh_free(map);
 
 	if (vfs_fs != NULL)
 		free_vfs_filesystem(vfs_fs);
@@ -493,7 +390,7 @@ errout:
 
 void vfs_unclaim_filesystem(struct fsal_filesystem *fs)
 {
-	struct vfs_filesystem *vfs_fs = fs->private;
+	struct vfs_filesystem *vfs_fs = fs->private_data;
 	struct glist_head *glist, *glistn;
 	struct vfs_filesystem_export_map *map;
 
@@ -519,7 +416,7 @@ void vfs_unclaim_filesystem(struct fsal_filesystem *fs)
 
 		free_vfs_filesystem(vfs_fs);
 
-		fs->private = NULL;
+		fs->private_data = NULL;
 	}
 
 	LogInfo(COMPONENT_FSAL,
@@ -571,83 +468,67 @@ fsal_status_t vfs_create_export(struct fsal_module *fsal_hdl,
 {
 	struct vfs_fsal_export *myself;
 	int retval = 0;
-	fsal_errors_t fsal_error = ERR_FSAL_NO_ERROR;
+	fsal_status_t fsal_status = {0, 0};
+
+	vfs_state_init();
 
 	myself = gsh_calloc(1, sizeof(struct vfs_fsal_export));
-	if (myself == NULL) {
-		LogMajor(COMPONENT_FSAL,
-			 "out of memory for object");
-		return fsalstat(posix2fsal_error(errno), errno);
-	}
 
 	glist_init(&myself->filesystems);
 
-	retval = fsal_export_init(&myself->export);
-	if (retval != 0) {
-		LogMajor(COMPONENT_FSAL,
-			 "out of memory for object");
-		gsh_free(myself);
-		return fsalstat(posix2fsal_error(retval), retval);
-	}
+	fsal_export_init(&myself->export);
 	vfs_export_ops_init(&myself->export.exp_ops);
-	myself->export.up_ops = up_ops;
 
 	retval = load_config_from_node(parse_node,
 				       vfs_sub_export_param,
 				       myself,
 				       true,
 				       err_type);
-	if (retval != 0)
-		return fsalstat(ERR_FSAL_INVAL, 0);
+	if (retval != 0) {
+		fsal_status = posix2fsal_status(EINVAL);
+		goto err_free;
+	}
 	myself->export.fsal = fsal_hdl;
-	vfs_sub_init_export_ops(myself, op_ctx->export->fullpath);
+	vfs_sub_init_export_ops(myself, op_ctx->ctx_export->fullpath);
 
 	retval = fsal_attach_export(fsal_hdl, &myself->export.exports);
 	if (retval != 0) {
-		fsal_error = posix2fsal_error(retval);
-		goto errout;	/* seriously bad */
+		fsal_status = posix2fsal_status(retval);
+		goto err_free;	/* seriously bad */
 	}
 
-	retval = populate_posix_file_systems();
+	retval = resolve_posix_filesystem(op_ctx->ctx_export->fullpath,
+					  fsal_hdl, &myself->export,
+					  vfs_claim_filesystem,
+					  vfs_unclaim_filesystem,
+					  &myself->root_fs);
 
 	if (retval != 0) {
 		LogCrit(COMPONENT_FSAL,
-			"populate_posix_file_systems returned %s (%d)",
+			"resolve_posix_filesystem(%s) returned %s (%d)",
+			op_ctx->ctx_export->fullpath,
 			strerror(retval), retval);
-		fsal_error = posix2fsal_error(retval);
-		goto errout;
-	}
-
-	retval = claim_posix_filesystems(op_ctx->export->fullpath,
-					 fsal_hdl,
-					 &myself->export,
-					 vfs_claim_filesystem,
-					 vfs_unclaim_filesystem,
-					 &myself->root_fs);
-
-	if (retval != 0) {
-		LogCrit(COMPONENT_FSAL,
-			"claim_posix_filesystems(%s) returned %s (%d)",
-			op_ctx->export->fullpath,
-			strerror(retval), retval);
-		fsal_error = posix2fsal_error(retval);
-		goto errout;
+		fsal_status = posix2fsal_status(retval);
+		goto err_cleanup;
 	}
 
 	retval = vfs_sub_init_export(myself);
 	if (retval != 0) {
-		fsal_error = posix2fsal_error(retval);
-		goto errout;
+		fsal_status = posix2fsal_status(retval);
+		goto err_cleanup;
 	}
 
 	op_ctx->fsal_export = &myself->export;
+
+	myself->export.up_ops = up_ops;
+
 	return fsalstat(ERR_FSAL_NO_ERROR, 0);
 
- errout:
-
+err_cleanup:
 	vfs_unexport_filesystems(myself);
-
+	fsal_detach_export(fsal_hdl, &myself->export.exports);
+err_free:
 	free_export_ops(&myself->export);
 	gsh_free(myself);	/* elvis has left the building */
-	return fsalstat(fsal_error, retval);
+	return fsal_status;
 }

@@ -41,6 +41,10 @@
 
 #include <time.h>
 #include <unistd.h>
+#include <sys/socket.h>
+#ifdef RPC_VSOCK
+#include <linux/vm_sockets.h>
+#endif /* VSOCK */
 #include <sys/types.h>
 #include <sys/param.h>
 #include <pthread.h>
@@ -156,6 +160,18 @@ struct gsh_client *get_gsh_client(sockaddr_t *client_ipaddr, bool lookup_only)
 		       (uint8_t *) &((struct sockaddr_in6 *)client_ipaddr)->
 		       sin6_addr, sizeof(ipaddr));
 		break;
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+	{
+		struct sockaddr_vm *svm; /* XXX checkpatch bs */
+
+		svm = (struct sockaddr_vm *)client_ipaddr;
+		addr = (uint8_t *)&(svm->svm_cid);
+		addr_len = sizeof(svm->svm_cid);
+		ipaddr = svm->svm_cid;
+	}
+	break;
+#endif /* VSOCK */
 	default:
 		assert(0);
 	}
@@ -195,9 +211,6 @@ struct gsh_client *get_gsh_client(sockaddr_t *client_ipaddr, bool lookup_only)
 
 	server_st = gsh_calloc(1, (sizeof(struct server_stats) + addr_len));
 
-	if (server_st == NULL)
-		return NULL;
-
 	cl = &server_st->client;
 	memcpy(cl->addrbuf, addr, addr_len);
 	cl->addr.addr = cl->addrbuf;
@@ -209,6 +222,7 @@ struct gsh_client *get_gsh_client(sockaddr_t *client_ipaddr, bool lookup_only)
 	PTHREAD_RWLOCK_wrlock(&client_by_ip.lock);
 	node = avltree_insert(&cl->node_k, &client_by_ip.t);
 	if (node) {
+		gsh_free(cl->hostaddr_str);
 		gsh_free(server_st);	/* somebody beat us to it */
 		cl = avltree_container_of(node, struct gsh_client, node_k);
 	} else {
@@ -277,6 +291,18 @@ int remove_gsh_client(sockaddr_t *client_ipaddr)
 		       (uint8_t *) &((struct sockaddr_in6 *)client_ipaddr)->
 		       sin6_addr, sizeof(ipaddr));
 		break;
+#ifdef RPC_VSOCK
+	case AF_VSOCK:
+	{
+		struct sockaddr_vm *svm; /* XXX checkpatch horror */
+
+		svm = (struct sockaddr_vm *)client_ipaddr;
+		addr = (uint8_t *)&(svm->svm_cid);
+		addr_len = sizeof(svm->svm_cid);
+		ipaddr = svm->svm_cid;
+	}
+	break;
+#endif /* VSOCK */
 	default:
 		assert(0);
 	}
@@ -292,8 +318,8 @@ int remove_gsh_client(sockaddr_t *client_ipaddr)
 			goto out;
 		}
 		cache_slot = (void **)
-		    &(client_by_ip.
-		      cache[eip_cache_offsetof(&client_by_ip, ipaddr)]);
+		    &(client_by_ip.cache[eip_cache_offsetof(
+						&client_by_ip, ipaddr)]);
 		cnode = (struct avltree_node *)atomic_fetch_voidptr(cache_slot);
 		if (node == cnode)
 			atomic_store_voidptr(cache_slot, NULL);
@@ -354,10 +380,14 @@ static bool arg_ipaddr(DBusMessageIter *args, sockaddr_t *sp, char **errormsg)
 	unsigned char addrbuf[16];
 	bool success = true;
 
+	/* XXX AF_VSOCK addresses are not self-describing--and one might
+	 * question whether inet addresses really are, either...so?
+	 */
+
 	if (args == NULL) {
 		success = false;
 		*errormsg = "message has no arguments";
-	} else if (DBUS_TYPE_STRING != dbus_message_iter_get_arg_type(args)) {
+	} else if (dbus_message_iter_get_arg_type(args) != DBUS_TYPE_STRING) {
 		success = false;
 		*errormsg = "arg not a string";
 	} else {
@@ -477,7 +507,7 @@ static bool client_to_dbus(struct gsh_client *cl_node, void *state)
 	const char *addrp;
 	int addr_type;
 	DBusMessageIter struct_iter;
-	struct timespec last_as_ts = ServerBootTime;
+	struct timespec last_as_ts = nfs_ServerBootTime;
 
 	cl = container_of(cl_node, struct server_stats, client);
 	addr_type = (cl_node->addr.len == 4) ? AF_INET : AF_INET6;
@@ -526,6 +556,25 @@ static struct gsh_dbus_method cltmgr_show_clients = {
 		  .direction = "out"},
 		 END_ARG_LIST}
 };
+
+/* Reset Client specific stats counters
+ */
+void reset_client_stats(void)
+{
+	struct avltree_node *client_node;
+	struct gsh_client *cl;
+	struct server_stats *clnt;
+
+	PTHREAD_RWLOCK_rdlock(&client_by_ip.lock);
+	for (client_node = avltree_first(&client_by_ip.t); client_node != NULL;
+	     client_node = avltree_next(client_node)) {
+		cl = avltree_container_of(client_node, struct gsh_client,
+					  node_k);
+		clnt = container_of(cl, struct server_stats, client);
+		reset_gsh_stats(&clnt->st);
+	}
+	PTHREAD_RWLOCK_unlock(&client_by_ip.lock);
+}
 
 static struct gsh_dbus_method *cltmgr_client_methods[] = {
 	&cltmgr_add_client,
@@ -579,6 +628,8 @@ static bool get_nfsv3_stats_io(DBusMessageIter *args,
 	DBusMessageIter iter;
 
 	dbus_message_iter_init_append(reply, &iter);
+	if (!nfs_param.core_param.enable_NFSSTATS)
+		errormsg = "NFS stat counting disabled";
 	client = lookup_client(args, &errormsg);
 	if (client == NULL) {
 		success = false;
@@ -626,6 +677,8 @@ static bool get_nfsv40_stats_io(DBusMessageIter *args,
 	DBusMessageIter iter;
 
 	dbus_message_iter_init_append(reply, &iter);
+	if (!nfs_param.core_param.enable_NFSSTATS)
+		errormsg = "NFS stat counting disabled";
 	client = lookup_client(args, &errormsg);
 	if (client == NULL) {
 		success = false;
@@ -673,6 +726,8 @@ static bool get_nfsv41_stats_io(DBusMessageIter *args,
 	DBusMessageIter iter;
 
 	dbus_message_iter_init_append(reply, &iter);
+	if (!nfs_param.core_param.enable_NFSSTATS)
+		errormsg = "NFS stat counting disabled";
 	client = lookup_client(args, &errormsg);
 	if (client == NULL) {
 		success = false;
@@ -721,6 +776,8 @@ static bool get_nfsv41_stats_layouts(DBusMessageIter *args,
 	DBusMessageIter iter;
 
 	dbus_message_iter_init_append(reply, &iter);
+	if (!nfs_param.core_param.enable_NFSSTATS)
+		errormsg = "NFS stat counting disabled";
 	client = lookup_client(args, &errormsg);
 	if (client == NULL) {
 		success = false;
@@ -1002,6 +1059,7 @@ void client_pkginit(void)
 	client_by_ip.cache_sz = 32767;
 	client_by_ip.cache =
 	    gsh_calloc(client_by_ip.cache_sz, sizeof(struct avltree_node *));
+	pthread_rwlockattr_destroy(&rwlock_attr);
 }
 
 /** @} */
